@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use crate::auth::Grant;
 
@@ -45,12 +46,45 @@ pub trait AuthorizationSource: Debug + Send + Sync {
     /// pairing has been withdrawn. The two are not distinguished on purpose, so
     /// that a revoked device learns nothing a never-paired device would not.
     fn current_grant(&self, device_wire_id: &str) -> Option<Grant>;
+
+    /// Captures a grant whose cancellation survives removal and re-pairing.
+    /// Sources without task-lifetime revocation support refuse to issue a lease.
+    fn current_lease(&self, _device_wire_id: &str) -> Option<AuthorizationLease> {
+        None
+    }
+}
+
+/// One device grant revision retained by already-admitted host work.
+#[derive(Clone, Debug)]
+pub struct AuthorizationLease {
+    grant: Grant,
+    cancellation: CancellationToken,
+}
+
+impl AuthorizationLease {
+    /// Returns the grant captured atomically with this lease.
+    #[must_use]
+    pub const fn grant(&self) -> &Grant {
+        &self.grant
+    }
+
+    /// Returns an owned cancellation signal that cannot cancel the device's grant.
+    #[must_use]
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancellation.child_token()
+    }
+}
+
+#[derive(Debug)]
+struct DeviceGrant {
+    grant: Grant,
+    cancellation: CancellationToken,
 }
 
 #[derive(Debug, Default)]
 struct DirectoryInner {
     generation: AtomicU64,
-    grants: RwLock<BTreeMap<String, Grant>>,
+    grants: RwLock<BTreeMap<String, DeviceGrant>>,
 }
 
 /// Shared, mutable directory of paired devices and their grants.
@@ -69,14 +103,14 @@ impl DeviceDirectory {
         Self::default()
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<String, Grant>> {
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<String, DeviceGrant>> {
         self.inner
             .grants
             .write()
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, Grant>> {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, DeviceGrant>> {
         self.inner
             .grants
             .read()
@@ -91,7 +125,15 @@ impl DeviceDirectory {
     /// guaranteed to observe the new grant with it.
     pub fn pair(&self, device_wire_id: impl Into<String>, grant: Grant) -> u64 {
         let mut grants = self.write();
-        grants.insert(device_wire_id.into(), grant);
+        if let Some(previous) = grants.insert(
+            device_wire_id.into(),
+            DeviceGrant {
+                grant,
+                cancellation: CancellationToken::new(),
+            },
+        ) {
+            previous.cancellation.cancel();
+        }
         let generation = self.inner.generation.fetch_add(1, Ordering::AcqRel) + 1;
         drop(grants);
         generation
@@ -110,12 +152,14 @@ impl DeviceDirectory {
     )]
     pub fn revoke(&self, device_wire_id: &str) -> bool {
         let mut grants = self.write();
-        let removed = grants.remove(device_wire_id).is_some();
-        if removed {
+        let removed = grants.remove(device_wire_id);
+        let was_paired = removed.is_some();
+        if let Some(removed) = removed {
+            removed.cancellation.cancel();
             self.inner.generation.fetch_add(1, Ordering::AcqRel);
         }
         drop(grants);
-        removed
+        was_paired
     }
 
     /// Returns the number of paired devices.
@@ -137,7 +181,18 @@ impl AuthorizationSource for DeviceDirectory {
     }
 
     fn current_grant(&self, device_wire_id: &str) -> Option<Grant> {
-        self.read().get(device_wire_id).cloned()
+        self.read()
+            .get(device_wire_id)
+            .map(|entry| entry.grant.clone())
+    }
+
+    fn current_lease(&self, device_wire_id: &str) -> Option<AuthorizationLease> {
+        self.read()
+            .get(device_wire_id)
+            .map(|entry| AuthorizationLease {
+                grant: entry.grant.clone(),
+                cancellation: entry.cancellation.child_token(),
+            })
     }
 }
 
@@ -176,6 +231,41 @@ mod tests {
         );
         assert_eq!(directory.generation(), 3);
         assert_eq!(directory.len(), 2);
+    }
+
+    #[test]
+    fn device_authorization_leases_never_survive_revocation_or_repairing() {
+        let directory = DeviceDirectory::new();
+        directory.pair("device-a", operator(&[OperatorScope::Write]));
+        directory.pair("device-b", operator(&[OperatorScope::Write]));
+        let original = directory
+            .current_lease("device-a")
+            .expect("first grant")
+            .cancellation();
+        let unrelated = directory
+            .current_lease("device-b")
+            .expect("other grant")
+            .cancellation();
+        let own_work = directory
+            .current_lease("device-a")
+            .expect("independent work")
+            .cancellation();
+        own_work.cancel();
+        assert!(!original.is_cancelled());
+        assert!(directory.revoke("device-a"));
+        assert!(original.is_cancelled());
+        assert!(!unrelated.is_cancelled());
+        assert!(directory.current_lease("device-a").is_none());
+        directory.pair("device-a", operator(&[OperatorScope::Write]));
+        let replacement = directory
+            .current_lease("device-a")
+            .expect("replacement grant")
+            .cancellation();
+        assert!(original.is_cancelled());
+        assert!(!replacement.is_cancelled());
+        directory.pair("device-a", operator(&[OperatorScope::Read]));
+        assert!(replacement.is_cancelled());
+        assert!(!unrelated.is_cancelled());
     }
 
     #[test]

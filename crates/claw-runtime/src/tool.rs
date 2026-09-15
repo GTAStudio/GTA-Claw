@@ -3,16 +3,19 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use claw_application::model::approval::{ApprovalOutcome, ApprovalVerdict, ApprovalWithdrawal};
 use claw_application::ports::clock::ClockPort;
 use claw_application::ports::tool::{
-    ToolDescriptor, ToolInvocation, ToolOutcome, ToolPort, ToolStatus,
+    InvocationAuthority, ToolDescriptor, ToolInvocation, ToolOutcome, ToolPort, ToolStatus,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::{ApprovalBroker, ApprovalError, ApprovalTicket};
+
+static NEXT_AUTHENTICATED_INVOCATION: AtomicU64 = AtomicU64::new(0);
 
 /// Deadlines applied to every tool call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,12 +37,18 @@ impl Default for ToolExecutorConfig {
 pub enum ToolExecutionError {
     /// The approval broker failed.
     Approval(ApprovalError),
+    /// A mutating authenticated call may have acted without a confirmed terminal result.
+    OutcomeUnknown(String),
 }
 
 impl Display for ToolExecutionError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Approval(error) => write!(formatter, "approval failed: {error}"),
+            Self::OutcomeUnknown(detail) => write!(
+                formatter,
+                "tool outcome is unknown; automatic replay is forbidden: {detail}"
+            ),
         }
     }
 }
@@ -121,7 +130,31 @@ impl ToolExecutor {
         invocation: ToolInvocation,
         cancel: &CancellationToken,
     ) -> Result<ToolOutcome, ToolExecutionError> {
+        self.execute_authorized(invocation, None, cancel).await
+    }
+
+    /// Executes with host-verified authority, refusing read-only callers before any approval.
+    ///
+    /// # Errors
+    /// Reports broker errors as in [`Self::execute`]; adapters unable to preserve identity fail closed.
+    /// Mutating calls with unconfirmed completion return [`ToolExecutionError::OutcomeUnknown`].
+    pub async fn execute_authorized(
+        &self,
+        mut invocation: ToolInvocation,
+        authority: Option<InvocationAuthority>,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutcome, ToolExecutionError> {
         let call_id = invocation.call.call_id.clone();
+        if authority
+            .as_ref()
+            .is_some_and(|authority| !authority.can_execute())
+        {
+            return Ok(Self::terminal(
+                call_id,
+                ToolStatus::Denied,
+                "caller is not authorized to execute tools",
+            ));
+        }
         let Some(descriptor) = self.describe(&invocation.call.name) else {
             return Ok(ToolOutcome {
                 call_id,
@@ -135,20 +168,44 @@ impl ToolExecutor {
             return Ok(Self::terminal(call_id, ToolStatus::Cancelled, "cancelled"));
         }
 
+        let binding = if let Some(authority) = authority.as_ref() {
+            match self.tools.bind_authorized(&invocation, authority) {
+                Ok(binding) => Some(binding),
+                Err(error) => {
+                    return Ok(Self::terminal(
+                        call_id,
+                        ToolStatus::Failed,
+                        &error.to_string(),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         if descriptor.requires_approval {
-            let outcome = self
-                .broker
-                .request(
-                    ApprovalTicket {
-                        session_id: invocation.session_id.clone(),
-                        turn: invocation.turn,
-                        call_id: call_id.clone(),
-                        tool_name: invocation.call.name.clone(),
-                        arguments: invocation.call.arguments.clone(),
-                    },
-                    cancel,
-                )
-                .await?;
+            let ticket = ApprovalTicket {
+                session_id: invocation.session_id.clone(),
+                turn: invocation.turn,
+                call_id: call_id.clone(),
+                tool_name: invocation.call.name.clone(),
+                arguments: invocation.call.arguments.clone(),
+            };
+            let outcome = match (authority.clone(), binding.clone()) {
+                (Some(authority), Some(binding)) => {
+                    self.broker
+                        .request_bound(ticket, authority, binding, cancel)
+                        .await?
+                }
+                (None, None) => self.broker.request(ticket, cancel).await?,
+                _ => {
+                    return Ok(Self::terminal(
+                        call_id,
+                        ToolStatus::Failed,
+                        "authenticated publication binding is missing",
+                    ));
+                }
+            };
 
             match outcome {
                 ApprovalOutcome::Decided { decision, .. }
@@ -182,11 +239,78 @@ impl ToolExecutor {
             }
         }
 
+        if cancel.is_cancelled()
+            || authority
+                .as_ref()
+                .is_some_and(InvocationAuthority::is_revoked)
+        {
+            return Ok(Self::terminal(
+                call_id,
+                ToolStatus::Cancelled,
+                "cancelled before execution",
+            ));
+        }
+
+        let adapter_id = if authority.is_some() {
+            let Ok(ordinal) = NEXT_AUTHENTICATED_INVOCATION.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| current.checked_add(1),
+            ) else {
+                return Ok(Self::terminal(
+                    call_id,
+                    ToolStatus::Failed,
+                    "host invocation identity exhausted",
+                ));
+            };
+            let Ok(id) =
+                claw_application::model::ids::ToolCallId::new(format!("runtime-tool-{ordinal}"))
+            else {
+                return Ok(Self::terminal(
+                    call_id,
+                    ToolStatus::Failed,
+                    "host invocation identity is invalid",
+                ));
+            };
+            invocation.call.call_id = id.clone();
+            id
+        } else {
+            call_id.clone()
+        };
+        let mutating_authenticated = authority.is_some() && descriptor.mutates_workspace;
+        let execution_authority = authority.clone();
+        let invoke = async {
+            match (authority, binding) {
+                (Some(authority), Some(binding)) => {
+                    self.tools
+                        .invoke_bound(invocation, authority, binding)
+                        .await
+                }
+                (None, None) => self.tools.invoke(invocation).await,
+                _ => Err(claw_application::ports::PortError::Invalid(
+                    "authenticated publication binding is missing".to_owned(),
+                )),
+            }
+        };
         let interrupted = tokio::select! {
             biased;
-            result = self.tools.invoke(invocation) => {
+            () = cancel.cancelled() => ToolStatus::Cancelled,
+            () = async {
+                match execution_authority.as_ref() {
+                    Some(authority) => authority.revoked().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => ToolStatus::Cancelled,
+            result = invoke => {
+                if let Err(claw_application::ports::PortError::CommittedButNotDurable(detail) | claw_application::ports::PortError::OutcomeUnknown(detail)) = &result {
+                    return Err(ToolExecutionError::OutcomeUnknown(detail.clone()));
+                }
                 return Ok(match result {
-                    Ok(outcome) => outcome,
+                    Ok(mut outcome) if outcome.call_id == adapter_id => {
+                        outcome.call_id = call_id;
+                        outcome
+                    }
+                    Ok(_) => Self::terminal(call_id, ToolStatus::Failed, "tool returned another invocation's result"),
                     Err(error) => ToolOutcome {
                         call_id,
                         status: ToolStatus::Failed,
@@ -195,13 +319,19 @@ impl ToolExecutor {
                     },
                 });
             }
-            () = cancel.cancelled() => ToolStatus::Cancelled,
             () = self.clock.sleep(self.config.call_timeout) => ToolStatus::TimedOut,
         };
 
         // The `invoke` future was dropped by `select!`; tell the adapter so it can release any
         // resources the future itself did not own.
-        let _ = self.tools.cancel(&call_id).await;
+        let _ = self.tools.cancel(&adapter_id).await;
+
+        if mutating_authenticated {
+            return Err(ToolExecutionError::OutcomeUnknown(
+                "mutating invocation was interrupted; reconcile its audit and result before retry"
+                    .to_owned(),
+            ));
+        }
 
         Ok(Self::terminal(
             call_id,

@@ -181,7 +181,15 @@ async fn spawn_with_serving(
     runtime: Arc<DeterministicRuntime>,
     serving: ServingStateHandle,
 ) -> Server {
-    let api = HttpApi::with_serving_state(config, runtime.services(), Arc::new(serving));
+    spawn_with_services(config, runtime.services(), serving).await
+}
+
+async fn spawn_with_services(
+    config: ApiConfig,
+    services: claw_http_api::ApiServices,
+    serving: ServingStateHandle,
+) -> Server {
+    let api = HttpApi::with_serving_state(config, services, Arc::new(serving));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test listener");
@@ -887,16 +895,36 @@ async fn tools_admin_mcp_and_webhooks_enforce_and_map_contracts() {
     .await;
     assert_eq!(tool.status, 200);
     assert_eq!(tool.json(), json!({"ok":true,"result":{"value":7}}));
+    let mut invocation = runtime
+        .last_tool_invocation()
+        .expect("read tool invocation")
+        .expect("tool invocation recorded");
+    let authority = invocation
+        .context
+        .authority
+        .take()
+        .expect("authenticated tool authority");
     assert_eq!(
-        runtime
-            .last_tool_invocation()
-            .expect("read tool invocation")
-            .expect("tool invocation recorded"),
+        authority.source(),
+        claw_application::ports::tool::InvocationSource::Http
+    );
+    assert!(authority.is_owner() && authority.can_execute());
+    assert_eq!(
+        authority.account(),
+        None,
+        "routing header is not an authenticated account"
+    );
+    assert_ne!(authority.subject(), "operator-token");
+    assert!(!format!("{authority:?}").contains(authority.subject()));
+    assert_eq!(
+        invocation,
         ToolInvocation {
             name: "echo".to_owned(),
             arguments: json!({"value":7}),
             action: Some("send".to_owned()),
             context: ToolInvocationContext {
+                authority: None,
+                binding: None,
                 session_key: Some("body-session".to_owned()),
                 agent_id: Some("body-agent".to_owned()),
                 idempotency_key: Some("idempotency-1".to_owned()),
@@ -1168,6 +1196,956 @@ async fn tools_invoke_rejects_auth_schema_scope_and_maps_tool_errors() {
             "type":"not_found",
             "message":"Tool not available: missing"
         }})
+    );
+}
+
+#[tokio::test]
+async fn tools_outcome_unknown_and_timeouts_never_invite_http_or_mcp_replay() {
+    struct UncertainTools {
+        hangs: bool,
+        calls: std::sync::atomic::AtomicUsize,
+        cancellations: std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>>,
+    }
+    impl claw_http_api::ToolPort for UncertainTools {
+        fn list(
+            &self,
+        ) -> claw_http_api::PortFuture<
+            '_,
+            Result<Vec<claw_http_api::ToolDefinition>, claw_http_api::PortError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn invoke(
+            &self,
+            _invocation: ToolInvocation,
+            cancellation: tokio_util::sync::CancellationToken,
+        ) -> claw_http_api::PortFuture<
+            '_,
+            Result<claw_http_api::ToolOutcome, claw_http_api::PortError>,
+        > {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.cancellations
+                .lock()
+                .expect("invocation tokens")
+                .push(cancellation);
+            Box::pin(async move {
+                if self.hangs {
+                    std::future::pending::<()>().await;
+                }
+                Err(claw_http_api::PortError::new(
+                    claw_http_api::PortErrorKind::OutcomeUnknown,
+                    "The write may have taken effect; do not repeat it automatically.",
+                ))
+            })
+        }
+    }
+    for hangs in [false, true] {
+        let tools = Arc::new(UncertainTools {
+            hangs,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            cancellations: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut services = DeterministicRuntime::new().services();
+        services.tools = tools.clone();
+        let mut config = config();
+        config.limits.operation_timeout = Duration::from_millis(20);
+        let server = spawn_with_services(config, services, ServingStateHandle::serving()).await;
+        let response = request(
+            &server,
+            "POST",
+            "/tools/invoke",
+            Some("operator-token"),
+            &[("Content-Type", "application/json")],
+            &json_body(&json!({"name": "write", "args": {}})),
+        )
+        .await;
+        assert_eq!(response.status, 409);
+        assert_eq!(response.json()["error"]["type"], "outcome_unknown");
+        assert_eq!(response.json()["error"]["retryable"], false);
+        assert_eq!(response.json()["error"]["recoveryRequired"], true);
+        let response = request_at(server.mcp_address, "POST", "/mcp", Some("mcp-owner"), &[("Content-Type", "application/json")], &json_body(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "write", "arguments": {}}}))).await;
+        assert_eq!(response.status, 200);
+        let result = response.json();
+        assert_eq!(result["result"]["isError"], true);
+        assert_eq!(
+            result["result"]["_meta"]["gta-claw"]["error"]["type"],
+            "outcome_unknown"
+        );
+        assert_eq!(
+            result["result"]["_meta"]["gta-claw"]["error"]["retryable"],
+            false
+        );
+        assert!(
+            result["result"]["content"][0]["text"]
+                .as_str()
+                .expect("recovery message")
+                .contains("Do not repeat it automatically")
+        );
+        assert_eq!(tools.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(
+            tools
+                .cancellations
+                .lock()
+                .expect("cancelled calls")
+                .iter()
+                .all(tokio_util::sync::CancellationToken::is_cancelled)
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_cancellation_targets_only_the_authenticated_active_request() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
+
+    async fn open_session_events(address: SocketAddr, session: &str) -> TcpStream {
+        let mut events = TcpStream::connect(address)
+            .await
+            .expect("session SSE socket");
+        let request = format!(
+            "GET /mcp HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer mcp-owner\r\nMcp-Session-Id: {session}\r\nConnection: close\r\n\r\n"
+        );
+        events
+            .write_all(request.as_bytes())
+            .await
+            .expect("session SSE request");
+        let mut head = Vec::new();
+        timeout(Duration::from_secs(2), async {
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0; 512];
+                let count = events.read(&mut buffer).await.expect("SSE headers");
+                assert!(count > 0);
+                head.extend_from_slice(&buffer[..count]);
+                assert!(head.len() <= 8_192);
+            }
+        })
+        .await
+        .expect("SSE opened before deletion");
+        assert!(String::from_utf8_lossy(&head).contains("200 OK"));
+        events
+    }
+
+    struct WaitingTools {
+        calls: AtomicUsize,
+        started: tokio::sync::mpsc::Sender<CancellationToken>,
+        wait_catalog: AtomicBool,
+        catalog_started: tokio::sync::mpsc::Sender<()>,
+    }
+    impl claw_http_api::ToolPort for WaitingTools {
+        fn list(
+            &self,
+        ) -> claw_http_api::PortFuture<
+            '_,
+            Result<Vec<claw_http_api::ToolDefinition>, claw_http_api::PortError>,
+        > {
+            Box::pin(async {
+                if self.wait_catalog.load(Ordering::SeqCst) {
+                    self.catalog_started
+                        .send(())
+                        .await
+                        .expect("catalog observer");
+                    std::future::pending::<()>().await;
+                }
+                Ok(Vec::new())
+            })
+        }
+        fn invoke(
+            &self,
+            _invocation: ToolInvocation,
+            cancellation: CancellationToken,
+        ) -> claw_http_api::PortFuture<
+            '_,
+            Result<claw_http_api::ToolOutcome, claw_http_api::PortError>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                self.started
+                    .send(cancellation.clone())
+                    .await
+                    .expect("test observer");
+                cancellation.cancelled().await;
+                Err(claw_http_api::PortError::new(
+                    claw_http_api::PortErrorKind::OutcomeUnknown,
+                    "Cancelled execution requires reconciliation",
+                ))
+            })
+        }
+    }
+
+    let (started, mut observed) = tokio::sync::mpsc::channel(2);
+    let (catalog_started, mut catalogs) = tokio::sync::mpsc::channel(1);
+    let tools = Arc::new(WaitingTools {
+        calls: AtomicUsize::new(0),
+        started,
+        wait_catalog: AtomicBool::new(false),
+        catalog_started,
+    });
+    let mut services = DeterministicRuntime::new().services();
+    services.tools = tools.clone();
+    let mut settings = config();
+    settings.limits.operation_timeout = Duration::from_secs(5);
+    settings.mcp_owner_authenticator = BearerAuthenticator::new(vec![
+        credential("mcp-owner", [Scope::OperatorAdmin]),
+        credential("mcp-owner-two", [Scope::OperatorAdmin]),
+    ]);
+    let server = spawn_with_services(settings, services, ServingStateHandle::serving()).await;
+    let address = server.mcp_address;
+    let invocation = json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"wait","arguments":{}}});
+    let start_call = |token: &'static str| {
+        let body = json_body(&invocation);
+        tokio::spawn(async move {
+            request_at(
+                address,
+                "POST",
+                "/mcp",
+                Some(token),
+                &[("Content-Type", "application/json")],
+                &body,
+            )
+            .await
+        })
+    };
+    let first = start_call("mcp-owner");
+    let first_token = timeout(Duration::from_secs(2), observed.recv())
+        .await
+        .expect("first call started")
+        .expect("first token");
+    let second = start_call("mcp-owner-two");
+    let second_token = timeout(Duration::from_secs(2), observed.recv())
+        .await
+        .expect("second call started")
+        .expect("second token");
+
+    let notify = json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"private-client-reason"}});
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-client"),
+            &[("Content-Type", "application/json")],
+            &json_body(&notify)
+        )
+        .await
+        .status,
+        202
+    );
+    let mut wrong_type = notify.clone();
+    wrong_type["params"]["requestId"] = json!("7");
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[("Content-Type", "application/json")],
+            &json_body(&wrong_type)
+        )
+        .await
+        .status,
+        202
+    );
+    assert!(!first_token.is_cancelled());
+    assert!(!second_token.is_cancelled());
+    let duplicate = mcp_request(
+        &server,
+        "POST",
+        Some("mcp-owner"),
+        &[("Content-Type", "application/json")],
+        &json_body(&invocation),
+    )
+    .await;
+    assert_eq!(duplicate.json()["error"]["code"], -32600);
+    for invalid_id in [json!(null), json!(1.5), json!("x".repeat(257)), json!([])] {
+        let mut invalid = invocation.clone();
+        invalid["id"] = invalid_id;
+        assert_eq!(
+            mcp_request(
+                &server,
+                "POST",
+                Some("mcp-owner"),
+                &[("Content-Type", "application/json")],
+                &json_body(&invalid)
+            )
+            .await
+            .json()["error"]["code"],
+            -32600
+        );
+    }
+    let mut missing_id = invocation.clone();
+    missing_id
+        .as_object_mut()
+        .expect("request object")
+        .remove("id");
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[("Content-Type", "application/json")],
+            &json_body(&missing_id)
+        )
+        .await
+        .json()["error"]["code"],
+        -32600
+    );
+    assert_eq!(
+        tools.calls.load(Ordering::SeqCst),
+        2,
+        "duplicate/invalid calls cannot invoke tools"
+    );
+
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[("Content-Type", "application/json")],
+            &json_body(&notify)
+        )
+        .await
+        .status,
+        202
+    );
+    let first_result = timeout(Duration::from_secs(2), first)
+        .await
+        .expect("first cancelled promptly")
+        .expect("first task");
+    assert!(first_token.is_cancelled());
+    assert!(!second_token.is_cancelled());
+    assert_eq!(
+        first_result.json()["result"]["_meta"]["gta-claw"]["error"]["retryable"],
+        false
+    );
+    assert!(!first_result.text().contains("private-client-reason"));
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner-two"),
+            &[("Content-Type", "application/json")],
+            &json_body(&notify)
+        )
+        .await
+        .status,
+        202
+    );
+    let second_result = timeout(Duration::from_secs(2), second)
+        .await
+        .expect("second cancelled promptly")
+        .expect("second task");
+    assert_eq!(
+        second_result.json()["result"]["_meta"]["gta-claw"]["error"]["retryable"],
+        false
+    );
+
+    let replacement = start_call("mcp-owner");
+    let replacement_token = timeout(Duration::from_secs(2), observed.recv())
+        .await
+        .expect("replacement started")
+        .expect("replacement token");
+    assert!(!replacement_token.is_cancelled());
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[("Content-Type", "application/json")],
+            &json_body(&notify)
+        )
+        .await
+        .status,
+        202
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), replacement)
+            .await
+            .expect("replacement cancelled")
+            .expect("replacement task")
+            .status,
+        200
+    );
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 3);
+
+    let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"session-fixture","version":"1"}}});
+    for ambiguous in [
+        br#"{"jsonrpc":"2.0","id":1,"id":2,"method":"tools/call","params":{"name":"wait","arguments":{}}}"#.as_slice(),
+        br#"{"jsonrpc":"2.0","id":1,"method":"initialize","method":"tools/call","params":{"name":"wait","arguments":{}}}"#.as_slice(),
+        br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait","arguments":{"value":"private-duplicate-detail","value":"overridden"}}}"#.as_slice(),
+        br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","protocolVersion":"2024-11-05","clientInfo":{"name":"fixture","version":"1"},"capabilities":{}}}"#.as_slice(),
+    ] {
+        let response = mcp_request(&server, "POST", Some("mcp-owner"), &[("Content-Type", "application/json")], ambiguous).await;
+        assert_eq!(response.status, 400);
+        assert_eq!(response.json()["error"]["code"], -32700);
+        assert!(!response.headers.contains_key("mcp-session-id"));
+        assert!(!response.text().contains("private-duplicate-detail"));
+    }
+    for (pointer, invalid) in [
+        ("/params/clientInfo", json!(null)),
+        ("/params/capabilities", json!([])),
+        ("/params/clientInfo/name", json!("")),
+        ("/params/clientInfo/version", json!("x".repeat(129))),
+        ("/params/protocolVersion", json!(1)),
+        ("/params/protocolVersion", json!("line\nbreak")),
+        ("/id", json!(null)),
+    ] {
+        let mut malformed = initialize.clone();
+        *malformed.pointer_mut(pointer).expect("initialize field") = invalid;
+        let response = mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[("Content-Type", "application/json")],
+            &json_body(&malformed),
+        )
+        .await;
+        assert_eq!(response.json()["error"]["code"], -32602);
+        assert!(!response.headers.contains_key("mcp-session-id"));
+    }
+    let mut missing = initialize.clone();
+    missing["params"]
+        .as_object_mut()
+        .expect("parameters")
+        .remove("capabilities");
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[("Content-Type", "application/json")],
+            &json_body(&missing)
+        )
+        .await
+        .json()["error"]["code"],
+        -32602
+    );
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[("Content-Type", "application/json")],
+            &json_body(&json!([initialize.clone(), invocation.clone()]))
+        )
+        .await
+        .status,
+        400,
+        "a malformed initialization batch cannot also invoke tools"
+    );
+    let legacy_initialize = mcp_request(&server, "POST", Some("mcp-owner"), &[("Content-Type", "application/json")], &json_body(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}))).await;
+    assert_eq!(legacy_initialize.status, 200);
+    assert!(!legacy_initialize.headers.contains_key("mcp-session-id"));
+    let mut session_ids = Vec::new();
+    for _session in 0..2 {
+        let response = mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[("Content-Type", "application/json")],
+            &json_body(&initialize),
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        session_ids.push(
+            response
+                .headers
+                .get("mcp-session-id")
+                .expect("issued standard session header")
+                .clone(),
+        );
+    }
+    assert_ne!(session_ids[0], session_ids[1]);
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", &session_ids[0])
+            ],
+            &json_body(&initialize)
+        )
+        .await
+        .status,
+        400
+    );
+    for session in &session_ids {
+        let before = mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", session),
+            ],
+            &json_body(&invocation),
+        )
+        .await;
+        assert_eq!(before.json()["error"]["code"], -32002);
+        let invalid_notification =
+            json!({"jsonrpc":"2.0","id":55,"method":"notifications/initialized"});
+        assert_eq!(
+            mcp_request(
+                &server,
+                "POST",
+                Some("mcp-owner"),
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Mcp-Session-Id", session)
+                ],
+                &json_body(&invalid_notification)
+            )
+            .await
+            .json()["error"]["code"],
+            -32600
+        );
+        let initialized = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+        assert_eq!(
+            mcp_request(
+                &server,
+                "POST",
+                Some("mcp-owner"),
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Mcp-Session-Id", session),
+                    ("Mcp-Protocol-Version", "2024-11-05")
+                ],
+                &json_body(&initialized)
+            )
+            .await
+            .status,
+            400
+        );
+        let still_waiting = mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", session),
+            ],
+            &json_body(&invocation),
+        )
+        .await;
+        assert_eq!(still_waiting.json()["error"]["code"], -32002);
+        let ready = mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", session),
+                ("Mcp-Protocol-Version", "2025-03-26"),
+            ],
+            &json_body(&initialized),
+        )
+        .await;
+        assert_eq!(ready.status, 202);
+        assert!(ready.body.is_empty());
+        assert_eq!(
+            mcp_request(
+                &server,
+                "POST",
+                Some("mcp-owner"),
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Mcp-Session-Id", session),
+                    ("Mcp-Protocol-Version", "2025-03-26"),
+                    ("Mcp-Protocol-Version", "2025-03-26")
+                ],
+                &json_body(&invocation)
+            )
+            .await
+            .status,
+            400
+        );
+    }
+    assert_eq!(
+        tools.calls.load(Ordering::SeqCst),
+        3,
+        "pre-initialized, malformed and wrong-version requests never call tools"
+    );
+    let start_scoped = |session: String| {
+        let body = json_body(&invocation);
+        tokio::spawn(async move {
+            request_at(
+                address,
+                "POST",
+                "/mcp",
+                Some("mcp-owner"),
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Mcp-Session-Id", &session),
+                ],
+                &body,
+            )
+            .await
+        })
+    };
+    let scoped_first = start_scoped(session_ids[0].clone());
+    let scoped_first_token = timeout(Duration::from_secs(2), observed.recv())
+        .await
+        .expect("first scoped call")
+        .expect("first scoped token");
+    let scoped_second = start_scoped(session_ids[1].clone());
+    let scoped_second_token = timeout(Duration::from_secs(2), observed.recv())
+        .await
+        .expect("second scoped call")
+        .expect("second scoped token");
+    let legacy = start_call("mcp-owner");
+    let legacy_token = timeout(Duration::from_secs(2), observed.recv())
+        .await
+        .expect("independent legacy call")
+        .expect("legacy token");
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-client"),
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", &session_ids[0])
+            ],
+            &json_body(&notify)
+        )
+        .await
+        .status,
+        404
+    );
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", &session_ids[0]),
+                ("Mcp-Session-Id", &session_ids[1])
+            ],
+            &json_body(&notify)
+        )
+        .await
+        .status,
+        404
+    );
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[("Content-Type", "application/json")],
+            &json_body(&notify)
+        )
+        .await
+        .status,
+        202
+    );
+    assert!(legacy_token.is_cancelled());
+    assert!(!scoped_first_token.is_cancelled());
+    assert!(!scoped_second_token.is_cancelled());
+    timeout(Duration::from_secs(2), legacy)
+        .await
+        .expect("legacy cancelled independently")
+        .expect("legacy task");
+
+    let mut events = open_session_events(address, &session_ids[1]).await;
+    let mut secondary_events = open_session_events(address, &session_ids[1]).await;
+    assert_eq!(
+        mcp_request(
+            &server,
+            "GET",
+            Some("mcp-owner"),
+            &[("Mcp-Session-Id", &session_ids[1])],
+            b""
+        )
+        .await
+        .status,
+        429
+    );
+
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", &session_ids[0])
+            ],
+            &json_body(&notify)
+        )
+        .await
+        .status,
+        202
+    );
+    timeout(Duration::from_secs(2), scoped_first)
+        .await
+        .expect("first scoped cancelled")
+        .expect("first scoped task");
+    assert!(scoped_first_token.is_cancelled());
+    assert!(!scoped_second_token.is_cancelled());
+    assert_eq!(
+        mcp_request(
+            &server,
+            "DELETE",
+            Some("mcp-client"),
+            &[("Mcp-Session-Id", &session_ids[1])],
+            b""
+        )
+        .await
+        .status,
+        404
+    );
+    assert!(!scoped_second_token.is_cancelled());
+    assert_eq!(
+        mcp_request(
+            &server,
+            "DELETE",
+            Some("mcp-owner"),
+            &[("Mcp-Session-Id", &session_ids[1])],
+            b""
+        )
+        .await
+        .status,
+        200
+    );
+    let closed = timeout(Duration::from_secs(2), scoped_second)
+        .await
+        .expect("session close cancelled call")
+        .expect("second scoped task");
+    assert!(scoped_second_token.is_cancelled());
+    assert_eq!(
+        closed.json()["result"]["_meta"]["gta-claw"]["error"]["retryable"],
+        false
+    );
+    let mut tail = Vec::new();
+    timeout(Duration::from_secs(2), events.read_to_end(&mut tail))
+        .await
+        .expect("session close ended SSE")
+        .expect("SSE EOF");
+    timeout(
+        Duration::from_secs(2),
+        secondary_events.read_to_end(&mut tail),
+    )
+    .await
+    .expect("session close ended second SSE")
+    .expect("second SSE EOF");
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", &session_ids[1])
+            ],
+            &json_body(&invocation)
+        )
+        .await
+        .status,
+        404
+    );
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", &session_ids[0])
+            ],
+            &json_body(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        )
+        .await
+        .status,
+        200,
+        "other session remains usable"
+    );
+    assert_eq!(
+        mcp_request(
+            &server,
+            "DELETE",
+            Some("mcp-owner"),
+            &[("Mcp-Session-Id", &session_ids[0])],
+            b""
+        )
+        .await
+        .status,
+        200
+    );
+    assert_eq!(
+        tools.calls.load(Ordering::SeqCst),
+        6,
+        "unknown/foreign/duplicate session headers cannot invoke another tool"
+    );
+
+    let response = mcp_request(
+        &server,
+        "POST",
+        Some("mcp-owner"),
+        &[("Content-Type", "application/json")],
+        &json_body(&initialize),
+    )
+    .await;
+    let session = response
+        .headers
+        .get("mcp-session-id")
+        .expect("drain test session")
+        .clone();
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", &session)
+            ],
+            &json_body(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
+        )
+        .await
+        .status,
+        202
+    );
+    let draining_call = start_scoped(session.clone());
+    let draining_token = timeout(Duration::from_secs(2), observed.recv())
+        .await
+        .expect("draining call started")
+        .expect("draining token");
+    let draining_legacy = start_call("mcp-owner");
+    let legacy_token = timeout(Duration::from_secs(2), observed.recv())
+        .await
+        .expect("draining legacy started")
+        .expect("legacy drain token");
+    let mut draining_events = open_session_events(address, &session).await;
+    tools.wait_catalog.store(true, Ordering::SeqCst);
+    let start_catalog = |request_id: u64| {
+        let session = session.clone();
+        tokio::spawn(async move {
+            request_at(
+                address,
+                "POST",
+                "/mcp",
+                Some("mcp-owner"),
+                &[
+                    ("Content-Type", "application/json"),
+                    ("Mcp-Session-Id", &session),
+                ],
+                &json_body(&json!({"jsonrpc":"2.0","id":request_id,"method":"tools/list"})),
+            )
+            .await
+        })
+    };
+    let cancelled_catalog = start_catalog(9);
+    timeout(Duration::from_secs(2), catalogs.recv())
+        .await
+        .expect("catalog started")
+        .expect("catalog marker");
+    assert_eq!(mcp_request(&server, "POST", Some("mcp-owner"), &[("Content-Type", "application/json"), ("Mcp-Session-Id", &session)], &json_body(&json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}))).await.status, 202);
+    assert_eq!(
+        timeout(Duration::from_secs(2), cancelled_catalog)
+            .await
+            .expect("catalog cancelled promptly")
+            .expect("catalog task")
+            .json()["error"]["code"],
+        -32800
+    );
+    assert!(!draining_token.is_cancelled());
+    let draining_catalog = start_catalog(10);
+    timeout(Duration::from_secs(2), catalogs.recv())
+        .await
+        .expect("drain catalog started")
+        .expect("drain catalog marker");
+    let mut pending_body = TcpStream::connect(address).await.expect("pending MCP body");
+    let pending_payload = json_body(&invocation);
+    let pending_head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer mcp-owner\r\nContent-Type: application/json\r\nContent-Length: {}\r\nMcp-Session-Id: {session}\r\nConnection: close\r\n\r\n",
+        pending_payload.len()
+    );
+    pending_body
+        .write_all(pending_head.as_bytes())
+        .await
+        .expect("pending headers");
+    pending_body
+        .write_all(&pending_payload[..1])
+        .await
+        .expect("partial body");
+    server.api.mcp_shutdown_token().cancel();
+    assert!(draining_token.is_cancelled());
+    assert!(legacy_token.is_cancelled());
+    assert_eq!(
+        timeout(Duration::from_secs(2), draining_catalog)
+            .await
+            .expect("catalog drained promptly")
+            .expect("drained catalog task")
+            .json()["error"]["code"],
+        -32800
+    );
+    for pending in [draining_call, draining_legacy] {
+        let response = timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("MCP call drained")
+            .expect("drained task");
+        assert_eq!(
+            response.json()["result"]["_meta"]["gta-claw"]["error"]["retryable"],
+            false
+        );
+    }
+    let mut drained_bytes = Vec::new();
+    timeout(
+        Duration::from_secs(2),
+        draining_events.read_to_end(&mut drained_bytes),
+    )
+    .await
+    .expect("root drain ends SSE")
+    .expect("drained SSE EOF");
+    pending_body
+        .write_all(&pending_payload[1..])
+        .await
+        .expect("complete raced body");
+    let mut refused_bytes = Vec::new();
+    timeout(
+        Duration::from_secs(2),
+        pending_body.read_to_end(&mut refused_bytes),
+    )
+    .await
+    .expect("raced request refused")
+    .expect("raced EOF");
+    assert!(String::from_utf8_lossy(&refused_bytes).starts_with("HTTP/1.1 503"));
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[("Content-Type", "application/json")],
+            &json_body(&initialize)
+        )
+        .await
+        .status,
+        503
+    );
+    assert_eq!(
+        mcp_request(
+            &server,
+            "POST",
+            Some("mcp-owner"),
+            &[
+                ("Content-Type", "application/json"),
+                ("Mcp-Session-Id", &session)
+            ],
+            &json_body(&invocation)
+        )
+        .await
+        .status,
+        503
+    );
+    assert_eq!(tools.calls.load(Ordering::SeqCst), 8);
+    assert_eq!(
+        request(&server, "GET", "/health", None, &[], b"")
+            .await
+            .status,
+        200,
+        "MCP shutdown does not mutate unrelated HTTP serving state"
     );
 }
 
@@ -1530,11 +2508,161 @@ async fn watch_transport_consumes_challenges_times_out_polls_and_closes_overflow
 }
 
 #[tokio::test]
+async fn known_partial_outputs_preserve_text_usage_and_terminal_on_all_http_surfaces() {
+    let runtime = DeterministicRuntime::new();
+    let server = spawn_with(config(), runtime.clone()).await;
+    for (finish_reason, chat_reason, response_reason) in [
+        (
+            claw_http_api::GenerationFinishReason::Length,
+            "length",
+            "max_output_tokens",
+        ),
+        (
+            claw_http_api::GenerationFinishReason::ContentFilter,
+            "content_filter",
+            "content_filter",
+        ),
+    ] {
+        for text in ["partial {", ""] {
+            runtime
+                .set_output(GenerationOutput {
+                    usage_reporting: claw_http_api::UsageReporting::Complete,
+                    text: text.to_owned(),
+                    tool_calls: Vec::new(),
+                    finish_reason,
+                    usage: Usage {
+                        input_tokens: 4,
+                        output_tokens: 3,
+                        total_tokens: 7,
+                    },
+                })
+                .expect("owned partial output");
+            for path in ["/v1/chat/completions", "/v1/responses"] {
+                for stream in [false, true] {
+                    let body = if path == "/v1/responses" {
+                        json!({"model":"openclaw","input":"owned request","stream":stream,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"tool_choice":"required"})
+                    } else {
+                        json!({"model":"openclaw","messages":[{"role":"user","content":"owned request"}],"stream":stream,"stream_options":{"include_usage":true},"response_format":{"type":"json_object"},"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"tool_choice":"required"})
+                    };
+                    let response = request(
+                        &server,
+                        "POST",
+                        path,
+                        Some("operator-token"),
+                        &[("Content-Type", "application/json")],
+                        &json_body(&body),
+                    )
+                    .await;
+                    assert_eq!(response.status, 200, "{}", response.text());
+                    if stream {
+                        let encoded = response.text();
+                        let events: Vec<Value> = encoded
+                            .split("\n\n")
+                            .filter_map(|block| {
+                                block.lines().find_map(|line| line.strip_prefix("data: "))
+                            })
+                            .filter(|data| *data != "[DONE]")
+                            .map(|data| serde_json::from_str(data).expect("owned JSON SSE event"))
+                            .collect();
+                        assert!(events.iter().all(|event| event.get("error").is_none()));
+                        if path == "/v1/responses" {
+                            assert!(!encoded.contains("event: response.completed"));
+                            let terminals: Vec<_> = events
+                                .iter()
+                                .filter(|event| event["type"] == "response.incomplete")
+                                .collect();
+                            assert_eq!(terminals.len(), 1);
+                            let terminal = &terminals[0]["response"];
+                            assert_eq!(terminal["status"], "incomplete");
+                            assert_eq!(terminal["incomplete_details"]["reason"], response_reason);
+                            assert_eq!(terminal["usage"]["total_tokens"], 7);
+                            assert_eq!(terminal["output"][0]["content"][0]["text"], text);
+                            assert_eq!(terminal["output"][0]["status"], "incomplete");
+                        } else {
+                            let terminals: Vec<_> = events
+                                .iter()
+                                .filter_map(|event| event["choices"][0]["finish_reason"].as_str())
+                                .collect();
+                            assert_eq!(terminals, [chat_reason]);
+                            let deltas: String = events
+                                .iter()
+                                .filter_map(|event| {
+                                    event["choices"][0]["delta"]["content"].as_str()
+                                })
+                                .collect();
+                            assert_eq!(deltas, text);
+                            assert_eq!(
+                                events.last().expect("usage event")["usage"]["total_tokens"],
+                                7
+                            );
+                        }
+                        assert!(!encoded.contains("No response from OpenClaw."));
+                    } else {
+                        let output = response.json();
+                        assert_eq!(output["usage"]["total_tokens"], 7);
+                        if path == "/v1/responses" {
+                            assert_eq!(output["status"], "incomplete");
+                            assert_eq!(output["incomplete_details"]["reason"], response_reason);
+                            assert_eq!(output["output"][0]["content"][0]["text"], text);
+                            assert_eq!(output["output"][0]["status"], "incomplete");
+                        } else {
+                            assert_eq!(output["choices"][0]["finish_reason"], chat_reason);
+                            assert_eq!(output["choices"][0]["message"]["content"], text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    runtime
+        .set_output(GenerationOutput {
+            text: String::new(),
+            finish_reason: claw_http_api::GenerationFinishReason::Length,
+            usage_reporting: claw_http_api::UsageReporting::Complete,
+            tool_calls: vec![ToolCall {
+                id: "private-partial-call".to_owned(),
+                name: "lookup".to_owned(),
+                arguments: "{\"private\":true}".to_owned(),
+            }],
+            usage: Usage {
+                input_tokens: 4,
+                output_tokens: 3,
+                total_tokens: 7,
+            },
+        })
+        .expect("malformed partial fixture");
+    for path in ["/v1/chat/completions", "/v1/responses"] {
+        for stream in [false, true] {
+            let body = if path == "/v1/responses" {
+                json!({"model":"openclaw","input":"owned request","stream":stream,"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]})
+            } else {
+                json!({"model":"openclaw","messages":[{"role":"user","content":"owned request"}],"stream":stream,"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]})
+            };
+            let response = request(
+                &server,
+                "POST",
+                path,
+                Some("operator-token"),
+                &[("Content-Type", "application/json")],
+                &json_body(&body),
+            )
+            .await;
+            assert_eq!(response.status, if stream { 200 } else { 502 });
+            assert!(!response.text().contains("private-partial-call"));
+            assert!(!response.text().contains("\\\"private\\\""));
+            assert!(response.text().contains("partial provider result"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn required_tool_choice_returns_structured_calls_on_both_openai_surfaces() {
     let runtime = DeterministicRuntime::new();
     runtime
         .set_output(GenerationOutput {
             text: "calling".to_owned(),
+            usage_reporting: claw_http_api::UsageReporting::Complete,
+            finish_reason: claw_http_api::GenerationFinishReason::ToolCalls,
             tool_calls: vec![ToolCall {
                 id: "call-1".to_owned(),
                 name: "lookup".to_owned(),
@@ -1840,6 +2968,8 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
     runtime
         .set_output(GenerationOutput {
             text: "{\"ok\":true}STOPsecret".to_owned(),
+            usage_reporting: claw_http_api::UsageReporting::Complete,
+            finish_reason: claw_http_api::GenerationFinishReason::Stop,
             tool_calls: Vec::new(),
             usage: Usage {
                 input_tokens: 3,
@@ -1893,6 +3023,8 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
     runtime
         .set_output(GenerationOutput {
             text: String::new(),
+            finish_reason: claw_http_api::GenerationFinishReason::ToolCalls,
+            usage_reporting: claw_http_api::UsageReporting::Complete,
             tool_calls: vec![ToolCall {
                 id: "call-forbidden".to_owned(),
                 name: "lookup".to_owned(),
@@ -1933,6 +3065,8 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
     runtime
         .set_output(GenerationOutput {
             text: String::new(),
+            finish_reason: claw_http_api::GenerationFinishReason::ToolCalls,
+            usage_reporting: claw_http_api::UsageReporting::Complete,
             tool_calls: vec![ToolCall {
                 id: "call-rogue".to_owned(),
                 name: "rogue".to_owned(),
@@ -2001,6 +3135,8 @@ async fn restrictive_generation_parameters_are_enforced_or_rejected() {
     runtime
         .set_output(GenerationOutput {
             text: "calling twice".to_owned(),
+            usage_reporting: claw_http_api::UsageReporting::Complete,
+            finish_reason: claw_http_api::GenerationFinishReason::ToolCalls,
             tool_calls: vec![
                 ToolCall {
                     id: "call-1".to_owned(),
@@ -2262,6 +3398,8 @@ async fn generation_ports_receive_validated_parameters_media_and_strict_response
     runtime
         .set_output(GenerationOutput {
             text: "{\"ok\":true}".to_owned(),
+            usage_reporting: claw_http_api::UsageReporting::Complete,
+            finish_reason: claw_http_api::GenerationFinishReason::Stop,
             tool_calls: Vec::new(),
             usage: Usage {
                 input_tokens: 3,

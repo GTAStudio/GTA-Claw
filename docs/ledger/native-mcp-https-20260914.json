@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-mcp-explicit-https-connect-proxy-routing",
+  "capturedAtUtc": "2026-09-14T23:23:25.1270653Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-mcp/src/http_client.rs","sha256":"1db67796649b5e96990d7c5500b77fb8466b75b5f0a19e91ffc52736651ea4cc"},
+    {"path":"crates/claw-mcp/src/client.rs","sha256":"76315a1cd70988cfbac43b191085f8332524566bb68663bc73644bdf47834b38"},
+    {"path":"crates/claw-mcp/src/lib.rs","sha256":"fa07ace1a4bbd024068a6ee152d2bba1bfa5b04420e9e3cd903763e6f7edccf5"},
+    {"path":"crates/claw-mcp/tests/http_interop.rs","sha256":"df3e89b4248e37ffce5f906fc55e22091a892ead7a0d2ce42b5f31f581911652"},
+    {"path":"apps/gta-claw-daemon/src/adapters/native_mcp.rs","sha256":"6efaf8edf5c6c7bb6cc6cb5e0520b213552afcc6b47cafe29ce0f5bce456f6bd"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"f55ef9aab652dcfe47bd8c3e02234f73660b327b6836ed03cf594158069ad662"}
+  ],
+  "cargoLockSha256": "35d6c486d9f786555694093b3131f1da1fbe4c95985d3d9d0909bd2d07c04254",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":403, "failed":0, "ignored":4, "testBinaries":25,
+      "log":"target/native-mcp-https-tests-20260914T232136577Z.log",
+      "sha256":"7ac0800332d7ab7c6b875f0b859d06f23438bf74efcf10330d346e53331c1587"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-https-clippy-20260914T232101060Z.log",
+      "sha256":"f433c2cb821dded9252b845627f48ba9875943207d17b8f255191586f51b8e8b"
+    }
+  ],
+  "behaviorEvidence": [
+    "explicit_mcp_routes_are_exact_and_never_use_proxy_environment_fallback",
+    "explicit_mcp_route_refuses_endpoint_changes_before_connecting",
+    "configured_http_proxy_tunnels_https_with_connect",
+    "explicit_https_proxy_failure_cannot_fall_back_to_the_direct_destination",
+    "native_mcp_https_requires_explicit_proxy_and_keeps_credentials_inside_tls",
+    "bound_native_mcp_tools_require_exact_approval_and_never_auto_publish_or_replay"
+  ],
+  "notes": [
+    "Remote HTTPS requires explicit loopback HTTP CONNECT proxy; native HTTP clients use immutable exact endpoint/route policy",
+    "No ambient proxy/NO_PROXY selection, redirects or direct fallback is authorized by this policy",
+    "Public URL policy rejects private/metadata targets; trusted proxy performs remote DNS and TLS target verification remains enabled",
+    "Local TLS/proxy fixtures and real daemon approval prove no proxy contact before approval and no MCP bearer in CONNECT",
+    "No external service or production proxy was used; dependency and current lock versions are unchanged"
+  ],
+  "unverified": [
+    "live remote MCP success, proxy DNS destination assurance and external account lifecycle",
+    "OAuth/proxy authentication, full resources/prompts/ACP and other-platform acceptance",
+    "physical power-loss acceptance, deployment and whole-project completion"
+  ]
+}

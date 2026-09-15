@@ -32,6 +32,7 @@ pub const WHATSAPP_GRAPH_API_VERSION: u8 = 20;
 pub const WHATSAPP_MAX_MESSAGES_PER_WEBHOOK: usize = 1_024;
 
 const WHATSAPP_COMPLETED_ID_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const WHATSAPP_REPLY_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
 
 /// Borrowed webhook verification query.
 pub struct WhatsAppVerificationQuery<'a> {
@@ -250,6 +251,60 @@ pub struct WhatsAppWebhookStats {
     pub ignored: usize,
     /// Messages dropped after the bounded queue filled.
     pub dropped: usize,
+}
+
+/// Provider-reported message state, separate from the local API acceptance receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WhatsAppDeliveryState {
+    /// The Cloud service reports dispatch to its delivery path.
+    Sent,
+    /// The provider reports delivery to the recipient.
+    Delivered,
+    /// The provider reports that the recipient read the message.
+    Read,
+    /// The provider reports a failed delivery attempt.
+    Failed,
+}
+
+impl WhatsAppDeliveryState {
+    /// Returns the provider status label without conflating it with local send confirmation.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Delivered => "delivered",
+            Self::Read => "read",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Bounded status metadata from a webhook whose signature must be verified by the host.
+#[derive(Clone, Eq, PartialEq)]
+pub struct WhatsAppDeliveryUpdate {
+    /// Configured receiving phone account, not a caller-selected override.
+    pub account_id: String,
+    /// Provider receipt identity of the original outbound message.
+    pub remote_message_id: String,
+    /// Recipient whose original receipt must match.
+    pub recipient_id: String,
+    /// Provider-reported status, separate from local transport state.
+    pub state: WhatsAppDeliveryState,
+    /// Provider timestamp in Unix milliseconds.
+    pub unix_millis: i64,
+    /// Bounded numeric failure code, excluding freeform error text.
+    pub failure_code: Option<u32>,
+}
+
+impl std::fmt::Debug for WhatsAppDeliveryUpdate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WhatsAppDeliveryUpdate")
+            .field("state", &self.state)
+            .field("unix_millis", &self.unix_millis)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Successful completion of the synchronous webhook pipeline.
@@ -529,6 +584,107 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
         })
     }
 
+    /// Parses status callbacks for this configured phone without executing or sending messages.
+    ///
+    /// The host must verify the signature over the exact bytes before consuming these updates.
+    ///
+    /// # Errors
+    /// Refuses foreign phone identities, malformed IDs/timestamps and oversized status batches.
+    pub fn delivery_updates(
+        &self,
+        payload: &[u8],
+    ) -> Result<Vec<WhatsAppDeliveryUpdate>, ChannelError> {
+        #[derive(Deserialize)]
+        struct Envelope<'a> {
+            #[serde(default, borrow)]
+            entry: Vec<Entry<'a>>,
+        }
+        #[derive(Deserialize)]
+        struct Entry<'a> {
+            #[serde(default, borrow)]
+            changes: Vec<Change<'a>>,
+        }
+        #[derive(Deserialize)]
+        struct Change<'a> {
+            #[serde(borrow)]
+            value: Option<StatusValue<'a>>,
+        }
+        #[derive(Deserialize)]
+        struct StatusValue<'a> {
+            #[serde(borrow)]
+            metadata: Option<WhatsAppMetadata<'a>>,
+            #[serde(default, borrow)]
+            statuses: Vec<DeliveryReport<'a>>,
+        }
+        #[derive(Deserialize)]
+        struct DeliveryReport<'a> {
+            id: &'a str,
+            recipient_id: &'a str,
+            timestamp: &'a str,
+            status: WhatsAppDeliveryState,
+            #[serde(default)]
+            errors: Vec<StatusError>,
+        }
+        #[derive(Deserialize)]
+        struct StatusError {
+            code: u32,
+        }
+
+        self.require_running()?;
+        if payload.len() > MAX_PROVIDER_RESPONSE_BYTES {
+            return Err(ChannelError::Protocol(ProtocolErrorKind::PayloadTooLarge));
+        }
+        let body: Envelope<'_> = serde_json::from_slice(payload)
+            .map_err(|_| ChannelError::Protocol(ProtocolErrorKind::MalformedResponse))?;
+        let mut updates = Vec::new();
+        for value in body
+            .entry
+            .into_iter()
+            .flat_map(|entry| entry.changes)
+            .filter_map(|change| change.value)
+        {
+            if !value.statuses.is_empty()
+                && value
+                    .metadata
+                    .is_none_or(|metadata| metadata.phone_number_id != self.phone_number_id)
+            {
+                return Err(ChannelError::Protocol(ProtocolErrorKind::InvalidField));
+            }
+            for status in value.statuses {
+                if updates.len() >= WHATSAPP_MAX_MESSAGES_PER_WEBHOOK {
+                    return Err(ChannelError::Protocol(ProtocolErrorKind::PayloadTooLarge));
+                }
+                if !valid_cloud_receipt_id(status.id)
+                    || invalid_routing_identifier(status.recipient_id)
+                    || status.timestamp.is_empty()
+                    || !status.timestamp.bytes().all(|byte| byte.is_ascii_digit())
+                    || status.errors.len() > 16
+                {
+                    return Err(ChannelError::Protocol(ProtocolErrorKind::InvalidField));
+                }
+                let unix_millis = status
+                    .timestamp
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|seconds| seconds.checked_mul(1_000))
+                    .ok_or(ChannelError::Protocol(ProtocolErrorKind::InvalidField))?;
+                updates.push(WhatsAppDeliveryUpdate {
+                    account_id: self.account_id.clone(),
+                    remote_message_id: status.id.to_owned(),
+                    recipient_id: status.recipient_id.to_owned(),
+                    state: status.status,
+                    unix_millis,
+                    failure_code: if status.status == WhatsAppDeliveryState::Failed {
+                        status.errors.first().map(|error| error.code)
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
+        Ok(updates)
+    }
+
     /// Parses a bounded webhook payload and queues normalized text messages.
     ///
     /// # Errors
@@ -539,6 +695,27 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
         &mut self,
         payload: &[u8],
         diagnostics: &mut impl DiagnosticSink,
+    ) -> Result<WhatsAppWebhookStats, ChannelError> {
+        self.ingest_webhook_mode(payload, diagnostics, false)
+    }
+
+    /// Queues native text input only after every message has a valid provider reply timestamp.
+    ///
+    /// # Errors
+    /// Refuses missing/malformed/expired timestamps before mutating the inbound queue.
+    pub fn ingest_native_webhook(
+        &mut self,
+        payload: &[u8],
+        diagnostics: &mut impl DiagnosticSink,
+    ) -> Result<WhatsAppWebhookStats, ChannelError> {
+        self.ingest_webhook_mode(payload, diagnostics, true)
+    }
+
+    fn ingest_webhook_mode(
+        &mut self,
+        payload: &[u8],
+        diagnostics: &mut impl DiagnosticSink,
+        native: bool,
     ) -> Result<WhatsAppWebhookStats, ChannelError> {
         self.require_running()?;
         if payload.len() > MAX_PROVIDER_RESPONSE_BYTES {
@@ -599,6 +776,23 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
             ));
             return Err(ChannelError::Protocol(ProtocolErrorKind::InvalidField));
         }
+        if native {
+            let now = self.clock.now_unix_ms();
+            for message in body
+                .entry
+                .iter()
+                .flat_map(|entry| &entry.changes)
+                .filter_map(|change| change.value.as_ref())
+                .flat_map(|value| &value.messages)
+                .filter(|message| {
+                    message.kind == Some("text") && message.from != self.phone_number_id
+                })
+            {
+                let received_at = native_message_timestamp(message.timestamp)
+                    .ok_or(ChannelError::Protocol(ProtocolErrorKind::InvalidField))?;
+                validate_reply_timestamp(received_at, now)?;
+            }
+        }
         self.prune_completed_messages();
         let mut stats = WhatsAppWebhookStats::default();
         for entry in body.entry {
@@ -651,11 +845,16 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
                         ));
                         continue;
                     };
-                    let received_at_unix_ms = message
-                        .timestamp
-                        .and_then(|timestamp| timestamp.parse::<u64>().ok())
-                        .and_then(|seconds| seconds.checked_mul(1_000))
-                        .unwrap_or_else(|| self.clock.now_unix_ms());
+                    let received_at_unix_ms = if native {
+                        native_message_timestamp(message.timestamp)
+                            .ok_or(ChannelError::Protocol(ProtocolErrorKind::InvalidField))?
+                    } else {
+                        message
+                            .timestamp
+                            .and_then(|timestamp| timestamp.parse::<u64>().ok())
+                            .and_then(|seconds| seconds.checked_mul(1_000))
+                            .unwrap_or_else(|| self.clock.now_unix_ms())
+                    };
                     let normalized = InboundMessage {
                         id: message.id.to_owned(),
                         channel_id: "whatsapp".to_owned(),
@@ -847,6 +1046,85 @@ impl<T: WhatsAppTransport, C: UnixClock> WhatsAppChannel<T, C> {
         }
     }
 
+    /// Checks the native route and conservative text-reply window for this inbound message.
+    ///
+    /// # Errors
+    /// Refuses foreign routes, missing/future timestamps and messages at least 24 hours old.
+    pub fn validate_native_reply(&self, message: &InboundMessage) -> Result<(), ChannelError> {
+        self.require_running()?;
+        message.validate().map_err(ChannelError::InvalidMessage)?;
+        if message.channel_id != "whatsapp"
+            || message.account_id != self.account_id
+            || message.conversation_id != format!("whatsapp:{}", message.sender_id)
+        {
+            return Err(ChannelError::Configuration(
+                ConfigurationError::ConversationScopeMismatch,
+            ));
+        }
+        validate_reply_timestamp(message.received_at_unix_ms, self.clock.now_unix_ms())
+    }
+
+    /// Sends exactly one normalized reply segment and requires a complete Cloud acknowledgement.
+    ///
+    /// The native host owns the durable claim and must not repeat an unconfirmed call.
+    ///
+    /// # Errors
+    /// Refuses invalid/expired routes, multi-segment input and missing or malformed remote IDs.
+    pub fn send_confirmed_reply_segment(
+        &mut self,
+        message: &InboundMessage,
+        content: &str,
+        credential: &ChannelCredential,
+    ) -> Result<String, ChannelError> {
+        self.validate_native_reply(message)?;
+        let mut segments = segment_outbound_text_iter("whatsapp", content)?;
+        let first = segments
+            .next()
+            .transpose()?
+            .ok_or(ChannelError::InvalidMessage(
+                InvalidMessageReason::EmptyContent,
+            ))?;
+        if first.as_ref() != content || segments.next().is_some() {
+            return Err(ChannelError::Protocol(ProtocolErrorKind::PayloadTooLarge));
+        }
+        credential
+            .expose_for_origin(
+                "whatsapp",
+                &self.account_id,
+                CredentialKind::Token,
+                &self.graph_origin,
+                |access_token| {
+                    validate_reply_timestamp(
+                        message.received_at_unix_ms,
+                        self.clock.now_unix_ms(),
+                    )?;
+                    let response = self
+                        .transport
+                        .send_text(&WhatsAppSendRequest {
+                            access_token,
+                            phone_number_id: &self.phone_number_id,
+                            to: &message.sender_id,
+                            text: content,
+                        })
+                        .map_err(WhatsAppSendError::into_channel_error)?;
+                    classify_response(&response)?;
+                    response.require_bounded()?;
+                    let sent: WhatsAppSendEnvelope<'_> = serde_json::from_slice(response.body())
+                        .map_err(|_| {
+                            ChannelError::Protocol(ProtocolErrorKind::MalformedResponse)
+                        })?;
+                    let [receipt] = sent.messages.as_slice() else {
+                        return Err(ChannelError::Protocol(ProtocolErrorKind::InvalidField));
+                    };
+                    if !valid_cloud_receipt_id(receipt.id) {
+                        return Err(ChannelError::Protocol(ProtocolErrorKind::InvalidField));
+                    }
+                    Ok(receipt.id.to_owned())
+                },
+            )
+            .map_err(map_credential_binding)?
+    }
+
     fn send_text_to(
         &mut self,
         to: &str,
@@ -943,6 +1221,36 @@ impl<T: WhatsAppTransport, C: UnixClock> Channel for WhatsAppChannel<T, C> {
             accepted_at_unix_ms: self.clock.now_unix_ms(),
         })
     }
+}
+
+fn native_message_timestamp(timestamp: Option<&str>) -> Option<u64> {
+    let timestamp = timestamp
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))?;
+    timestamp
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(1_000)
+        .filter(|millis| *millis > 0)
+}
+
+fn validate_reply_timestamp(received_at: u64, now: u64) -> Result<(), ChannelError> {
+    if received_at == 0
+        || now
+            .checked_sub(received_at)
+            .is_none_or(|age| age >= WHATSAPP_REPLY_WINDOW_MS)
+    {
+        return Err(ChannelError::Protocol(ProtocolErrorKind::InvalidField));
+    }
+    Ok(())
+}
+
+fn valid_cloud_receipt_id(id: &str) -> bool {
+    id.len() > 6
+        && id.len() <= 256
+        && id.starts_with("wamid.")
+        && id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'/' | b'_' | b'-' | b'=')
+        })
 }
 
 #[derive(Deserialize)]
@@ -1045,7 +1353,7 @@ fn decode_sha256_signature(signature: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut decoded = [0_u8; 32];
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = decode_hex(pair[0])?;
         let low = decode_hex(pair[1])?;
         decoded[index] = (high << 4) | low;
@@ -1165,6 +1473,298 @@ mod tests {
             attachments: Vec::new(),
             received_at_unix_ms: 1,
         }
+    }
+
+    #[test]
+    fn whatsapp_delivery_updates_bind_phone_recipient_and_keep_only_bounded_status_metadata() {
+        let origin = approved_origin();
+        let mut channel = WhatsAppChannel::new(
+            ACCOUNT,
+            "phone-id",
+            origin,
+            RecordingTransport {
+                sent: Rc::new(RefCell::new(Vec::new())),
+            },
+            FixedClock(1),
+            NonZeroUsize::new(2).expect("queue"),
+        )
+        .expect("channel");
+        channel.start(&mut ()).expect("started");
+        for state in ["sent", "delivered", "read", "failed"] {
+            let body = serde_json::json!({"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"statuses":[{"id":"wamid.confirmed","recipient_id":"15550001","status":state,"timestamp":"42","errors":[{"code":131_000,"message":"private-error-detail"}]}]}}]}]});
+            let updates = channel
+                .delivery_updates(body.to_string().as_bytes())
+                .expect("verified status fields");
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].state.label(), state);
+            assert_eq!(updates[0].account_id, ACCOUNT);
+            assert_eq!(updates[0].recipient_id, "15550001");
+            assert_eq!(updates[0].unix_millis, 42_000);
+            assert_eq!(
+                updates[0].failure_code,
+                (state == "failed").then_some(131_000)
+            );
+            assert!(!format!("{updates:?}").contains("private-error-detail"));
+            for (pointer, invalid) in [
+                (
+                    "/entry/0/changes/0/value/metadata/phone_number_id",
+                    serde_json::json!("other-phone"),
+                ),
+                (
+                    "/entry/0/changes/0/value/statuses/0/id",
+                    serde_json::json!("wrong-id"),
+                ),
+                (
+                    "/entry/0/changes/0/value/statuses/0/recipient_id",
+                    serde_json::json!(""),
+                ),
+                (
+                    "/entry/0/changes/0/value/statuses/0/timestamp",
+                    serde_json::json!("9223372036854775807"),
+                ),
+                (
+                    "/entry/0/changes/0/value/statuses/0/status",
+                    serde_json::json!("unknown"),
+                ),
+            ] {
+                let mut changed = body.clone();
+                *changed.pointer_mut(pointer).expect("field") = invalid;
+                assert!(
+                    channel
+                        .delivery_updates(changed.to_string().as_bytes())
+                        .is_err(),
+                    "{pointer}"
+                );
+            }
+        }
+        assert!(
+            channel
+                .delivery_updates(br#"{"entry":[]}"#)
+                .expect("empty status set")
+                .is_empty()
+        );
+        assert!(
+            channel
+                .poll_inbound()
+                .expect("status callbacks never enqueue model input")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_whatsapp_segment_requires_one_cloud_receipt_without_hidden_splitting() {
+        for response in [
+            br#"{"messages":[{"id":"wamid.fixture-one"}]}"#.as_slice(),
+            b"",
+            b"{}",
+            br#"{"messages":[]}"#,
+            br#"{"messages":[{"id":"wamid.one"},{"id":"wamid.two"}]}"#,
+            br#"{"messages":[{"id":"invalid-id"}]}"#,
+            br#"{"messages":[{"id":"wamid. bad"}]}"#,
+        ] {
+            let origin = approved_origin();
+            let access = credential(origin.clone());
+            let attempts = Rc::new(Cell::new(0));
+            let transport = ScriptedStageTransport {
+                results: Rc::new(RefCell::new(VecDeque::from([Ok(ProviderResponse::new(
+                    200, response,
+                ))]))),
+                attempts: Rc::clone(&attempts),
+            };
+            let mut channel = WhatsAppChannel::new(
+                ACCOUNT,
+                "phone-id",
+                origin,
+                transport,
+                FixedClock(10),
+                NonZeroUsize::new(2).expect("queue"),
+            )
+            .expect("channel");
+            channel.start(&mut ()).expect("started");
+            let mut message = inbound("message-one".to_owned());
+            message.received_at_unix_ms = 1;
+            let mut foreign = message.clone();
+            foreign.account_id = "other-account".to_owned();
+            assert!(
+                channel
+                    .send_confirmed_reply_segment(&foreign, "reply", &access)
+                    .is_err()
+            );
+            foreign = message.clone();
+            foreign.conversation_id = "whatsapp:someone-else".to_owned();
+            assert!(
+                channel
+                    .send_confirmed_reply_segment(&foreign, "reply", &access)
+                    .is_err()
+            );
+            assert!(
+                channel
+                    .send_confirmed_reply_segment(&message, &"x".repeat(8_000), &access)
+                    .is_err()
+            );
+            assert_eq!(attempts.get(), 0);
+            let result = channel.send_confirmed_reply_segment(&message, "reply", &access);
+            assert_eq!(
+                result.is_ok(),
+                response == br#"{"messages":[{"id":"wamid.fixture-one"}]}"#
+            );
+            assert_eq!(
+                attempts.get(),
+                1,
+                "the native entry never retries a remote request"
+            );
+        }
+    }
+
+    #[test]
+    fn native_whatsapp_ingress_requires_timestamps_before_enqueuing_any_batch_member() {
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let mut channel = WhatsAppChannel::new(
+            ACCOUNT,
+            "phone-id",
+            approved_origin(),
+            RecordingTransport {
+                sent: Rc::clone(&sent),
+            },
+            FixedClock(1_000 + WHATSAPP_REPLY_WINDOW_MS),
+            NonZeroUsize::new(2).expect("queue"),
+        )
+        .expect("channel");
+        channel.start(&mut ()).expect("started");
+        let body = serde_json::json!({"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"messages":[{"from":"15550001","id":"timestamp-one","type":"text","timestamp":"2","text":{"body":"valid input"}},{"from":"15550001","id":"timestamp-two","type":"text","timestamp":"3","text":{"body":"later input"}}]}}]}]});
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("0"),
+            serde_json::json!("-1"),
+            serde_json::json!("+2"),
+            serde_json::json!("18446744073709551615"),
+            serde_json::json!("86402"),
+            serde_json::json!("1"),
+        ] {
+            let mut rejected = body.clone();
+            rejected["entry"][0]["changes"][0]["value"]["messages"][1]["timestamp"] = invalid;
+            assert!(
+                channel
+                    .ingest_native_webhook(rejected.to_string().as_bytes(), &mut ())
+                    .is_err()
+            );
+            assert!(
+                channel.poll_inbound().expect("queue").is_none(),
+                "no partial admission before rejecting later timestamps"
+            );
+        }
+        assert_eq!(
+            channel
+                .ingest_native_webhook(body.to_string().as_bytes(), &mut ())
+                .expect("native batch")
+                .queued,
+            2
+        );
+        assert_eq!(
+            channel
+                .poll_inbound()
+                .expect("queue")
+                .expect("first")
+                .received_at_unix_ms,
+            2_000
+        );
+        assert_eq!(
+            channel
+                .poll_inbound()
+                .expect("queue")
+                .expect("second")
+                .received_at_unix_ms,
+            3_000
+        );
+        assert!(sent.borrow().is_empty());
+        let mut legacy = body;
+        legacy["entry"][0]["changes"][0]["value"]["messages"][0]["timestamp"] =
+            serde_json::Value::Null;
+        assert_eq!(
+            channel
+                .ingest_webhook(legacy.to_string().as_bytes(), &mut ())
+                .expect("legacy compatibility")
+                .queued,
+            2
+        );
+        assert_eq!(
+            channel
+                .poll_inbound()
+                .expect("queue")
+                .expect("legacy first")
+                .received_at_unix_ms,
+            1_000 + WHATSAPP_REPLY_WINDOW_MS
+        );
+    }
+
+    #[test]
+    fn native_whatsapp_text_reply_window_is_rechecked_before_each_transport_call() {
+        struct AdjustableClock(Rc<Cell<u64>>);
+        impl UnixClock for AdjustableClock {
+            fn now_unix_ms(&self) -> u64 {
+                self.0.get()
+            }
+        }
+        let now = Rc::new(Cell::new(1_000 + WHATSAPP_REPLY_WINDOW_MS - 1));
+        let attempts = Rc::new(Cell::new(0));
+        let origin = approved_origin();
+        let access = credential(origin.clone());
+        let transport = ScriptedStageTransport {
+            results: Rc::new(RefCell::new(VecDeque::from([Ok(ProviderResponse::new(
+                200,
+                br#"{"messages":[{"id":"wamid.window-one"}]}"#.to_vec(),
+            ))]))),
+            attempts: Rc::clone(&attempts),
+        };
+        let mut channel = WhatsAppChannel::new(
+            ACCOUNT,
+            "phone-id",
+            origin,
+            transport,
+            AdjustableClock(Rc::clone(&now)),
+            NonZeroUsize::new(2).expect("queue"),
+        )
+        .expect("channel");
+        channel.start(&mut ()).expect("started");
+        let mut message = inbound("window-one".to_owned());
+        message.received_at_unix_ms = 1_000;
+        assert_eq!(
+            channel
+                .send_confirmed_reply_segment(&message, "reply", &access)
+                .expect("inside window"),
+            "wamid.window-one"
+        );
+        now.set(1_000 + WHATSAPP_REPLY_WINDOW_MS);
+        assert!(
+            channel
+                .send_confirmed_reply_segment(&message, "later segment", &access)
+                .is_err()
+        );
+        now.set(999);
+        assert!(
+            channel
+                .send_confirmed_reply_segment(&message, "clock rollback", &access)
+                .is_err()
+        );
+        now.set(1_000);
+        message.received_at_unix_ms = 0;
+        assert!(
+            channel
+                .send_confirmed_reply_segment(&message, "unknown time", &access)
+                .is_err()
+        );
+        message.received_at_unix_ms = u64::MAX;
+        assert!(
+            channel
+                .send_confirmed_reply_segment(&message, "invalid future", &access)
+                .is_err()
+        );
+        assert_eq!(
+            attempts.get(),
+            1,
+            "expired/untrusted timestamps never reach transport or trigger templates"
+        );
     }
 
     #[test]

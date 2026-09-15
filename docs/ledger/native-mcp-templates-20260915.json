@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-reviewed-mcp-resource-templates",
+  "capturedAtUtc": "2026-09-15T02:34:39.2072262Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-daemon/src/adapters/native_mcp.rs","sha256":"821bf2cd9649d5a41038be42268dbb078fb94b3cdfab3152c7a27fe768aaee00"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"b737d245907ea67c29407b5e24cace28dd5777e38aaa42f6ae934bbbeae7842b"},
+    {"path":"apps/gta-claw-daemon/Cargo.toml","sha256":"445878a8f074b6ddf581fdec2743a85bee0b0c86c7cf1d5760e5ccd1618d0e55"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "previousCargoLockSha256": "5955c2233d8cad3f8d4c72b61bdfef396f609c5a2b90c50fb56c69e8ba262b1e",
+  "lockChanges": ["gta-claw-daemon -> iri-string 0.7.13"],
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":312, "failed":0, "ignored":4, "testBinaries":15,
+      "log":"target/native-mcp-templates-tests-20260915T023238599Z.log",
+      "sha256":"49a25f3516d912ac510a5f2141c6d136791c9c27bb77379030cc8cc260450986"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-templates-clippy-20260915T023229025Z.log",
+      "sha256":"48a33b0573d10c8ab0f0bc5a2e3ca34f2dc31e3b6fd7d03dad13bf28164d5c6c"
+    }
+  ],
+  "behaviorEvidence": [
+    "native_mcp_template_expansion_is_bounded_canonical_and_bound_without_argument_disclosure",
+    "native_mcp_resources_and_prompts_are_reviewed_bounded_untrusted_data",
+    "bound_native_mcp_tools_require_exact_approval_and_never_auto_publish_or_replay"
+  ],
+  "notes": [
+    "Explicit resource_template policy reuses the existing RFC 6570 engine and requires bounded scalar variables",
+    "Rendered URIs use a bounded writer and must retain canonical fixed scheme/authority; no local filesystem access is implied",
+    "Approval binds full descriptor/arguments plus rendered URI digest; returned content must match that exact URI",
+    "Thirty actual local data-catalog/read scenarios and both real-daemon credential modes verify approval and revocation",
+    "Only one edge to an already-locked crate was added offline; no package versions or production services changed"
+  ],
+  "unverified": [
+    "Optional/list/map variable contracts and complete RFC 6570 product coverage",
+    "Subscriptions, event recovery and automatic context selection",
+    "Real third-party templates, cross-platform acceptance and deployment",
+    "Complete frozen build manifests and whole-project completion"
+  ]
+}

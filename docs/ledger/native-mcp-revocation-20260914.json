@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-mcp-durable-server-review-revocation",
+  "capturedAtUtc": "2026-09-14T22:40:53.2723079Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-state/src/runtime.rs","sha256":"9aa70de347a320342845f5b66742c22b42d41dae34192864940fb984c7d65261"},
+    {"path":"apps/gta-claw-daemon/src/adapters/native_mcp.rs","sha256":"f1d6f1dc81c0ffc0718c0d3652b214717c967439eeb0c89fcc5875048327678e"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"5c91e98218840e1aeaf08e26ce1624e57eab665706ea05118bf0ba4f12b2b11f"},
+    {"path":"apps/gta-claw-daemon/src/production.rs","sha256":"3ea9e101af33c1f03c98a3f1750ce680476f581c6d53f5c60bdae0432e5bc1a7"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"1faf6a4051c9fc966fe4c62acccb266c7b5520e7bdaab2c4c53460e24ec8f743"}
+  ],
+  "cargoLockSha256": "35d6c486d9f786555694093b3131f1da1fbe4c95985d3d9d0909bd2d07c04254",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":252, "failed":0, "ignored":4, "testBinaries":9,
+      "log":"target/native-mcp-revocation-tests-20260914T223912384Z.log",
+      "sha256":"28a956edd5db643cfa7f1c8170845100c67f7e141dff04efd4fe15e5ca2104c3"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-revocation-clippy-20260914T224030476Z.log",
+      "sha256":"cfcaf7210c0fa4eec3f844d0ecb1b2930af84eba9db385c068c274790a028b33"
+    }
+  ],
+  "behaviorEvidence": [
+    "tool_publication_revocations_are_immutable_bounded_and_survive_restart",
+    "native_mcp_policy_pins_only_reviewed_loopback_tools_and_offline_schemas",
+    "native_mcp_invokes_only_exact_reviewed_descriptors_once_and_audits_outcomes",
+    "bound_native_mcp_tools_require_exact_approval_and_never_auto_publish_or_replay"
+  ],
+  "notes": [
+    "Server ID and explicit positive review revision bind an immutable whole-backend revocation",
+    "Catalog changes immediately cancel and unpublish the group; committed revocations survive real redb and daemon restart",
+    "New review revisions require fresh approval and leave prior revocations intact; descriptor or URL changes alone cannot restore a revoked review",
+    "Storage failure disables all MCP tools for the current runtime without claiming persistence",
+    "Twelve actual local-server scenarios and real process re-enrollment tests pass; no dependency or current lock changes"
+  ],
+  "unverified": [
+    "crash before revocation commit, persistence failure recovery and physical power-loss fencing",
+    "administrative re-enrollment and remote notification recovery across outages",
+    "remote HTTPS/proxy/OAuth, stdio launch, full resources/prompts/ACP and whole-project completion"
+  ]
+}

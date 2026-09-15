@@ -115,8 +115,10 @@ async fn embedding_base64_encoding_packs_little_endian_float32() {
     assert_eq!(bytes.len(), 3 * 4, "three float32 values were expected");
 
     let decoded = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four bytes")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
     assert_eq!(decoded, vec![0.25_f32, -0.5, 0.75]);
 

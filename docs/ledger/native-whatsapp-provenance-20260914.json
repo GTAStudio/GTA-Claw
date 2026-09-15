@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-whatsapp-immutable-provider-timestamp",
+  "capturedAtUtc": "2026-09-14T20:53:58.9768432Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"f26b46ed933996db735706207de09b343dfabfc8e297d185cacbf5f713902b0d"},
+    {"path":"apps/gta-claw-daemon/src/adapters/legacy.rs","sha256":"d3eeb7e875262d676b355844a7997dcb234f994510e6e0def541394174bd7ba3"}
+  ],
+  "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":205, "failed":0, "ignored":4, "testBinaries":8,
+      "log":"target/native-whatsapp-provenance-tests-20260914T205215996Z.log",
+      "sha256":"8f361afeb0581ba96a80bca983174396e6a75edf8251e87044fc1367f87b4497"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-whatsapp-provenance-clippy-20260914T205310967Z.log",
+      "sha256":"aff5891de319e9d49acd46f2259c3118810f98b3cb2ffdf19146f85254769a66"
+    }
+  ],
+  "behaviorEvidence": [
+    "native_whatsapp_webhook_retains_confirmed_prefix_and_never_resends_after_restart",
+    "native_whatsapp_dropped_request_stops_before_later_queued_input"
+  ],
+  "notes": [
+    "Normalized channel input retains its provider timestamp into the owned durable runtime entry",
+    "Nonzero WhatsApp provider time is immutable submission data under the original message key",
+    "Replacing or removing that time conflicts before execution and delivery claim, including after actual database reopen",
+    "Other channel and zero-time legacy serialization remains unchanged; old records are not automatically backfilled",
+    "No new dependencies or changes to the existing Cargo.lock witness"
+  ],
+  "unverified": [
+    "historic timestamp/account migration, remote timestamp trust and latest-user-message aggregation",
+    "approved template workflows and live Cloud account acceptance",
+    "cross-platform and physical power-loss acceptance, deployment and whole-project completion"
+  ]
+}

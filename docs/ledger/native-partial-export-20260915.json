@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-cli-complete-partial-text-export",
+  "capturedAtUtc": "2026-09-15T08:54:07.3271866Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-cli/src/native_gateway.rs","sha256":"8774f8e499bf7c098eee813c8da6e3e6e6ce6ee21ca74ad49ace5778bb969f40"},
+    {"path":"apps/gta-claw-cli/src/state_snapshot.rs","sha256":"c2b0c40d48d1ae077aa827b28983025d4f590bca2a4caa6aa0671d472d2444ff"},
+    {"path":"apps/gta-claw-cli/src/lib.rs","sha256":"7432aac1799d3856bce324a80732ab1990e7e6ed42c5d8683bce0b801d14baff"},
+    {"path":"apps/gta-claw-cli/tests/gateway_health.rs","sha256":"c46882ff000c9840c3678930e5269047dfb23e96afaa69c451eef934cdd4962c"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-cli --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":95, "failed":0, "ignored":1, "testBinaries":5,
+      "log":"target/native-partial-export-tests-20260915T085319504Z.log",
+      "sha256":"fb539602879565385c0beb4b672e038081586e73035f951ca972babe6b8d2691"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-cli --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-partial-export-clippy-20260915T085229801Z.log",
+      "sha256":"3af04758a66ffaefc59b8d0dc2934e6f0b4268029eb20b07f574c6aaab320ef9"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-cli --lib --test gateway_health partial_ --locked --offline --quiet",
+      "result":"passed", "passed":6, "failed":0, "ignored":0, "testBinaries":2,
+      "log":"target/native-partial-export-focused-20260915T085057806Z.log",
+      "sha256":"b935cb270e548cbfefb5dc523123330026738fc7108735338ca63de8cbefbe5e",
+      "scopeNote":"Four unit and two process tests, also included in the final CLI cohort"
+    }
+  ],
+  "retainedFailures": [],
+  "behaviorEvidence": [
+    "partial_export_pages_pin_all_identity_fields_and_verify_the_complete_utf8_digest",
+    "partial_export_command_requires_a_new_absolute_destination_and_no_cursor_overrides",
+    "partial_export_cli_collects_verified_pages_without_ack_or_overwriting_files",
+    "partial_run_cli_rejects_corrupt_pages_without_rendering_their_text"
+  ],
+  "notes": [
+    "New gateway export-partial pins run/revision/session/turn/status/length/SHA and one connection epoch while collecting at most 4 MiB and 4096 contiguous pages under the existing overall network deadline",
+    "Only operator.read and agent.wait are used; no ACK, automatic retry/reconnect, write idempotency or cursor/wait overrides are accepted",
+    "All pages and the complete SHA256 are verified before preparing a local write; an empty retained partial may export, while an unavailable partial fails",
+    "The writer reuses pinned parent and Sandbox create_new_file, refuses overwrite/links, syncs and checks the directory, and is joined once started; Unix files are owner-only and Windows inherits the trusted parent ACL",
+    "This is not atomic rename publication: local I/O failure can leave an output file and is reported through fileMayExist; failed network/page validation creates no output",
+    "Receipt metadata never includes exported text, reasoning, tool arguments or the stdin credential; the local file is explicitly untrusted incomplete plaintext and grants no execution authority",
+    "Seven real CLI subprocess/WebSocket fixture modes cover valid, empty, full-hash corruption, identity change, disconnect, existing target and absence; no daemon paging protocol was changed",
+    "Initial unit compile failures because DiagnosticFailure has no Debug were resolved with explicit result matching rather than adding Debug; failures are in terminal conversation history, not separate logs",
+    "No public API outside CLI was changed; final all-target CLI tests and lint are the scoped gates, not a new root-workspace build claim",
+    "All earlier credential/MCP/OAuth/stdio anomalies remain unresolved; no dependency/lock, production/proxy, real account/browser/device migration, deployment or Git write occurred"
+  ],
+  "unverified": [
+    "Atomic rename publication or injected low-level disk-write/sync failures for plaintext export; unconfirmed local files are explicitly preserved",
+    "Encrypted partial-export format, interrupted-export resumption, TUI/desktop partial UX and continuous source partial-text checkpoints",
+    "Actual CLI export against a real provider account and all operating systems; daemon owner-bound page evidence is from prior separate checkpoints",
+    "All prior native credential/MCP/stdio root causes, complete frozen build manifests, release and whole-project acceptance"
+  ]
+}

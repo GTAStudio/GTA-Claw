@@ -37,6 +37,11 @@ use url::{Host, Url};
 use zeroize::Zeroizing;
 
 mod diagnostics;
+mod mcp_credential;
+mod mcp_oauth;
+mod migration_preview;
+mod native_gateway;
+mod state_snapshot;
 
 use diagnostics::{Diagnostics, LOG_FILE_UNUSABLE, Verbosity, bool_field, sanitize};
 
@@ -160,6 +165,11 @@ async fn dispatch(arguments: Vec<OsString>) -> RenderedResult {
         Ok(Invocation::Help) => RenderedResult::success(format!("{USAGE}\n\n{HELP_DETAIL}\n")),
         Ok(Invocation::Foundation) => run_foundation(arguments),
         Ok(Invocation::Gateway(options)) => run_gateway_command(options).await,
+        Ok(Invocation::Native(command)) => native_gateway::run(command).await,
+        Ok(Invocation::Migration(command)) => migration_preview::run(command).await,
+        Ok(Invocation::Snapshot(command)) => state_snapshot::run(command).await,
+        Ok(Invocation::McpCredential(command)) => mcp_credential::run(command).await,
+        Ok(Invocation::McpLogin(command)) => mcp_oauth::run(*command).await,
         Err(failure) => render_parse_failure(failure),
     }
 }
@@ -190,7 +200,21 @@ const USAGE: &str = "\
 usage:
   gta-claw-cli --version
   gta-claw-cli health
-  gta-claw-cli send <session-id> <message>
+    gta-claw-cli mcp credential <reference|status|set|delete> --server <id> --endpoint <url>
+    gta-claw-cli mcp credential <reference|status|set|delete> --server <id> --program-sha256 <sha256> --environment-name <name>
+    gta-claw-cli mcp oauth <reference|status|logout> --server <id> --endpoint <url> [--confirm-logout]
+    gta-claw-cli mcp oauth login --server <id> --endpoint <url> --issuer <url>
+            --authorization-endpoint <url> --token-endpoint <url> --client-id <id> --confirm-login
+            [--http-proxy <loopback-url>] [--callback-port <0..65535>] [--scope <scopes>] [--timeout-ms <250..120000>]
+    gta-claw-cli mcp oauth refresh --server <id> --endpoint <url> --issuer <url>
+            --authorization-endpoint <url> --token-endpoint <url> --client-id <id> --confirm-refresh
+            [--http-proxy <loopback-url>] [--timeout-ms <250..120000>]
+    gta-claw-cli state snapshot <export|restore> --source <absolute-file>
+            --destination <new-absolute-file> --passphrase-stdin
+    gta-claw-cli migrate openclaw preview --source <absolute-state-root>
+            [--after <relative-path> --fingerprint <sha256>]
+    gta-claw-cli send <session-id> <message> --idempotency-key <key> <gateway-options>
+    gta-claw-cli gateway <sessions|describe|history|send|abort|run|results|ack-run|approvals|approval|approve|deny> ...
   gta-claw-cli gateway health --endpoint <ws-or-wss-url> --ephemeral-device
       [--token-stdin] [--timeout-ms <250..120000>]
       [--allow-insecure-remote-ws] [--json]";
@@ -202,8 +226,77 @@ commands:
   --version                   print `gta-claw-cli <version>` and exit 0
   --help, -h                  print this text and exit 0
   health                      report local runtime health; contacts nothing
-  send <session-id> <message> always fails: message transport is not configured
+    mcp credential reference    print a server/origin-bound native tokenRef; no store/network access
+    mcp credential status       report whether that native credential exists, never its value
+    mcp credential set          read token stdin and update the bound entry; requires --token-stdin --confirm-write
+    mcp credential delete       remove that bound entry; requires --confirm-delete
+                                                            all four require --server <id> --endpoint <http-loopback-or-https-url>
+                                                              for stdio use --server <id> --program-sha256 <sha256> --environment-name <name>
+                                                              stdio secrets are at most 2048 bytes and bind the reviewed executable
+                                                            set/delete use native storage, have no automatic retry or rollback
+    mcp oauth reference         print the separate native OAuth record reference; no store/network access
+    mcp oauth status            report local record state, never refresh or reveal its tokens
+    mcp oauth logout            remove only that local OAuth record; requires --confirm-logout
+                                                            all three require --server <id> --endpoint <http-loopback-or-https-url>
+                                                            no browser, remote token revocation or daemon notification is performed
+    mcp oauth login             explicitly authorize a pre-provisioned public client using PKCE S256
+                                                            prints authorization_required JSON with a URL, then waits for a loopback callback
+                                                            HTTPS requires an explicit loopback CONNECT proxy; no automatic browser launch
+                                                            --confirm-login permits replacing that native OAuth record after authorization
+                                                            final JSON confirms token response/storage, not daemon configuration or MCP access
+    mcp oauth refresh           explicitly rotate the existing native OAuth record under the same reviewed endpoints
+                                                            requires --confirm-refresh; no browser, callback, scope change or automatic retry
+    send <session-id> <message> native Gateway send; requires --idempotency-key
   gateway health              run one authenticated Gateway v4 health probe
+    gateway sessions            list stored native sessions
+    gateway describe <session>  read owned persistent session metadata, without message content
+    gateway history <session>   read the bounded context checkpoint; optional --limit <1..1000>
+    gateway send <session> <message> --idempotency-key <key>
+                                                            submit once; prints a receipt, not a final answer
+    gateway abort <session>     cancel the current turn in that session
+    gateway run <run-id>        query a durable run; optional --wait-ms <0..120000>
+    gateway partial-run <run-id> <revision>  read partial text; --offset <bytes> --sha256 <digest>
+    gateway export-partial <run-id> <revision> --destination <absolute-file>
+                                                            export all verified partial-text pages without ACK or replay
+    gateway results <session>   list pending results; optional --after <cursor>
+    gateway ack-run <id> <revision>
+                                                            acknowledge exactly the observed terminal result
+    gateway approvals [session] list pending approval metadata
+    gateway approval <id>       read the complete redacted approval preview
+    gateway approve <id>        approve that pending invocation once
+    gateway deny <id>           deny that pending invocation once
+    gateway memory <list|get|search|save|delete|export|import> <session>
+                              use authenticated memory without asking a model
+                              requires --device-profile and --idempotency-key
+                              get/save/delete: --note-id <id>
+                              save: --kind <fact|preference|procedure> --content-stdin
+                              save/delete: --expected-revision <notebook-revision>
+                              search: --query <text> [--limit <1..8>]
+                              list: [--limit <1..32>] [--after <id> --revision <revision>]
+                              get: [--offset <byte-offset> --revision <note-revision>]
+                              export: --revision <notebook-revision> [--offset <byte-offset>]
+                              import: --archive-stdin --expected-revision <revision> [--overwrite]
+                              encrypted export: --destination <new-absolute-file> --passphrase-stdin
+                              encrypted import: --archive-file <absolute-file> --passphrase-stdin
+
+approve/deny require --preview-fingerprint <sha256> from gateway approval.
+The complete preview is checked again before submitting the decision.
+Memory checks native Gateway capabilities before sending and prints a durable run receipt.
+Approve/deny from an authorized client, then query with gateway run; it never auto-approves.
+Save content is UTF-8 stdin, at most 8192 bytes; --content-stdin conflicts with --token-stdin.
+Archive import is bounded schema-v1 JSON from stdin; the entire command must fit 16 KiB.
+Export returns hashed plaintext pages through the durable result; no credentials or authority are exported.
+For a token-authenticated Gateway, save/import may use --request-stdin instead of other stdin flags.
+Its bounded JSON has token plus content (save) or archive (import); neither is read from argv.
+Memory file modes alternatively take --request-stdin containing only token and passphrase.
+Encrypted export collects approved revision-pinned pages, verifies the full archive, then creates
+a new age-scrypt file. Import authenticates/decrypts before connecting; its command still fits 16 KiB.
+Each export page requires approval; result ACKs are not automatic. Original page keys are retained.
+For memory files, --timeout-ms bounds network work; file KDF/I/O and cleanup are joined, not abandoned.
+
+Native business commands require the same endpoint/identity/token options.
+They emit a separate schema_version 1 JSON result and never replay writes.
+An ephemeral device may need operator pairing on the target Gateway.
 
 `gateway health` options (each may be given at most once):
   --endpoint <url>            required. Canonical ws:// or wss:// URL with no
@@ -254,6 +347,11 @@ enum Invocation {
     Help,
     Foundation,
     Gateway(GatewayOptions),
+    Native(native_gateway::NativeCommand),
+    Migration(migration_preview::PreviewCommand),
+    Snapshot(state_snapshot::SnapshotCommand),
+    McpCredential(mcp_credential::CredentialCommand),
+    McpLogin(Box<mcp_oauth::LoginCommand>),
 }
 
 #[derive(Clone, Copy)]
@@ -266,6 +364,7 @@ enum SecretSourceKind {
 struct GatewayOptions {
     endpoint: String,
     ephemeral_device: bool,
+    device_profile: Option<String>,
     secret_source: SecretSourceKind,
     timeout: Duration,
     allow_insecure_remote_ws: bool,
@@ -295,16 +394,38 @@ fn parse_invocation(arguments: &[OsString]) -> Result<Invocation, ParseFailure> 
         "--version" if arguments.len() == 1 => Ok(Invocation::Version),
         "--help" | "-h" if arguments.len() == 1 => Ok(Invocation::Help),
         "gateway" => parse_gateway(arguments),
+        "send" => native_gateway::parse(arguments, 0).map(Invocation::Native),
+        "migrate" => migration_preview::parse(arguments).map(Invocation::Migration),
+        "state" => state_snapshot::parse(arguments).map(Invocation::Snapshot),
+        "mcp"
+            if arguments.get(1).and_then(|value| value.to_str()) == Some("oauth")
+                && matches!(
+                    arguments.get(2).and_then(|value| value.to_str()),
+                    Some("login" | "refresh")
+                ) =>
+        {
+            mcp_oauth::parse(arguments).map(|command| Invocation::McpLogin(Box::new(command)))
+        }
+        "mcp" => mcp_credential::parse(arguments).map(Invocation::McpCredential),
         _ => Ok(Invocation::Foundation),
     }
 }
 
 fn parse_gateway(arguments: &[OsString]) -> Result<Invocation, ParseFailure> {
     if arguments.get(1).and_then(|value| value.to_str()) != Some("health") {
-        return Err(parse_failure("expected `gateway health`", arguments));
+        return native_gateway::parse(arguments, 1).map(Invocation::Native);
     }
+    parse_gateway_options(arguments, 2, false).map(Invocation::Gateway)
+}
+
+fn parse_gateway_options(
+    arguments: &[OsString],
+    start: usize,
+    allow_profile: bool,
+) -> Result<GatewayOptions, ParseFailure> {
     let mut endpoint = None;
     let mut ephemeral_device = false;
+    let mut device_profile = None;
     let mut secret_source = SecretSourceKind::None;
     let mut timeout = DEFAULT_TIMEOUT;
     let mut timeout_seen = false;
@@ -312,7 +433,7 @@ fn parse_gateway(arguments: &[OsString]) -> Result<Invocation, ParseFailure> {
     let mut json = false;
     let mut verbosity = Verbosity::Off;
     let mut log_file = None;
-    let mut index = 2;
+    let mut index = start;
 
     while index < arguments.len() {
         let Some(flag) = arguments[index].to_str() else {
@@ -329,7 +450,25 @@ fn parse_gateway(arguments: &[OsString]) -> Result<Invocation, ParseFailure> {
                 }
                 endpoint = Some(value.to_owned());
             }
-            "--ephemeral-device" if !ephemeral_device => ephemeral_device = true,
+            "--ephemeral-device" if !ephemeral_device && device_profile.is_none() => {
+                ephemeral_device = true;
+            }
+            "--device-profile"
+                if allow_profile && !ephemeral_device && device_profile.is_none() =>
+            {
+                index += 1;
+                let profile = option_value(arguments, index, "missing device profile")?
+                    .to_str()
+                    .filter(|profile| {
+                        !profile.is_empty()
+                            && profile.len() <= 64
+                            && profile.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+                            })
+                    })
+                    .ok_or_else(|| parse_failure("invalid device profile", arguments))?;
+                device_profile = Some(profile.to_owned());
+            }
             "--token-stdin" if matches!(secret_source, SecretSourceKind::None) => {
                 secret_source = SecretSourceKind::Stdin;
             }
@@ -374,22 +513,23 @@ fn parse_gateway(arguments: &[OsString]) -> Result<Invocation, ParseFailure> {
 
     let endpoint =
         endpoint.ok_or_else(|| parse_failure("gateway endpoint is required", arguments))?;
-    if !ephemeral_device {
+    if !ephemeral_device && device_profile.is_none() {
         return Err(parse_failure(
             "explicit --ephemeral-device opt-in is required",
             arguments,
         ));
     }
-    Ok(Invocation::Gateway(GatewayOptions {
+    Ok(GatewayOptions {
         endpoint,
         ephemeral_device,
+        device_profile,
         secret_source,
         timeout,
         allow_insecure_remote_ws,
         json,
         verbosity,
         log_file,
-    }))
+    })
 }
 
 fn option_value<'a>(

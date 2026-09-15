@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use unicode_width::UnicodeWidthChar;
 
 use crate::model::{AppModel, Prompt, RunState, Screen};
 
@@ -23,6 +24,8 @@ pub struct Cell {
     pub symbol: char,
     /// Cell styling.
     pub style: CellStyle,
+    /// Occupied by the preceding double-width glyph; never printed independently.
+    pub continuation: bool,
 }
 
 impl Default for Cell {
@@ -30,6 +33,7 @@ impl Default for Cell {
         Self {
             symbol: ' ',
             style: CellStyle::default(),
+            continuation: false,
         }
     }
 }
@@ -81,6 +85,7 @@ impl Grid {
         }
         (0..self.width)
             .filter_map(|x| self.cell(x, y))
+            .filter(|cell| !cell.continuation)
             .map(|cell| cell.symbol)
             .collect()
     }
@@ -96,24 +101,34 @@ impl Grid {
 
     pub(crate) fn put(&mut self, x: u16, y: u16, symbol: char, style: CellStyle) {
         if let Some(index) = self.index(x, y) {
-            self.cells[index] = Cell { symbol, style };
+            self.cells[index] = Cell {
+                symbol,
+                style,
+                continuation: false,
+            };
         }
     }
 
     pub(crate) fn write(&mut self, x: u16, y: u16, text: &str, style: CellStyle) {
-        let available = self.width.saturating_sub(x);
-        for (offset, symbol) in text
-            .chars()
-            .map(sanitize_character)
-            .take(usize::from(available))
-            .enumerate()
-        {
-            self.put(
-                x.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX)),
-                y,
-                symbol,
-                style,
-            );
+        let mut column = x;
+        for symbol in text.chars().map(sanitize_character) {
+            let width = u16::try_from(symbol.width().unwrap_or(1))
+                .unwrap_or(1)
+                .max(1);
+            if column.saturating_add(width) > self.width {
+                break;
+            }
+            self.put(column, y, symbol, style);
+            if width == 2
+                && let Some(index) = self.index(column + 1, y)
+            {
+                self.cells[index] = Cell {
+                    symbol: ' ',
+                    style,
+                    continuation: true,
+                };
+            }
+            column = column.saturating_add(width);
         }
     }
 
@@ -157,10 +172,132 @@ pub fn render(model: &AppModel, width: u16, height: u16, no_color: bool) -> Grid
         Screen::Help => draw_help(&mut grid),
     }
     draw_footer(&mut grid, model, no_color);
+    if model.composer_open && model.prompt.is_none() {
+        let row = grid.height().saturating_sub(5);
+        for target in row..grid.height().saturating_sub(2) {
+            for column in 0..grid.width() {
+                grid.put(column, target, ' ', CellStyle::default());
+            }
+        }
+        let title = model.memory_draft.as_ref().map_or_else(
+            || "Message".to_owned(),
+            |(_, draft)| format!("Memory {}", draft.action()),
+        );
+        grid.write(1, row, &title, accent);
+        let columns = usize::from(grid.width().saturating_sub(4)).max(1);
+        let mut used_columns = 0;
+        let tail: Vec<char> = model
+            .composer
+            .chars()
+            .rev()
+            .map(|character| {
+                if matches!(character, '\n' | '\r' | '\t') {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .take_while(|character| {
+                used_columns += unicode_width::UnicodeWidthChar::width(*character).unwrap_or(1);
+                used_columns <= columns
+            })
+            .collect();
+        let visible: String = tail.into_iter().rev().collect();
+        grid.write(1, row.saturating_add(1), &format!("> {visible}"), normal);
+    }
+    if matches!(
+        &model.prompt,
+        Some(Prompt::Approval {
+            preview_fingerprint: Some(_),
+            ..
+        })
+    ) {
+        draw_approval(&mut grid, model, no_color);
+    }
     if model.palette_open {
         draw_palette(&mut grid, model, no_color);
     }
     grid
+}
+
+fn approval_lines(text: &str, width: u16) -> Vec<String> {
+    let columns = usize::from(width.saturating_sub(4).max(1));
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let escaped: String = line
+            .chars()
+            .flat_map(|character| {
+                if character.is_ascii() && !character.is_control() {
+                    character.to_string()
+                } else {
+                    character.escape_unicode().to_string()
+                }
+                .chars()
+                .collect::<Vec<_>>()
+            })
+            .collect();
+        if escaped.is_empty() {
+            rows.push(String::new());
+        }
+        for chunk in escaped.as_bytes().chunks(columns) {
+            rows.push(String::from_utf8_lossy(chunk).into_owned());
+        }
+    }
+    rows
+}
+
+pub(crate) fn approval_fully_visible(model: &AppModel, width: u16, height: u16) -> bool {
+    let (width, height) = (width.min(MAX_GRID_WIDTH), height.min(MAX_GRID_HEIGHT));
+    let Some(Prompt::Approval {
+        text,
+        preview_fingerprint: Some(_),
+        ..
+    }) = &model.prompt
+    else {
+        return false;
+    };
+    width >= 24
+        && height >= 12
+        && model
+            .approval_scroll
+            .saturating_add(usize::from(height.saturating_sub(9)))
+            >= approval_lines(text, width).len()
+}
+
+fn draw_approval(grid: &mut Grid, model: &AppModel, no_color: bool) {
+    let Some(Prompt::Approval { text, .. }) = &model.prompt else {
+        return;
+    };
+    for row in 4..grid.height().saturating_sub(2) {
+        for column in 0..grid.width() {
+            grid.put(column, row, ' ', CellStyle::default());
+        }
+    }
+    grid.write(2, 4, "EXECUTION APPROVAL", colored(220, no_color));
+    let lines = approval_lines(text, grid.width());
+    let visible = usize::from(grid.height().saturating_sub(9));
+    let start = model
+        .approval_scroll
+        .min(lines.len().saturating_sub(visible));
+    for (index, line) in lines.iter().skip(start).take(visible).enumerate() {
+        grid.write(
+            2,
+            6 + u16::try_from(index).unwrap_or(u16::MAX),
+            line,
+            CellStyle::default(),
+        );
+    }
+    let status = if approval_fully_visible(model, grid.width(), grid.height()) {
+        "y Approve   n Deny"
+    } else {
+        "PageDown Review more   n Deny"
+    };
+    grid.write(
+        2,
+        grid.height().saturating_sub(3),
+        status,
+        colored(220, no_color),
+    );
 }
 
 /// Flushes a complete grid to a Crossterm output without blocking on network work.
@@ -177,6 +314,9 @@ pub fn flush<W: Write>(writer: &mut W, grid: &Grid, no_color: bool) -> io::Resul
         let mut cursor_known = true;
         for x in 0..grid.width() {
             let cell = grid.cell(x, y).unwrap_or_default();
+            if cell.continuation {
+                continue;
+            }
             if !cursor_known {
                 queue!(writer, MoveTo(x, y))?;
             }
@@ -216,6 +356,9 @@ pub fn flush_changes<W: Write>(
     for y in 0..grid.height() {
         for x in 0..grid.width() {
             let cell = grid.cell(x, y).unwrap_or_default();
+            if cell.continuation {
+                continue;
+            }
             if previous.cell(x, y) == Some(cell) {
                 continue;
             }
@@ -294,13 +437,17 @@ fn draw_sessions(grid: &mut Grid, model: &AppModel, no_color: bool) {
 
 fn draw_workspace(grid: &mut Grid, model: &AppModel, no_color: bool) {
     let split = grid.width().saturating_mul(2) / 3;
+    let transcript_columns = usize::from(split.saturating_sub(2)).max(1);
     let title = model
         .selected_session()
         .map_or("No session selected", |session| session.title.as_str());
     grid.write(
         1,
         4,
-        &format!("Transcript - {title}"),
+        &wrap_columns(&format!("Transcript - {title}"), transcript_columns)
+            .into_iter()
+            .next()
+            .unwrap_or_default(),
         colored(45, no_color),
     );
     grid.write(
@@ -312,25 +459,20 @@ fn draw_workspace(grid: &mut Grid, model: &AppModel, no_color: bool) {
     for y in 4..grid.height().saturating_sub(2) {
         grid.put(split, y, '|', colored(238, no_color));
     }
-    let body_height = usize::from(grid.height().saturating_sub(8));
+    let occupied = if model.composer_open || model.prompt.is_some() {
+        3
+    } else {
+        0
+    };
+    let body_height = usize::from(grid.height().saturating_sub(8 + occupied));
+    let rows = transcript_rows(model, transcript_columns);
     let start = model
-        .transcript
-        .len()
-        .saturating_sub(body_height.saturating_add(model.scroll));
-    for (row, entry) in model
-        .transcript
-        .iter()
-        .skip(start)
-        .take(body_height)
-        .enumerate()
-    {
+        .scroll
+        .checked_add(body_height)
+        .map_or(0, |window| rows.len().saturating_sub(window));
+    for (row, line) in rows.iter().skip(start).take(body_height).enumerate() {
         let y = 6_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
-        grid.write(
-            1,
-            y,
-            &format!("{}: {}", entry.role, entry.text),
-            CellStyle::default(),
-        );
+        grid.write(1, y, line, CellStyle::default());
     }
     for (row, tool) in model.tools.iter().rev().take(body_height).rev().enumerate() {
         let y = 6_u16.saturating_add(u16::try_from(row).unwrap_or(u16::MAX));
@@ -358,6 +500,53 @@ fn draw_workspace(grid: &mut Grid, model: &AppModel, no_color: bool) {
             );
         }
     }
+}
+
+fn wrap_columns(text: &str, columns: usize) -> Vec<String> {
+    let columns = columns.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        if character == '\n' {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+            continue;
+        }
+        let mut character = sanitize_character(character);
+        let mut width = character.width().unwrap_or(1).max(1);
+        if width > columns {
+            character = '\u{fffd}';
+            width = 1;
+        }
+        if used + width > columns {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        row.push(character);
+        used += width;
+    }
+    rows.push(row);
+    rows
+}
+
+fn transcript_rows(model: &AppModel, columns: usize) -> Vec<String> {
+    model
+        .transcript
+        .iter()
+        .flat_map(|entry| wrap_columns(&format!("{}: {}", entry.role, entry.text), columns))
+        .collect()
+}
+
+pub(crate) fn transcript_row_count(model: &AppModel) -> usize {
+    if model.viewport.0 < 8 {
+        return model.transcript.len();
+    }
+    transcript_rows(
+        model,
+        usize::from((model.viewport.0.min(MAX_GRID_WIDTH) * 2 / 3).saturating_sub(2)).max(1),
+    )
+    .len()
 }
 
 fn draw_runs(grid: &mut Grid, model: &AppModel, no_color: bool) {
@@ -514,7 +703,7 @@ fn draw_palette(grid: &mut Grid, model: &AppModel, no_color: bool) {
     grid.write(
         x.saturating_add(2),
         y.saturating_add(4),
-        "actions: refresh quit | Esc close",
+        "run  partial  partial-next  cancel  refresh  quit",
         colored(245, no_color),
     );
 }
@@ -543,7 +732,10 @@ const fn colored(value: u8, no_color: bool) -> CellStyle {
 fn sanitize_character(character: char) -> char {
     if character == '\n' || character == '\r' || character == '\t' {
         ' '
-    } else if character.is_control() {
+    } else if character.is_control()
+        || character.width() == Some(0)
+        || matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    {
         '\u{fffd}'
     } else {
         character

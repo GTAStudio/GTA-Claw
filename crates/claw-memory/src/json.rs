@@ -5,6 +5,8 @@ use std::fmt::{self, Display, Formatter};
 use std::io::{self, Read};
 
 use serde::de::DeserializeOwned;
+use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Number, Value};
 
 /// A failure while reading a size-bounded JSON document.
 #[derive(Debug)]
@@ -77,10 +79,183 @@ where
     serde_json::from_slice(&bytes).map_err(JsonDecodeError::Json)
 }
 
+/// Reads one unambiguous JSON value with bounded allocation and nesting.
+///
+/// In addition to the caller's raw byte limit, this rejects duplicate object
+/// keys, nesting beyond 64 containers, and more than 16,384 values. Existing
+/// typed readers keep their own deserialization semantics.
+///
+/// # Errors
+///
+/// Returns the errors of [`from_json_reader`], with structural violations
+/// reported as [`JsonDecodeError::Json`] before the offending value is built.
+pub fn from_json_value_reader<R: Read>(
+    reader: R,
+    max_input_bytes: usize,
+) -> Result<Value, JsonDecodeError> {
+    from_json_reader::<StrictValue, _>(reader, max_input_bytes).map(|value| value.0)
+}
+
+struct StrictValue(Value);
+
+impl<'de> serde::Deserialize<'de> for StrictValue {
+    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
+    where
+        Deserializer: serde::Deserializer<'de>,
+    {
+        ValueSeed {
+            depth: 0,
+            remaining: &mut 16_384,
+        }
+        .deserialize(deserializer)
+        .map(Self)
+    }
+}
+
+struct ValueSeed<'budget> {
+    depth: usize,
+    remaining: &'budget mut usize,
+}
+
+impl<'de> DeserializeSeed<'de> for ValueSeed<'_> {
+    type Value = Value;
+
+    fn deserialize<Deserializer>(
+        self,
+        deserializer: Deserializer,
+    ) -> Result<Value, Deserializer::Error>
+    where
+        Deserializer: serde::Deserializer<'de>,
+    {
+        if self.depth > 64 || *self.remaining == 0 {
+            return Err(Deserializer::Error::custom(
+                "JSON structural budget exceeded",
+            ));
+        }
+        *self.remaining -= 1;
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ValueSeed<'_> {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded JSON value without duplicate keys")
+    }
+
+    fn visit_bool<DecodeError: serde::de::Error>(self, value: bool) -> Result<Value, DecodeError> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<DecodeError: serde::de::Error>(self, value: i64) -> Result<Value, DecodeError> {
+        Ok(Value::Number(Number::from(value)))
+    }
+
+    fn visit_u64<DecodeError: serde::de::Error>(self, value: u64) -> Result<Value, DecodeError> {
+        Ok(Value::Number(Number::from(value)))
+    }
+
+    fn visit_f64<DecodeError: serde::de::Error>(self, value: f64) -> Result<Value, DecodeError> {
+        Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| DecodeError::custom("JSON numbers must be finite"))
+    }
+
+    fn visit_str<DecodeError: serde::de::Error>(self, value: &str) -> Result<Value, DecodeError> {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<DecodeError: serde::de::Error>(
+        self,
+        value: String,
+    ) -> Result<Value, DecodeError> {
+        Ok(Value::String(value))
+    }
+
+    fn visit_unit<DecodeError: serde::de::Error>(self) -> Result<Value, DecodeError> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<Access>(self, mut access: Access) -> Result<Value, Access::Error>
+    where
+        Access: SeqAccess<'de>,
+    {
+        if self.depth >= 64 {
+            return Err(Access::Error::custom("JSON nesting budget exceeded"));
+        }
+        let mut values = Vec::new();
+        while let Some(value) = access.next_element_seed(ValueSeed {
+            depth: self.depth + 1,
+            remaining: self.remaining,
+        })? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<Access>(self, mut access: Access) -> Result<Value, Access::Error>
+    where
+        Access: MapAccess<'de>,
+    {
+        if self.depth >= 64 {
+            return Err(Access::Error::custom("JSON nesting budget exceeded"));
+        }
+        let mut values = Map::new();
+        while let Some(key) = access.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(Access::Error::custom("duplicate JSON object key"));
+            }
+            let value = access.next_value_seed(ValueSeed {
+                depth: self.depth + 1,
+                remaining: self.remaining,
+            })?;
+            values.insert(key, value);
+        }
+        Ok(Value::Object(values))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{JsonDecodeError, from_json_reader};
+    use super::{JsonDecodeError, from_json_reader, from_json_value_reader};
     use crate::{MemoryRecord, Session};
+
+    #[test]
+    fn strict_value_reader_preserves_json_types_and_exact_integer_values() {
+        let document = br#"{"integer":18446744073709551615,"minimum":-9223372036854775808,"number":1.25,"text":"line\nvalue","array":[null,true,false]}"#;
+        let expected: serde_json::Value =
+            serde_json::from_slice(document).expect("valid reference");
+        let actual =
+            from_json_value_reader(document.as_slice(), document.len()).expect("strict JSON");
+        assert_eq!(actual, expected);
+        assert_eq!(actual["integer"].as_u64(), Some(u64::MAX));
+        assert_eq!(actual["minimum"].as_i64(), Some(i64::MIN));
+    }
+
+    #[test]
+    fn strict_value_reader_rejects_ambiguous_deep_wide_and_trailing_input() {
+        for document in [
+            r#"{"path":"reviewed","path":"changed"}"#,
+            r#"{"outer":{"value":1,"\u0076alue":2}}"#,
+            "{} {}",
+            "1e9999",
+        ] {
+            assert!(from_json_value_reader(document.as_bytes(), document.len()).is_err());
+        }
+        let accepted = format!("{}0{}", "[".repeat(64), "]".repeat(64));
+        assert!(from_json_value_reader(accepted.as_bytes(), accepted.len()).is_ok());
+        let rejected = format!("{}0{}", "[".repeat(10_000), "]".repeat(10_000));
+        assert!(from_json_value_reader(rejected.as_bytes(), rejected.len()).is_err());
+        let accepted = serde_json::to_vec(&vec![0; 16_383]).expect("bounded array");
+        assert!(from_json_value_reader(accepted.as_slice(), accepted.len()).is_ok());
+        let rejected = serde_json::to_vec(&vec![0; 16_384]).expect("oversized array");
+        assert!(from_json_value_reader(rejected.as_slice(), rejected.len()).is_err());
+        assert!(matches!(
+            from_json_value_reader(b"{}".as_slice(), 1),
+            Err(JsonDecodeError::InputTooLong { .. })
+        ));
+    }
 
     #[test]
     fn a_document_within_the_outer_limit_decodes_normally() {

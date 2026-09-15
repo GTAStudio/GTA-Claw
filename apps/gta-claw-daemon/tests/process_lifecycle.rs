@@ -30,6 +30,12 @@ fn command() -> (Command, PathBuf) {
     ));
     let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"));
     command.env_clear();
+    #[cfg(windows)]
+    for name in ["SystemRoot", "SystemDrive", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     command
         .args([
             "--smoke",
@@ -61,7 +67,7 @@ fn normal_mode_remains_running_until_terminated() {
     let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("daemon process starts");
     let mut child = ChildGuard { child, state };

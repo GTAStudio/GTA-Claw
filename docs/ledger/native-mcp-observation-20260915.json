@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "stage": "mcp-confirmed-subscriptions-and-bounded-resource-observation",
+  "capturedAtUtc": "2026-09-15T02:53:25.0335210Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-mcp/src/client.rs","sha256":"e7f67fd36108e209fb3eda1b3be561ac411c07d698c72aa05ab0931a129c2de8"},
+    {"path":"crates/claw-mcp/tests/http_interop.rs","sha256":"5ee10d9c9f825e891c9651420cdea7aa0f25367dd00cc1245eb5b36855ca999d"},
+    {"path":"crates/claw-mcp/tests/stdio_interop.rs","sha256":"ff5b97b52b9f4ff307d6b424dc2509b68cdf85c7d26bdf9b6b824b3154e25ac4"},
+    {"path":"apps/gta-claw-daemon/src/adapters/native_mcp.rs","sha256":"63134d6f8cf9a9a8a58302c85640b30acc30d9421a11db3dc6465931a15ead40"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"193111eeac93bd2e94a02b586c59a33683bf7bc7935ca0d47a8bc81a8132cbee"},
+    {"path":"apps/gta-claw-cli/tests/foundation.rs","sha256":"91f4d3754362d632dcd55d1f19febe9de5f07f75e9ef33d6ef454db130a74a4e"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":405, "failed":0, "ignored":5, "testBinaries":20,
+      "log":"target/native-mcp-observation-tests-20260915T025141634Z.log",
+      "sha256":"d6a7f5f20348b965e6fc62e38ade177eafc3be8df5ace8ee0e89514fc86e247e"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-observation-clippy-20260915T025312481Z.log",
+      "sha256":"33ee9b6f4365f0965db1339d8477e379c91b5cbbe4affe29f89b65ee952bc42d"
+    }
+  ],
+  "priorChecks": [
+    {"result":"failed","reason":"OAuth CLI native record status unexpectedly returned absent; root cause unconfirmed","log":"target/native-mcp-observation-tests-20260915T024800579Z.log","sha256":"3cf9159c9435e59d7290a460e1db80354163dcec78f294aa0bed18ce94061e72"},
+    {"result":"passed","reason":"isolated original status test did not reproduce the failure","log":"target/native-mcp-observation-oauth-status-recheck-20260915T025047215Z.log","sha256":"291a7ebecb9d7e3de7ba532a79e223ea2b6e08a800b200f61c005471ba2fb841"}
+  ],
+  "behaviorEvidence": [
+    "resource_subscription_state_bounds_and_fences_unconfirmed_notifications",
+    "resource_subscription_success_releases_only_the_confirmed_uri",
+    "resource_subscriptions_filter_notifications_and_never_replay_uncertain_transitions",
+    "native_mcp_resource_watch_requires_bounded_arguments_and_counts_only_its_fixed_uri",
+    "native_mcp_resource_watch_has_bounded_notifications_and_owned_subscription_cleanup",
+    "bound_native_mcp_tools_require_exact_approval_and_never_auto_publish_or_replay"
+  ],
+  "notes": [
+    "SDK resource updates now require confirmed per-connection subscriptions; pending updates coalesce and unknown transitions retain bounded capacity",
+    "Daemon resource_watch is an approved fixed-URI observation capped at three seconds and 32 advisory updates, with no automatic read",
+    "Completion attempts unsubscription and closes the owned connection; failures remain unknown and are not replayed",
+    "Six SDK and nine daemon actual protocol cases plus both real-daemon credential modes validate lifecycle and cleanup",
+    "Original native status failure remains retained; added assertions are diagnostics only, not a root-cause fix",
+    "No dependency/lock changes, real accounts, production proxy changes or browser execution"
+  ],
+  "unverified": [
+    "Root cause and stability of the unreproduced native OAuth status failure",
+    "Persistent subscriptions, complete event history, cursor replay and cross-restart recovery",
+    "Already-admitted notification races and same-URI old event discrimination",
+    "Live-platform acceptance, deployment, complete frozen manifests and whole-project completion"
+  ]
+}

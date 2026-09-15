@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+jsonschema = { version = "=0.56.0", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true

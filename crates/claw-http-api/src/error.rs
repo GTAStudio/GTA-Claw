@@ -31,6 +31,17 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn recovery_required(kind: &str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            body: json!({"error": {
+                "message": message.into(), "type": kind,
+                "retryable": false, "recoveryRequired": true
+            }}),
+            allow: None,
+        }
+    }
+
     pub(crate) fn method(allow: &'static str) -> Self {
         Self {
             status: StatusCode::METHOD_NOT_ALLOWED,

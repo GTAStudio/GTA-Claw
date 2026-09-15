@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "stage": "verified-memory-page-collection-and-encrypted-file-import-export",
+  "capturedAtUtc": "2026-09-14T18:08:56.0699367Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-cli/src/native_gateway.rs","sha256":"621b901963f68d594f4af4fa6bfd862650060749032009b273a7bc05e29204bc"},
+    {"path":"apps/gta-claw-cli/src/state_snapshot.rs","sha256":"57ba52227a2d0b8bb8f091ce500af1379c040f797d060f3b48a344b513a97c84"},
+    {"path":"apps/gta-claw-cli/src/lib.rs","sha256":"f0349026cc9eb51e8597f295c616b72708695a357228c2f6b4912d9bb29f0f19"},
+    {"path":"apps/gta-claw-cli/tests/gateway_health.rs","sha256":"a51c8e071e905523289cf417e1b4fb8e98c1b070ef9a65367dd752b6d4b98f4c"}
+  ],
+  "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-cli --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":76, "failed":0, "ignored":1, "testBinaries":5,
+      "log":"target/native-memory-files-tests-20260914T180746588Z.log",
+      "sha256":"c66f30064dc17c0b291c6a48fcac02e2aec112724b26606e8a69e20d3881d96c"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-cli --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-memory-files-clippy-20260914T180844501Z.log",
+      "sha256":"12fbf5751a98cc5dc1fb2016721da844a9582d533d1827714bc18ef10077939c"
+    }
+  ],
+  "behaviorEvidence": [
+    "memory_archive_pages_require_contiguous_utf8_identity_and_final_digest",
+    "memory_encrypted_export_requires_a_new_local_file_and_separate_secret_input",
+    "native_memory_encrypted_export_collects_approved_pages_and_never_publishes_bad_data",
+    "encrypted_state_snapshot_roundtrip_is_private_atomic_and_never_overwrites_targets"
+  ],
+  "notes": [
+    "Actual subprocess/WebSocket export creates an authenticated age file that is independently decrypted and imported",
+    "Every page retains normal human approval; original keys are not automatically resubmitted or acknowledged",
+    "Destination creation follows complete page, digest and archive validation; existing files survive unchanged",
+    "Wrong passphrase, corrupted ciphertext and oversized input are refused before Gateway connection",
+    "Token/passphrase input buffers are zeroized and never included in tool arguments, argv or output",
+    "File/KDF workers are joined after cancellation; network timeout is not a hard filesystem deadline",
+    "The runtime initialization error line is an existing passing fault-injection test",
+    "No new dependencies; existing dirty Cargo.lock witness is preserved"
+  ],
+  "unverified": [
+    "staged import above the existing 16 KiB tool-envelope bound",
+    "automatic server result ACK/cleanup and client crash-journal recovery",
+    "GUI encrypted-file workflows and actual cross-platform interaction",
+    "parent-directory power-loss durability and hard whole-filesystem deadlines",
+    "full provenance/deletion/semantic workflows, real accounts, deployment and whole-project completion"
+  ]
+}

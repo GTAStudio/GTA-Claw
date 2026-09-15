@@ -1172,15 +1172,15 @@ impl McpBackend for ConversationMcpBackend {
         info
     }
 
-    async fn list_tools(
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: OperationContext,
-    ) -> std::result::Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult {
+    ) -> impl std::future::Future<Output = std::result::Result<ListToolsResult, ErrorData>> + Send {
+        std::future::ready(Ok(ListToolsResult {
             tools: Self::tools(),
             ..ListToolsResult::default()
-        })
+        }))
     }
 
     async fn call_tool(

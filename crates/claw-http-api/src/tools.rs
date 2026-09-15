@@ -30,6 +30,10 @@ pub(crate) async fn invoke(
         );
     }
     let invocation_context = ToolInvocationContext {
+        authority: Some(
+            principal.tool_authority(claw_application::ports::tool::InvocationSource::Http),
+        ),
+        binding: None,
         session_key: optional_body_string_from_request(&request, "x-openclaw-session-key"),
         agent_id: optional_body_string_from_request(&request, "x-openclaw-agent-id"),
         idempotency_key: None,
@@ -37,7 +41,7 @@ pub(crate) async fn invoke(
         account_id: optional_body_string_from_request(&request, "x-openclaw-account-id"),
         agent_to: optional_body_string_from_request(&request, "x-openclaw-message-to"),
         agent_thread_id: optional_body_string_from_request(&request, "x-openclaw-thread-id"),
-        sender_is_owner: true,
+        sender_is_owner: principal.scopes.contains(Scope::OperatorAdmin),
         dry_run: false,
     };
     let value = read_json_value(request, limits.tools_body_bytes, limits.body_timeout).await?;
@@ -80,10 +84,9 @@ pub(crate) async fn invoke(
     )
     .await
     .map_err(|_| {
-        ApiError::openai(
-            StatusCode::GATEWAY_TIMEOUT,
-            "tool execution timed out",
-            "tool_error",
+        ApiError::recovery_required(
+            "outcome_unknown",
+            "Tool execution timed out with an unknown outcome. Reconcile recorded effects before retrying; do not repeat it automatically.",
         )
     })?
     .map_err(|error| {
@@ -93,8 +96,9 @@ pub(crate) async fn invoke(
             PortErrorKind::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "tool_error"),
             PortErrorKind::Timeout => (StatusCode::GATEWAY_TIMEOUT, "tool_error"),
             PortErrorKind::CommittedButNotDurable => {
-                (StatusCode::CONFLICT, "committed_but_not_durable")
+                return ApiError::recovery_required("committed_but_not_durable", error.message);
             }
+            PortErrorKind::OutcomeUnknown => return ApiError::recovery_required("outcome_unknown", error.message),
             PortErrorKind::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "tool_error"),
         };
         ApiError::openai(status, error.message, error_type)
@@ -150,6 +154,14 @@ fn tool_response(outcome: ToolOutcome) -> Response {
             "requiresApproval".to_owned(),
             Value::Bool(requires_approval),
         );
+    }
+    if matches!(
+        error.get("type").and_then(Value::as_str),
+        Some("outcome_unknown" | "committed_but_not_durable")
+    ) {
+        error.insert("retryable".to_owned(), Value::Bool(false));
+        error.insert("recoveryRequired".to_owned(), Value::Bool(true));
+        return json_response(StatusCode::CONFLICT, &json!({"ok":false,"error":error}));
     }
     json_response(status, &json!({"ok":false,"error":error}))
 }

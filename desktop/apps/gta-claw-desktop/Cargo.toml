@@ -11,7 +11,7 @@ build = "build.rs"
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 claw-application.workspace = true
 claw-gateway-client.workspace = true
-claw-platform.workspace = true
+claw-platform = { workspace = true, features = ["native-identity"] }
 claw-protocol.workspace = true
 claw-security.workspace = true
 getrandom = { version = "=0.4.3", features = ["sys_rng"] }

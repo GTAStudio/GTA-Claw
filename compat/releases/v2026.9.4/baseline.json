@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "repository": "openclaw/openclaw",
+  "package_version": "2026.9.4",
+  "release_tag": "v2026.9.4",
+  "tag_object_sha": "8bec206f3c1f787e1e9c45cfd34d3de2a78c7b8e",
+  "commit_sha": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "tree_sha": "e12ac49c56657a501b3eab13539bda4fa8aaee5f",
+  "gateway": {
+    "current": 4,
+    "minimum_general_client": 4,
+    "minimum_authenticated_node": 3,
+    "minimum_probe": 3
+  },
+  "evidence": {
+    "method": "github_api",
+    "commit_signature_verified": true,
+    "tag_signature_verified": true
+  }
+}

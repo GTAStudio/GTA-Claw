@@ -102,14 +102,10 @@ async fn tool_invocation_context_comes_from_headers_with_the_body_winning() {
     assert_eq!(context.agent_thread_id.as_deref(), Some("thread-1"));
 }
 
-/// Ownership is asserted rather than derived, which is pinned as a difference.
-///
-/// The adapter reports every HTTP caller as the session owner. That is a real
-/// difference worth naming: a future change that derives ownership from the
-/// authenticated principal has to update this test deliberately.
+/// Write authorization alone must not confer operator ownership.
 #[tokio::test]
-async fn tool_invocation_ownership_is_pinned_as_a_known_constant() {
-    for token in ["operator-token", "write-token"] {
+async fn tool_invocation_ownership_is_derived_from_the_authenticated_admin_scope() {
+    for (token, owner) in [("operator-token", true), ("write-token", false)] {
         let server = spawn(script(json!({ "tool": { "kind": "echo" } }))).await;
         let response = server
             .send(&RequestSpec::post(
@@ -119,9 +115,10 @@ async fn tool_invocation_ownership_is_pinned_as_a_known_constant() {
             ))
             .await;
         assert_eq!(response.status, 200);
-        assert!(
+        assert_eq!(
             server.runtime.tool_invocation().context.sender_is_owner,
-            "{token} was not reported as the session owner"
+            owner,
+            "{token} must preserve its authenticated ownership boundary"
         );
     }
 }

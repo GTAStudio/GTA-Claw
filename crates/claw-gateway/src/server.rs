@@ -23,7 +23,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::config::{GatewayServerConfig, ValidatedConfig};
 use crate::connection::{self, ConnectionServices};
 use crate::directory::ConnectionDirectory;
-use crate::dispatch::MethodRegistry;
+use crate::dispatch::{MethodHandler, MethodRegistry};
 use crate::error::ServerError;
 use crate::events::{ConnectionId, EventBus, EventDraft};
 use crate::methods;
@@ -96,6 +96,22 @@ impl GatewayServer {
     pub fn with_store(mut self, store: Arc<dyn GatewayStore>) -> Self {
         self.store = store;
         self
+    }
+
+    /// Installs application behavior for a catalogued method before the server is bound.
+    ///
+    /// The registry retains the method's frozen role and scope requirements.
+    ///
+    /// # Errors
+    ///
+    /// Rejects method names outside the frozen catalog.
+    pub fn with_method(
+        mut self,
+        name: &str,
+        handler: Arc<dyn MethodHandler>,
+    ) -> Result<Self, ServerError> {
+        Arc::make_mut(&mut self.registry).register(name, handler)?;
+        Ok(self)
     }
 
     /// Replaces the wall-clock port.
@@ -552,6 +568,66 @@ mod tests {
         assert_eq!(server.registry().len(), 278);
         assert_eq!(server.directory().len(), 0);
         assert_eq!(server.events().subscriber_count(), 0);
+    }
+
+    #[derive(Debug)]
+    struct ApplicationHandler;
+
+    impl crate::dispatch::MethodHandler for ApplicationHandler {
+        fn handle<'a>(
+            &'a self,
+            _context: crate::dispatch::MethodContext<'a>,
+            _params: serde_json::Value,
+        ) -> crate::dispatch::MethodFuture<'a> {
+            Box::pin(async { Ok(serde_json::json!({"application": true})) })
+        }
+    }
+
+    #[test]
+    fn application_method_binding_preserves_catalog_and_authorization() {
+        let server = server(2)
+            .with_method("exec.approval.resolve", Arc::new(ApplicationHandler))
+            .expect("bind a catalogued method");
+        assert_eq!(server.registry().len(), 278);
+        assert!(
+            server
+                .registry()
+                .implemented_names()
+                .contains(&"exec.approval.resolve")
+        );
+        assert!(
+            server
+                .registry()
+                .authorize_call(
+                    Role::Operator,
+                    &[],
+                    "exec.approval.resolve",
+                    &serde_json::json!({})
+                )
+                .is_err()
+        );
+        assert!(
+            server
+                .registry()
+                .authorize_call(
+                    Role::Operator,
+                    &[claw_protocol::gateway::OperatorScope::Approvals],
+                    "exec.approval.resolve",
+                    &serde_json::json!({}),
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn application_method_binding_rejects_unknown_names() {
+        let error = server(2)
+            .with_method("application.unknown", Arc::new(ApplicationHandler))
+            .expect_err("application code cannot expand the frozen method set");
+        assert!(matches!(
+            error,
+            crate::error::ServerError::Registry(crate::error::DispatchError::UnknownMethod(_))
+        ));
     }
 
     #[tokio::test]

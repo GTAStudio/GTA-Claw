@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "stage": "owner-bound-gateway-partial-text-pages-and-cli",
+  "capturedAtUtc": "2026-09-15T05:26:34.1780836Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-daemon/src/adapters/runtime_gateway.rs","sha256":"322c3d7b1f1407c2854423849775c187a889eab3348c5d5753621f2505509dc2"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"e3e511e8eeda7aaea62e6619f81eca79d7892be93c1a90fd611b3b6d3bb2915b"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"217fad53ccd38658a2444f1f4e62d2f99a3fe9a927467bbf894ed15e605d55b6"},
+    {"path":"apps/gta-claw-cli/src/native_gateway.rs","sha256":"40b2b2c5c963b3ca06b009c2970cf8810e690fd8fdf40ab578d6c75eabd76850"},
+    {"path":"apps/gta-claw-cli/src/lib.rs","sha256":"412950516d11bd373935cc176bc79322eb80139f653d2f6cd520e2175a99f932"},
+    {"path":"apps/gta-claw-cli/tests/gateway_health.rs","sha256":"545eaf99d0573eee9aa39a16a68c1636959f8dac7f7bb1dcbdd4e451c4240e88"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":318, "failed":0, "ignored":5, "testBinaries":14,
+      "log":"target/native-partial-pages-tests-20260915T052331508Z.log",
+      "sha256":"f38ad0d1e357f1fa9a9775c367768e28e41a879ad1b1c491131fafc9c8c33a4e"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-partial-pages-clippy-20260915T052252919Z.log",
+      "sha256":"48c512bd3ba500de6af1d105e29cb0b4b3d7e70f788d83cd5f326db901ddbbfe"
+    }
+  ],
+  "retainedFailures": [
+    {"log":"target/native-partial-pages-clippy-20260915T052208740Z.log","sha256":"57edbfa6f2638676d411c4506f3b731ef20fe022e7c13a6ac42decdb94a1e2e6","reason":"Optional cursor and nested validation condition lint; simplified without changing checks"}
+  ],
+  "behaviorEvidence": [
+    "gateway_partial_text_pages_are_utf8_bounded_content_pinned_and_not_complete",
+    "native_partial_page_requires_revision_and_digest_without_ack_or_wait",
+    "bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection",
+    "partial_run_command_pins_revision_offset_and_digest_without_ack_or_wait",
+    "partial_run_reply_refuses_changed_identity_unbounded_text_and_false_completeness",
+    "native_business_commands_use_real_rpc_and_the_minimum_exact_scope",
+    "partial_run_cli_rejects_corrupt_pages_without_rendering_their_text"
+  ],
+  "notes": [
+    "agent.wait partialPage is an explicit native extension: terminal run ownership and exact revision are checked before reading its bound turn",
+    "Visible partial text only, at most 2048 UTF-8 bytes per page and 4 MiB total; later offsets require the original SHA256 and character boundaries",
+    "No reasoning/tool arguments, ACK, provider retry, result promotion or complete-history insertion occurs",
+    "CLI gateway partial-run requires run ID and revision, validates closed response identity/cursor/limits/flags, and verifies full SHA for a complete single-page result before rendering",
+    "Multi-page reads pin the same digest but individual later pages cannot independently verify the full text hash; no automatic all-page collector is claimed",
+    "Real daemon tests cover owner reads, wrong revision/digest/offset, a different paired device refusal, retained pending result and unchanged nine provider calls per dialect",
+    "Actual CLI child tests verify first/continuation request shape, exactly operator.read, clean close and no body disclosure for a corrupt page",
+    "First CLI parameter fixture omitted its already-required endpoint; the test was corrected, not the product requirement",
+    "No dependency versions/downloads, real accounts, production proxy/process changes, browser execution, device migration, deployment or Git writes"
+  ],
+  "unverified": [
+    "Automatic complete multi-page export, TUI/desktop partial-result views and remote-service acceptance",
+    "Runtime usage/finish provenance and monetary accounting; Gateway result status remains outcome_unknown where previously required",
+    "Signed/opaque reasoning continuation, complete provider/account lifecycle and the two prior native-credential anomalies",
+    "Complete frozen build manifests, MSRV/release and whole-project acceptance"
+  ]
+}

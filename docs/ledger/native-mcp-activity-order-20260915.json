@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-mcp-monotonic-activity-and-idle-expiry",
+  "capturedAtUtc": "2026-09-15T09:06:29.2773578Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-http-api/src/mcp.rs","sha256":"2f52718c0ee065ab296657a91f52d3ac6edfb4e9909c51944fc05f34e87b670f"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":360, "failed":0, "ignored":4, "testBinaries":19,
+      "log":"target/native-mcp-activity-order-tests-20260915T090356107Z.log",
+      "sha256":"9e5875279b148d1914bd7e1e26bb19dd92d31cca1e4d0e343e418d53ec6d91dc"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-activity-order-clippy-20260915T090328662Z.log",
+      "sha256":"639ff7b3dd23ccc50c3ca9dc44ce7727dff7b78dea2f2b217522a6967818a2aa"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api --lib mcp_out_of_order_request_timestamps --locked --offline --quiet",
+      "result":"passed", "passed":1, "failed":0, "ignored":0, "testBinaries":1,
+      "log":"target/native-mcp-activity-order-focused-20260915T090110057Z.log",
+      "sha256":"b6634a50f62cc4be0ad27d7fb83f5e56496ddc24eeadfcd310891f87ac3fcd7d",
+      "scopeNote":"Same deterministic test that failed before the two-line production repair, included in final cohort"
+    }
+  ],
+  "retainedFailures": [
+    {"log":"target/native-mcp-activity-order-baseline-20260915T085950392Z.log","sha256":"5b4ab62ec9b036b212eb5582380c347b3b4ef223663574ea343020a9dc318cdb","passed":0,"failed":1,"ignored":0,"testBinaries":1,"reason":"An older sampled create wrongly cancelled a newer active session, deterministically reproducing the idle-ordering defect"},
+    {"log":"target/native-mcp-activity-order-clippy-20260915T090237323Z.log","sha256":"14592a406c32acd2061d0f8700dfb571982444419aa44e4f82b9e461ec247a9f","reason":"Test used unchecked time subtraction and held its table lock longer than needed; repaired without production semantic changes"}
+  ],
+  "behaviorEvidence": [
+    "mcp_out_of_order_request_timestamps_do_not_expire_or_backdate_sessions",
+    "mcp_idle_sessions_cancel_without_new_requests_and_hold_active_permits_until_release",
+    "mcp_idle_expiry_finishes_real_sse_body_and_releases_stream_capacity",
+    "native_mcp_http_client_interoperates_with_owned_daemon_sessions"
+  ],
+  "notes": [
+    "Request activity is sampled before locking; lock acquisition can reorder samples, so negative checked elapsed time is not evidence of inactivity",
+    "Expiry now uses is_some_and(age >= idle_timeout) and resolve updates touched with max(previous, now); TTL remains 30 minutes",
+    "Deterministic test covers reversed create/resolve samples, latest-activity TTL minus one nanosecond, exact TTL cancellation and permits retained until actual drop",
+    "Two production lines plus one neighboring regression changed; no initialization, authentication, DELETE, shutdown or retry policy was relaxed",
+    "This establishes a deterministic defect compatible with the earlier SessionExpired observation, but the original failed run has no clock trace and is not proven to have this as its sole cause",
+    "Native keyring, OAuth record verification, stdio file-lock and other previously retained failures remain open",
+    "No dependency/lock change, production/proxy operation, real account/browser/device migration, deployment or Git write occurred"
+  ],
+  "unverified": [
+    "Unique root-cause attribution for the historical SessionExpired failure without request timestamp evidence",
+    "Previously retained credential/OAuth/stdio anomalies, cross-platform suspend/clock behavior and real 30-minute endurance",
+    "Complete MCP lifecycle parity, frozen build manifests, release and whole-project acceptance"
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "stage": "http-mcp-owned-bounded-request-cancellation",
+  "capturedAtUtc": "2026-09-14T21:05:27.6565100Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-http-api/src/mcp.rs","sha256":"dd817ea4a01c10b37f0b300d2184f229a40a156932ad3beb44d3007e372658d2"},
+    {"path":"crates/claw-http-api/src/state.rs","sha256":"374758e34b01a8bb508a076976b55518e24392c72a41bbae9755b472904fb072"},
+    {"path":"crates/claw-http-api/tests/e2e.rs","sha256":"0b6c84c8061957ca0eef2e68d706c1e134ba431730e037f25ed0409826143d8a"}
+  ],
+  "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":319, "failed":0, "ignored":4, "testBinaries":18,
+      "log":"target/native-mcp-cancellation-tests-20260914T210415614Z.log",
+      "sha256":"411bf6916430ad1772933b53f7901445462a4e757110a7ae7af71291a6042a11"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-cancellation-clippy-20260914T210349437Z.log",
+      "sha256":"ff7bb6a975e57914fda7737873ec55d3304e7ac6bedc91b271b43a4f502f42ec"
+    }
+  ],
+  "behaviorEvidence": [
+    "mcp_active_requests_are_bounded_owned_exclusive_and_cancelled_on_drop",
+    "mcp_cancellation_targets_only_the_authenticated_active_request",
+    "tools_outcome_unknown_and_timeouts_never_invite_http_or_mcp_replay"
+  ],
+  "notes": [
+    "Active calls are bound to the authenticated subject and typed request ID with 256 global and 32 subject slots",
+    "Cancellation notifications reach only the matching token; cancelled but unfinished calls retain capacity",
+    "Duplicate, absent, null, floating-point and oversized IDs are refused before tool invocation",
+    "Guard cleanup and real TCP two-owner cancellation/ID reuse are verified; cancellation is not rollback",
+    "No new dependencies or changes to the existing Cargo.lock witness"
+  ],
+  "unverified": [
+    "same-credential multi-client session isolation and stale cancellation attribution",
+    "full claw-mcp client/server product composition, OAuth/stdio, resource/prompt lifecycle and ACP",
+    "external service/platform/power-loss acceptance, deployment and whole-project completion"
+  ]
+}

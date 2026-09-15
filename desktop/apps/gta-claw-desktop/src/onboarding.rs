@@ -378,6 +378,7 @@ impl EndpointRejection {
 pub(crate) struct ConnectRequest {
     endpoint: GatewayEndpoint,
     token: Option<SecretString>,
+    remember_device: bool,
 }
 
 impl ConnectRequest {
@@ -415,13 +416,20 @@ impl ConnectRequest {
                 endpoint_display: Some(endpoint.display().to_owned()),
                 error: UserError::input(
                     "identity.consent-required",
-                    "Consent is required before creating an ephemeral device identity.",
+                    "Consent is required before using a Gateway device identity.",
                     "Review the pairing notice and select the consent checkbox.",
                 ),
             });
         }
-        Ok(Self { endpoint, token })
+        Ok(Self { endpoint, token, remember_device: false })
     }
+
+    pub(crate) const fn with_remembered_device(mut self, remember: bool) -> Self {
+        self.remember_device = remember;
+        self
+    }
+
+    pub(crate) const fn remember_device(&self) -> bool { self.remember_device }
 
     pub(crate) fn endpoint_display(&self) -> &str {
         self.endpoint.display()
@@ -442,6 +450,7 @@ impl Debug for ConnectRequest {
             .debug_struct("ConnectRequest")
             .field("endpoint", &self.endpoint)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("remember_device", &self.remember_device)
             .finish()
     }
 }

@@ -143,8 +143,7 @@ pub(crate) fn try_junction(original: &Path, link: &Path) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+        .is_ok_and(|status| status.success());
     created && fs::symlink_metadata(link).is_ok()
 }
 

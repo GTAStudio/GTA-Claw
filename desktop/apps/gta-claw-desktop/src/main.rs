@@ -137,7 +137,12 @@ fn apply_product_state(window: &AppWindow, models: &ProductModels, state: &Produ
     window
         .set_session_detail(format!("{} · {}", selected_run.workspace, selected_run.detail).into());
     window.set_session_tone(tone_index(selected_run.state.tone()));
-    window.set_can_approve(selected_run.state == RunState::WaitingForApproval);
+    window.set_can_approve(state.can_present_approval());
+    window.set_can_abort(state.native_abort().is_some());
+    window.set_can_send_message(state.can_send_native_message());
+    window.set_memory_binding(state.memory_binding().into());
+    window.set_can_retry_memory(state.retry_native_memory().is_some());
+    window.set_memory_result(state.memory_result().into());
     window.set_can_answer(selected_run.state == RunState::WaitingForAnswer);
     window.set_approval_prompt(state.approval_prompt().into());
     window.set_approval_scope(state.approval_scope().into());
@@ -431,7 +436,7 @@ fn enqueue_submission(
     };
     window.invoke_replace_endpoint_input(safe_endpoint.into());
     let result = match submission {
-        Ok(request) => sender.connect(request),
+        Ok(request) => sender.connect(request.with_remembered_device(window.get_remember_device())),
         Err(rejection) => sender.reject_submission(rejection),
     };
     if let Err(rejection) = result {
@@ -812,22 +817,223 @@ fn wire_callbacks(
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+fn wire_native_callbacks(window: &AppWindow, sender: ControllerSender, view: &Rc<ProductView>) {
+    let product = Rc::clone(view);
+    let commands = sender.clone();
+    let weak = window.as_weak();
+    window.on_memory_retry_requested(move |binding| {
+        let params = {
+            let state = product.state.borrow();
+            (binding.as_str() == state.memory_binding())
+                .then(|| state.retry_native_memory())
+                .flatten()
+        };
+        let connection = product.state.borrow().native_connection();
+        if let (Some(params), Some(connection)) = (params, connection) {
+            let result = commands.memory_request(connection, params.clone());
+            if result.is_ok() {
+                product.state.borrow_mut().native_message_enqueued(&params);
+            }
+            apply_command_result(&weak, result);
+            if let Some(window) = weak.upgrade() {
+                product.apply(&window);
+            }
+        }
+    });
+    let product = Rc::clone(view);
+    let commands = sender.clone();
+    let weak = window.as_weak();
+    window.on_memory_submitted(move |binding, action, id, kind, revision, offset, content, overwrite| {
+        let form = product_state::MemoryForm { action, id: id.as_str(), kind, revision: revision.as_str(), offset: offset.as_str(), content: content.as_str(), overwrite };
+        let params = product.state.borrow_mut().native_memory(binding.as_str(), &form);
+        let connection = product.state.borrow().native_connection();
+        match (params, connection) {
+            (Ok(params), Some(connection)) => {
+                let result = commands.memory_request(connection, params.clone());
+                if result.is_ok() { product.state.borrow_mut().native_message_enqueued(&params); }
+                apply_command_result(&weak, result);
+            }
+            (result, _) => {
+                if let Some(window) = weak.upgrade() {
+                    apply_error(&window, &UserError::input("memory.invalid-input", result.err().unwrap_or("Memory connection is unavailable"), "Review the selected action, revision and bounded input before retrying."));
+                }
+            }
+        }
+        if let Some(window) = weak.upgrade() { product.apply(&window); }
+    });
+    let product = Rc::clone(view);
+    let commands = sender.clone();
+    let weak = window.as_weak();
+    window.on_abort_requested(move || {
+        let state = product.state.borrow();
+        if let (Some(connection), Some(params)) = (state.native_connection(), state.native_abort())
+        {
+            apply_command_result(
+                &weak,
+                commands.product_request(connection, "chat.abort", params),
+            );
+        }
+    });
+    let weak = window.as_weak();
+    let product = Rc::clone(view);
+    let commands = sender.clone();
+    window.on_message_submitted(move |message| {
+        let params = product.state.borrow_mut().native_message(message.as_str());
+        let connection = product.state.borrow().native_connection();
+        if let (Some(params), Some(connection)) = (params, connection) {
+            let result = commands.product_request(connection, "chat.send", params.clone());
+            if result.is_ok() {
+                product.state.borrow_mut().native_message_enqueued(&params);
+            }
+            apply_command_result(&weak, result);
+        } else if let Some(window) = weak.upgrade() {
+            apply_error(
+                &window,
+                &UserError::input(
+                    "chat.unavailable",
+                    "Message was not submitted.",
+                    "Reconnect and check the message size before retrying.",
+                ),
+            );
+        }
+        if let Some(window) = weak.upgrade() {
+            product.apply(&window);
+        }
+    });
+
+    let weak = window.as_weak();
+    let product = Rc::clone(view);
+    let commands = sender.clone();
+    window.on_approval_requested(move |approved| {
+        let params = product.state.borrow().native_approval(approved);
+        let connection = product.state.borrow().native_connection();
+        if let (Some(params), Some(connection)) = (params, connection) {
+            apply_command_result(
+                &weak,
+                commands.product_request(connection, "approval.resolve", params),
+            );
+        }
+    });
+
+    let weak = window.as_weak();
+    let product = Rc::clone(view);
+    let commands = sender;
+    window.on_open_session_requested(move |index| {
+        let Ok(index) = usize::try_from(index) else {
+            return;
+        };
+        let session = {
+            let mut state = product.state.borrow_mut();
+            state.open_session(index);
+            state.selected_run().id.clone()
+        };
+        if let Some(connection) = product.state.borrow().native_connection() {
+            apply_command_result(
+                &weak,
+                commands.product_request(
+                    connection,
+                    "chat.history",
+                    serde_json::json!({"sessionKey": session}),
+                ),
+            );
+            apply_command_result(
+                &weak,
+                commands.product_request(
+                    connection,
+                    "exec.approval.list",
+                    serde_json::json!({"sessionId": session}),
+                ),
+            );
+        }
+        if let Some(window) = weak.upgrade() {
+            product.apply(&window);
+        }
+    });
+
+    let weak = window.as_weak();
+    window.on_answer_requested(move |_answer| {
+        if let Some(window) = weak.upgrade() {
+            apply_error(
+                &window,
+                &UserError::input(
+                    "question.unavailable",
+                    "No supported question is pending.",
+                    "Continue in the conversation.",
+                ),
+            );
+        }
+    });
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn main() -> Result<(), DesktopError> {
     let window = AppWindow::new().map_err(DesktopError::Platform)?;
     let preferences = Rc::new(RefCell::new(VisualPreferencesState::default()));
     let product_view = Rc::new(
-        ProductView::attach(&window, ProductState::default())
+        ProductView::attach(&window, ProductState::native())
             .map_err(DesktopError::PaletteCatalog)?,
     );
     apply_preferences(&window, *preferences.borrow());
     product_view.apply(&window);
     let weak_window = window.as_weak();
-    let controller = DesktopController::spawn(move |snapshot| {
-        let _ = weak_window.upgrade_in_event_loop(move |window| apply_snapshot(&window, &snapshot));
-    })
+    let (product_tx, product_rx) = std::sync::mpsc::sync_channel(32);
+    let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let producer_overflow = std::sync::Arc::clone(&overflow);
+    let controller = DesktopController::spawn_product(
+        move |snapshot| {
+            let _ =
+                weak_window.upgrade_in_event_loop(move |window| apply_snapshot(&window, &snapshot));
+        },
+        move |update| {
+            if product_tx.try_send(update).is_err() {
+                producer_overflow.store(true, std::sync::atomic::Ordering::Release);
+            }
+        },
+    )
     .map_err(DesktopError::ControllerStart)?;
     wire_callbacks(&window, controller.sender(), preferences, &product_view);
+    wire_native_callbacks(&window, controller.sender(), &product_view);
+    let timer = slint::Timer::default();
+    let weak = window.as_weak();
+    let view = Rc::clone(&product_view);
+    let commands = controller.sender();
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(20),
+        move || {
+            let Some(window) = weak.upgrade() else { return };
+            if overflow.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                let _ = commands.disconnect();
+                view.state.borrow_mut().native_unavailable();
+                apply_error(
+                    &window,
+                    &UserError::input(
+                        "chat.resync-required",
+                        "The client fell behind the Gateway.",
+                        "Reconnect to reload the current conversation before continuing.",
+                    ),
+                );
+                for _ in product_rx.try_iter() {}
+                view.apply(&window);
+                return;
+            }
+            let mut changed = false;
+            for update in product_rx.try_iter().take(32) {
+                view.state.borrow_mut().apply_native(update);
+                changed = true;
+            }
+            let next = view.state.borrow_mut().next_native_query();
+            let connection = view.state.borrow().native_connection();
+            if let (Some((method, params)), Some(connection)) = (next, connection) {
+                apply_command_result(&weak, commands.product_request(connection, method, params));
+            }
+            if changed {
+                view.apply(&window);
+            }
+        },
+    );
     window.run().map_err(DesktopError::Platform)?;
+    timer.stop();
     controller
         .shutdown()
         .map_err(DesktopError::ControllerShutdown)

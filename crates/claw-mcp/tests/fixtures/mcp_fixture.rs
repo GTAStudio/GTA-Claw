@@ -15,21 +15,18 @@ use std::{
     time::Duration,
 };
 
+use claw_mcp::model::{
+    CallToolRequestParams, CallToolResult, ContentBlock, CreateMessageRequestParams, ErrorData,
+    GetPromptRequestParams, GetPromptResult, JsonObject, ListPromptsResult,
+    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, LoggingLevel,
+    LoggingMessageNotificationParam, PaginatedRequestParams, Prompt, PromptArgument, PromptMessage,
+    ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
+    ResourceUpdatedNotificationParam, Role, SamplingMessage, ServerCapabilities, ServerInfo,
+    SubscribeRequestParams, Tool, UnsubscribeRequestParams,
+};
 use claw_mcp::{
     framing::DEFAULT_MAX_FRAME_BYTES,
     server::{GtaMcpServer, McpBackend, OperationContext, serve_stdio},
-};
-use rmcp::{
-    ErrorData,
-    model::{
-        CallToolRequestParams, CallToolResult, ContentBlock, CreateMessageRequestParams,
-        GetPromptRequestParams, GetPromptResult, JsonObject, ListPromptsResult,
-        ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, LoggingLevel,
-        LoggingMessageNotificationParam, PaginatedRequestParams, Prompt, PromptArgument,
-        PromptMessage, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
-        ResourceTemplate, ResourceUpdatedNotificationParam, Role, SamplingMessage,
-        ServerCapabilities, ServerInfo, SubscribeRequestParams, Tool, UnsubscribeRequestParams,
-    },
 };
 use serde_json::{Value, json};
 
@@ -65,6 +62,16 @@ impl McpBackend for FixtureBackend {
                 ErrorData::internal_error(format!("failed to record cancellation: {error}"), None)
             })?;
         }
+        if std::env::var("GTA_CLAW_MCP_PRODUCT_FIXTURE")
+            .is_ok_and(|value| value == "reviewed-value")
+        {
+            let schema = json!({"type":"object","required":["text"],"properties":{"text":{"type":"string","maxLength":64}},"additionalProperties":false});
+            return Ok(ListToolsResult::with_all_items(vec![Tool::new(
+                "product-probe",
+                "Inspect the owned stdio fixture",
+                schema.as_object().expect("fixture schema").clone(),
+            )]));
+        }
         Ok(ListToolsResult {
             tools: vec![
                 Tool::new("echo", "Returns the supplied text", JsonObject::new()),
@@ -87,6 +94,31 @@ impl McpBackend for FixtureBackend {
         context: OperationContext,
     ) -> Result<CallToolResult, ErrorData> {
         match request.name.as_ref() {
+            "product-probe" => {
+                let text = required_string_argument(request.arguments, "text")?;
+                record_product_fixture("calls.jsonl").map_err(|_| {
+                    ErrorData::internal_error("fixture marker is unavailable", None)
+                })?;
+                if text == "wait" {
+                    let address = std::env::var("GTA_CLAW_MCP_PRODUCT_NOTIFY")
+                        .ok()
+                        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+                        .filter(|address| address.ip().is_loopback())
+                        .ok_or_else(|| {
+                            ErrorData::invalid_params(
+                                "fixture requires an owned notification listener",
+                                None,
+                            )
+                        })?;
+                    let _signal = tokio::net::TcpStream::connect(address).await.map_err(|_| {
+                        ErrorData::internal_error("fixture notification failed", None)
+                    })?;
+                    context.cancellation.cancelled().await;
+                }
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    "owned stdio result",
+                )]))
+            }
             "hang" => {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 Err(ErrorData::internal_error(
@@ -97,6 +129,23 @@ impl McpBackend for FixtureBackend {
             "echo" => {
                 let text = required_string_argument(request.arguments, "text")?;
                 Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+            }
+            "environment-scope" => {
+                let flags = json!({
+                    "inheritedCargoEnvironment": std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+                    "explicitFixtureValue": std::env::var("GTA_CLAW_MCP_EXPLICIT_FIXTURE").is_ok_and(|value| value == "reviewed-fixture-value")
+                });
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    flags.to_string(),
+                )]))
+            }
+            "working-directory" => {
+                let directory = std::env::current_dir().map_err(|_| {
+                    ErrorData::internal_error("fixture directory is unavailable", None)
+                })?;
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    directory.to_string_lossy(),
+                )]))
             }
             "sample" => {
                 let response = GtaMcpServer::<Self>::sample(
@@ -172,67 +221,71 @@ impl McpBackend for FixtureBackend {
         }
     }
 
-    async fn list_resources(
+    fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: OperationContext,
-    ) -> Result<ListResourcesResult, ErrorData> {
-        Ok(ListResourcesResult::with_all_items(vec![
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> + Send {
+        std::future::ready(Ok(ListResourcesResult::with_all_items(vec![
             Resource::new("gta://fixture/session", "fixture-session")
                 .with_description("A deterministic fixture session")
                 .with_mime_type("text/markdown")
                 .with_size(21),
-        ]))
+        ])))
     }
 
-    async fn list_resource_templates(
+    fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: OperationContext,
-    ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        Ok(ListResourceTemplatesResult::with_all_items(vec![
+    ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, ErrorData>> + Send
+    {
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(vec![
             ResourceTemplate::new("gta://fixture/{name}", "fixture-by-name")
                 .with_description("Fixture resources by name")
                 .with_mime_type("text/plain"),
-        ]))
+        ])))
     }
 
-    async fn read_resource(
+    fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: OperationContext,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> impl std::future::Future<Output = Result<ReadResourceResult, ErrorData>> + Send {
         if request.uri != "gta://fixture/session" {
-            return Err(ErrorData::invalid_params("unknown fixture resource", None));
+            return std::future::ready(Err(ErrorData::invalid_params(
+                "unknown fixture resource",
+                None,
+            )));
         }
-        Ok(ReadResourceResult::new(vec![
+        std::future::ready(Ok(ReadResourceResult::new(vec![
             ResourceContents::text("fixture resource body", request.uri)
                 .with_mime_type("text/markdown"),
-        ]))
+        ])))
     }
 
-    async fn subscribe(
+    fn subscribe(
         &self,
         request: SubscribeRequestParams,
         _context: OperationContext,
-    ) -> Result<(), ErrorData> {
-        validate_resource_uri(&request.uri)
+    ) -> impl std::future::Future<Output = Result<(), ErrorData>> + Send {
+        std::future::ready(validate_resource_uri(&request.uri))
     }
 
-    async fn unsubscribe(
+    fn unsubscribe(
         &self,
         request: UnsubscribeRequestParams,
         _context: OperationContext,
-    ) -> Result<(), ErrorData> {
-        validate_resource_uri(&request.uri)
+    ) -> impl std::future::Future<Output = Result<(), ErrorData>> + Send {
+        std::future::ready(validate_resource_uri(&request.uri))
     }
 
-    async fn list_prompts(
+    fn list_prompts(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: OperationContext,
-    ) -> Result<ListPromptsResult, ErrorData> {
-        Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
+    ) -> impl std::future::Future<Output = Result<ListPromptsResult, ErrorData>> + Send {
+        std::future::ready(Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
             "summarize",
             Some("Summarizes deterministic fixture text"),
             Some(vec![
@@ -240,23 +293,29 @@ impl McpBackend for FixtureBackend {
                     .with_description("Text to summarize")
                     .with_required(true),
             ]),
-        )]))
+        )])))
     }
 
-    async fn get_prompt(
+    fn get_prompt(
         &self,
         request: GetPromptRequestParams,
         _context: OperationContext,
-    ) -> Result<GetPromptResult, ErrorData> {
+    ) -> impl std::future::Future<Output = Result<GetPromptResult, ErrorData>> + Send {
         if request.name != "summarize" {
-            return Err(ErrorData::invalid_params("unknown fixture prompt", None));
+            return std::future::ready(Err(ErrorData::invalid_params(
+                "unknown fixture prompt",
+                None,
+            )));
         }
-        let text = required_string_argument(request.arguments, "text")?;
-        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-            Role::User,
-            format!("Summarize exactly: {text}"),
-        )])
-        .with_description("Resolved deterministic fixture prompt"))
+        std::future::ready(
+            required_string_argument(request.arguments, "text").map(|text| {
+                GetPromptResult::new(vec![PromptMessage::new_text(
+                    Role::User,
+                    format!("Summarize exactly: {text}"),
+                )])
+                .with_description("Resolved deterministic fixture prompt")
+            }),
+        )
     }
 }
 
@@ -395,10 +454,31 @@ fn spawn_listener_grandchild(path: &Path) -> io::Result<()> {
     ))
 }
 
+fn record_product_fixture(file: &str) -> io::Result<()> {
+    let record = json!({
+        "pid":std::process::id(),
+        "directory":std::env::current_dir()?,
+        "inheritedHostToken":std::env::var_os("GITHUB_TOKEN").is_some() || std::env::var_os("ADMIN_TOKEN").is_some(),
+        "explicitEnvironment":std::env::var("GTA_CLAW_MCP_PRODUCT_FIXTURE").is_ok_and(|value| value == "reviewed-value"),
+        "protectedEnvironment":std::env::var("GTA_CLAW_MCP_PRODUCT_SECRET").is_ok_and(|value| value == "private-stdio-keyring-value")
+    });
+    let mut output = OpenOptions::new().create(true).append(true).open(file)?;
+    writeln!(output, "{record}")
+}
+
 #[tokio::main]
 async fn main() {
     let arguments = std::env::args().collect::<Vec<_>>();
     match arguments.get(1).map(String::as_str) {
+        Some("--product-fixture") => {
+            if let Err(error) = record_product_fixture("starts.jsonl") {
+                eprintln!("fixture marker failed: {error}");
+                return;
+            }
+            if let Err(error) = serve_stdio(Arc::new(FixtureBackend)).await {
+                eprintln!("fixture failed: {error}");
+            }
+        }
         Some("--malformed") => {
             println!("{{not-json");
         }

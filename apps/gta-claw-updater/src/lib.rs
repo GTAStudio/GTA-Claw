@@ -1663,8 +1663,8 @@ impl SecureDirectory {
 
     #[cfg(windows)]
     fn create_exclusive_regular(&self, name: &OsStr) -> Result<File, UpdateError> {
-        validate_single_component(name)?;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        validate_single_component(name)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1947,15 +1947,19 @@ impl SecureDirectory {
         }
     }
 
+    #[cfg(unix)]
     fn sync(&self) -> Result<(), io::Error> {
-        #[cfg(unix)]
-        {
-            self.handle.sync_all()
-        }
-        #[cfg(windows)]
-        {
-            Ok(())
-        }
+        self.handle.sync_all()
+    }
+
+    #[cfg(windows)]
+    #[expect(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "Portable directory commit hook; Windows has no supported directory flush here and this does not guarantee power-loss durability"
+    )]
+    const fn sync(&self) -> Result<(), io::Error> {
+        Ok(())
     }
 
     fn validate_directory(&self, owner_only: bool) -> Result<(), UpdateError> {
@@ -2807,7 +2811,7 @@ fn decode_sha256(value: &str) -> Result<[u8; 32], UpdateError> {
         return Err(UpdateError::InvalidArtifactHash);
     }
     let mut digest = [0_u8; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(chunk[0]).ok_or(UpdateError::InvalidArtifactHash)?;
         let low = hex_nibble(chunk[1]).ok_or(UpdateError::InvalidArtifactHash)?;
         digest[index] = (high << 4) | low;
@@ -2976,7 +2980,10 @@ fn extract_bundle_files(
         }
         let mut file = directory.open_regular(file_name, true)?;
         file.write_all(&bytes).map_err(UpdateError::Io)?;
+        #[cfg(unix)]
         set_safe_mode(&file, entry.mode)?;
+        #[cfg(not(unix))]
+        let _ = entry.mode;
         file.sync_all().map_err(UpdateError::Io)?;
     }
     Ok(())
@@ -3017,11 +3024,6 @@ fn set_safe_mode(file: &File, requested: u32) -> Result<(), UpdateError> {
     let mode = requested & 0o777;
     file.set_permissions(fs::Permissions::from_mode(mode))
         .map_err(UpdateError::Io)
-}
-
-#[cfg(not(unix))]
-fn set_safe_mode(_file: &File, _requested: u32) -> Result<(), UpdateError> {
-    Ok(())
 }
 
 #[cfg(not(windows))]

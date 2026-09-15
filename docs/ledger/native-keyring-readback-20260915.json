@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-credential-readback-diagnostic-coverage",
+  "capturedAtUtc": "2026-09-15T09:18:08.4882620Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-provider-sdk/src/secret/windows.rs","sha256":"5766280cb4836d701e3796c75366d0b2bf5ba3c8743358e25f259eeed60543ee"},
+    {"path":"crates/claw-mcp/src/oauth/keyring.rs","sha256":"54d44e7af95103f36528a70b6f1287067a50aed1692fb44a17e7bca8763d76ec"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-provider-sdk -p claw-mcp -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":589, "failed":0, "ignored":5, "testBinaries":18,
+      "log":"target/native-keyring-isolation-integrated-20260915T091530856Z.log",
+      "sha256":"83aa68b610b0cceff36bd2e1137f66f5ddec802dddde55b50343f746ece242a3"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-provider-sdk -p claw-mcp -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-keyring-isolation-clippy-20260915T091502096Z.log",
+      "sha256":"9325ea98cc5be9361d95a1743aee136346313834bf0c8d28328abbbc0f23cd50"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-provider-sdk -p claw-mcp --lib --locked --offline --quiet",
+      "result":"passed", "passed":275, "failed":0, "ignored":0, "testBinaries":2,
+      "log":"target/native-keyring-isolation-tests-20260915T091412714Z.log",
+      "sha256":"bc3da6923ae74b8b54f5de61a693225e6ad1008f07d66c8636eff9a18198a724",
+      "scopeNote":"Library subset of the final full related regression, not additional coverage"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-provider-sdk --lib independent_native_handles --locked --offline --quiet",
+      "result":"passed", "passed":1, "failed":0, "ignored":0, "testBinaries":1,
+      "log":"target/native-keyring-isolation-diagnostic-20260915T091033656Z.log",
+      "sha256":"3b3b97ee8cd4b5caeff8f3637e51f0fd01adf01b3d31bc30f3c830f7edf2ad77",
+      "scopeNote":"Added failure-stage diagnostics only; a passing rerun is not root-cause resolution"
+    }
+  ],
+  "retainedFailures": [
+    {"log":"target/native-keyring-isolation-focused-20260915T090903613Z.log","sha256":"99b8308535291880e80568499f939bfa5ed15ebc2e307637638cfdac8206f4dd","passed":0,"failed":1,"ignored":0,"testBinaries":1,"reason":"An independent native reader did not report absence after successful owned-key deletion; original assertion did not distinguish remaining data from read error, cause unresolved"}
+  ],
+  "behaviorEvidence": [
+    "independent_native_handles_isolate_concurrent_credential_lifecycles",
+    "native_token_store_uncertain_writes_and_failed_deletion_never_replay_or_restore_secrets"
+  ],
+  "notes": [
+    "Only four unique fixture credentials are accessed; independent handles coordinate four concurrent rotation stages and deletion, without sleeps/retries or changes to native operation policy",
+    "Store and key preflights happen before worker barriers; failure diagnostics report booleans/static errors, not values",
+    "OAuth confirmation distinguishes absent, changed and unreadable records while preserving unknown-result refusal and single-write behavior for markers and final tokens",
+    "The native backend, persistence mode, error safety, concurrency policy and external-writer boundaries are unchanged; this is diagnostic coverage, not a credential-store repair",
+    "Public APIs and dependencies are unchanged; final scoped all-target tests/lint cover the change without a new root-wide build claim",
+    "No production/proxy, real account/browser/device migration, dependency download, deployment or Git action occurred"
+  ],
+  "unverified": [
+    "Root cause and classification of the initial native deletion readback failure and all earlier native credential/OAuth/stdio anomalies",
+    "Cross-process native-store linearizability, atomic confirmation against external writers, cross-platform and real-account acceptance",
+    "Complete frozen build manifests, release and whole-project acceptance"
+  ]
+}

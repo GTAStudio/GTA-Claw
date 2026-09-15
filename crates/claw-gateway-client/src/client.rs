@@ -1515,11 +1515,11 @@ fn handle_inbound(
                         ResyncRequired::EventQueueSaturated,
                     ))
                 })?;
-            match context
-                .resources
-                .events
-                .try_send(GatewayEvent::new(event, byte_permit))
-            {
+            match context.resources.events.try_send(GatewayEvent::new(
+                event,
+                context.epoch,
+                byte_permit,
+            )) {
                 Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
                 Err(mpsc::error::TrySendError::Full(_)) => Err(GatewayClientError::Protocol(
                     ProtocolFailure::ResyncRequired(ResyncRequired::EventQueueSaturated),

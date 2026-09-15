@@ -294,6 +294,134 @@ impl Display for WasmHostError {
 
 impl Error for WasmHostError {}
 
+/// A validated skill call ready for a caller-owned backend.
+///
+/// Preparation grants no authority. The caller must still authorize the target,
+/// bind approval to the manifest and arguments, and track the actual execution.
+#[derive(Clone, Eq, PartialEq)]
+pub enum PreparedSkillInvocation {
+    /// Reviewed instruction content, not an executable backend call.
+    Instructions {
+        /// Fixed content from the validated manifest.
+        content: String,
+    },
+    /// Parameters for a reviewed native handler.
+    Native {
+        /// Exact handler identity from the manifest.
+        handler: String,
+        /// Schema-validated arguments.
+        parameters: Value,
+    },
+    /// A fully encoded declarative HTTP request.
+    Http {
+        /// Request produced from the manifest and validated arguments.
+        request: HttpRequest,
+        /// Expected response representation.
+        response: HttpResponseMode,
+    },
+    /// Parameters for one component-local tool.
+    Wasm {
+        /// Exact plugin identity from the manifest.
+        plugin_id: String,
+        /// Exact component-local export from the manifest.
+        export: String,
+        /// Schema-validated arguments.
+        parameters: Value,
+    },
+}
+
+impl Debug for PreparedSkillInvocation {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Instructions { .. } => formatter
+                .debug_struct("Instructions")
+                .field("content", &"[REDACTED]")
+                .finish(),
+            Self::Native { handler, .. } => formatter
+                .debug_struct("Native")
+                .field("handler", handler)
+                .field("parameters", &"[REDACTED]")
+                .finish(),
+            Self::Http { request, response } => formatter
+                .debug_struct("Http")
+                .field("request", request)
+                .field("response", response)
+                .finish(),
+            Self::Wasm {
+                plugin_id, export, ..
+            } => formatter
+                .debug_struct("Wasm")
+                .field("plugin_id", plugin_id)
+                .field("export", export)
+                .field("parameters", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
+/// Validates a manifest and its arguments without contacting any backend.
+///
+/// Async application adapters can reuse this preparation while retaining their
+/// own authorization, audit, cancellation and resource-lifetime boundaries.
+///
+/// # Errors
+///
+/// Returns [`SkillExecutionError::InvalidManifest`],
+/// [`SkillExecutionError::InvalidParameters`] or
+/// [`SkillExecutionError::ParameterEncoding`] before any effect is attempted.
+pub fn prepare_skill_invocation(
+    manifest: &SkillManifest,
+    parameters: Value,
+) -> Result<PreparedSkillInvocation, SkillExecutionError> {
+    manifest
+        .validate()
+        .map_err(SkillExecutionError::InvalidManifest)?;
+    validate_parameters(manifest.parameters(), &parameters)
+        .map_err(SkillExecutionError::InvalidParameters)?;
+    match manifest.execution() {
+        SkillExecution::Instructions { content } => Ok(PreparedSkillInvocation::Instructions {
+            content: content.clone(),
+        }),
+        SkillExecution::Native { handler } => Ok(PreparedSkillInvocation::Native {
+            handler: handler.clone(),
+            parameters,
+        }),
+        SkillExecution::Http { request } => {
+            let mut headers = request.headers.clone();
+            let encoded = serde_json::to_vec(&parameters)
+                .map_err(|_| SkillExecutionError::ParameterEncoding)?;
+            let (url, body) = match &request.parameters {
+                HttpParameterEncoding::JsonBody => {
+                    headers.insert("content-type".to_owned(), "application/json".to_owned());
+                    (request.url.clone(), encoded)
+                }
+                HttpParameterEncoding::QueryParameter { name } => {
+                    let encoded = String::from_utf8(encoded)
+                        .map_err(|_| SkillExecutionError::ParameterEncoding)?;
+                    (
+                        append_query_parameter(&request.url, name, &encoded),
+                        Vec::new(),
+                    )
+                }
+            };
+            Ok(PreparedSkillInvocation::Http {
+                request: HttpRequest {
+                    method: request.method,
+                    url,
+                    headers,
+                    body,
+                },
+                response: request.response,
+            })
+        }
+        SkillExecution::Wasm { plugin_id, export } => Ok(PreparedSkillInvocation::Wasm {
+            plugin_id: plugin_id.clone(),
+            export: export.clone(),
+            parameters,
+        }),
+    }
+}
+
 /// Runtime dispatcher with explicit backend ports.
 pub struct SkillRuntime<'a> {
     native: &'a NativeSkillRegistry,
@@ -375,47 +503,30 @@ impl<'a> SkillRuntime<'a> {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return Err(SkillExecutionError::Cancelled);
         }
-        manifest
-            .validate()
-            .map_err(SkillExecutionError::InvalidManifest)?;
-        validate_parameters(manifest.parameters(), &parameters)
-            .map_err(SkillExecutionError::InvalidParameters)?;
-        match manifest.execution() {
-            SkillExecution::Native { handler } => self.native.execute(handler, parameters),
-            SkillExecution::Http { request } => {
-                let mut headers = request.headers.clone();
-                let encoded = serde_json::to_vec(&parameters)
-                    .map_err(|_| SkillExecutionError::ParameterEncoding)?;
-                let (url, body) = match &request.parameters {
-                    HttpParameterEncoding::JsonBody => {
-                        headers.insert("content-type".to_owned(), "application/json".to_owned());
-                        (request.url.clone(), encoded)
-                    }
-                    HttpParameterEncoding::QueryParameter { name } => {
-                        let encoded = String::from_utf8(encoded)
-                            .map_err(|_| SkillExecutionError::ParameterEncoding)?;
-                        (
-                            append_query_parameter(&request.url, name, &encoded),
-                            Vec::new(),
-                        )
-                    }
-                };
-                let response = self
+        match prepare_skill_invocation(manifest, parameters)? {
+            PreparedSkillInvocation::Instructions { content } => Ok(serde_json::json!({
+                "kind":"instructions", "content":content, "executionGranted":false,
+            })),
+            PreparedSkillInvocation::Native {
+                handler,
+                parameters,
+            } => self.native.execute(&handler, parameters),
+            PreparedSkillInvocation::Http { request, response } => {
+                let result = self
                     .http
-                    .send(HttpRequest {
-                        method: request.method,
-                        url,
-                        headers,
-                        body,
-                    })
+                    .send(request)
                     .map_err(SkillExecutionError::HttpBridge)?;
-                decode_http_response(response, request.response)
+                decode_http_response(result, response)
             }
-            SkillExecution::Wasm { plugin_id, export } => self
+            PreparedSkillInvocation::Wasm {
+                plugin_id,
+                export,
+                parameters,
+            } => self
                 .wasm
                 .invoke(WasmSkillInvocation {
-                    plugin_id,
-                    tool: export,
+                    plugin_id: &plugin_id,
+                    tool: &export,
                     parameters,
                     cancellation,
                 })
@@ -454,7 +565,11 @@ fn redact_url_query(url: &str) -> String {
         .map_or_else(|| url.to_owned(), |(base, _)| format!("{base}?[REDACTED]"))
 }
 
-fn decode_http_response(
+/// Decodes a complete response using the manifest's declared representation.
+///
+/// # Errors
+/// Refuses oversized responses, non-success status, invalid JSON and invalid UTF-8 text.
+pub fn decode_http_response(
     response: HttpResponse,
     mode: HttpResponseMode,
 ) -> Result<Value, SkillExecutionError> {
@@ -519,3 +634,94 @@ impl Display for SkillExecutionError {
 }
 
 impl Error for SkillExecutionError {}
+
+#[cfg(test)]
+mod preparation_tests {
+    use serde_json::json;
+
+    use super::{PreparedSkillInvocation, SkillExecutionError, prepare_skill_invocation};
+    use crate::load_manifest;
+
+    #[test]
+    fn preparation_keeps_instruction_content_non_executable_and_bounded() {
+        let manifest_value = json!({
+            "id":"review.instructions", "description":"Reviewed instructions",
+            "parameters":{"type":"object","properties":{},"additionalProperties":false},
+            "execution":{"kind":"instructions","content":"Inspect the source.\nAsk before effects."},
+        });
+        let manifest = load_manifest(&manifest_value.to_string()).expect("instruction manifest");
+        let prepared = prepare_skill_invocation(&manifest, json!({})).expect("instruction data");
+        assert!(matches!(&prepared, PreparedSkillInvocation::Instructions { content } if content == "Inspect the source.\nAsk before effects."));
+        assert!(!format!("{prepared:?}").contains("Inspect the source"));
+        assert!(prepare_skill_invocation(&manifest, json!({"execute":true})).is_err());
+        for content in [String::new(), " ".to_owned(), "content\u{1b}".to_owned(), "x".repeat(8193)] {
+            let mut invalid = manifest_value.clone();
+            invalid["execution"]["content"] = json!(content);
+            assert!(load_manifest(&invalid.to_string()).is_err());
+        }
+        let mut invalid = manifest_value;
+        invalid["parameters"]["additionalProperties"] = json!(true);
+        assert!(load_manifest(&invalid.to_string()).is_err());
+    }
+
+    #[test]
+    fn preparation_preserves_targets_and_redacts_argument_values() {
+        for execution in [
+            json!({"kind":"native","handler":"fs_read"}),
+            json!({"kind":"wasm","plugin_id":"reviewed-plugin","export":"read"}),
+            json!({"kind":"http","request":{"method":"GET","url":"https://example.test/read","parameters":{"kind":"query_parameter","name":"input"}}}),
+        ] {
+            let manifest = load_manifest(
+                &json!({"id":"reviewed-skill","description":"Read a reviewed resource","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false},"execution":execution}).to_string(),
+            )
+            .expect("valid skill");
+            let prepared = prepare_skill_invocation(&manifest, json!({"value":"private-argument"}))
+                .expect("prepared call");
+            assert!(!format!("{prepared:?}").contains("private-argument"));
+            match prepared {
+                PreparedSkillInvocation::Instructions { .. } => panic!("execution fixtures must not become instruction content"),
+                PreparedSkillInvocation::Native {
+                    handler,
+                    parameters,
+                } => {
+                    assert_eq!(handler, "fs_read");
+                    assert_eq!(parameters, json!({"value":"private-argument"}));
+                }
+                PreparedSkillInvocation::Wasm {
+                    plugin_id,
+                    export,
+                    parameters,
+                } => {
+                    assert_eq!(plugin_id, "reviewed-plugin");
+                    assert_eq!(export, "read");
+                    assert_eq!(parameters, json!({"value":"private-argument"}));
+                }
+                PreparedSkillInvocation::Http { request, .. } => {
+                    assert_eq!(
+                        request.url,
+                        "https://example.test/read?input=%7B%22value%22%3A%22private-argument%22%7D"
+                    );
+                    assert!(request.body.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preparation_rejects_parameters_before_producing_a_backend_call() {
+        let manifest = load_manifest(
+            &json!({"id":"reviewed-skill","description":"Read a reviewed resource","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false},"execution":{"kind":"native","handler":"fs_read"}}).to_string(),
+        )
+        .expect("valid skill");
+        for parameters in [
+            json!({}),
+            json!({"value": 7}),
+            json!({"value":"text","owner":true}),
+        ] {
+            assert!(matches!(
+                prepare_skill_invocation(&manifest, parameters),
+                Err(SkillExecutionError::InvalidParameters(_))
+            ));
+        }
+    }
+}

@@ -41,8 +41,8 @@ Rust 工作空间**尚未**提供与遗留实现完全等价的 Agent 服务，�
   排空过程。
 - **执行一次签名更新**，使用独立的更新器。
 
-CLI 仍没有聊天命令，守护进程也尚未达到完整等价：会话与轮次状态不持久化，没有交互式审批，也没有装配
-`claw-tools`，技能执行同样未被分派。`src/` 下的遗留 Node 服务会继续保留，直到这些缺口和冻结的兼容性证据
+CLI 已有原生发送、历史、取消和审批命令；守护进程已用 redb 持久化会话、轮次和上下文检查点，
+但完整事务恢复、调用者绑定、`claw-tools` 和技能执行仍未完成。`src/` 下的遗留 Node 服务会继续保留，直到这些缺口和冻结的兼容性证据
 义务被关闭——详见 [legacy-node-port-obligations.md](legacy-node-port-obligations.md)。
 
 ---
@@ -51,7 +51,7 @@ CLI 仍没有聊天命令，守护进程也尚未达到完整等价：会话与�
 
 | 项目 | 说明 |
 |---|---|
-| Rust 工具链 | 由 `rust-toolchain.toml` 固定为 `1.97.1`，在仓库目录内 `rustup` 会自动选用。最低支持版本为 `1.94.0`。 |
+| Rust 工具链 | 开发固定为 `1.98.1`，MSRV 声明仍为 `1.94.0`，本增量尚未重新验证 MSRV。受保护发布策略仍固定 `1.97.1`，发布前需独立审查升级。 |
 | 平台 | 根工作空间可在 Linux、macOS 和 Windows 上构建。桌面客户端**仅支持 Windows 和 macOS**——在 Linux 上构建会被有意拒绝。 |
 | 一个 Gateway | CLI、TUI 和桌面客户端都是客户端程序。要做实际的事情，需要一个可达的 OpenClaw Gateway v4 端点（`ws://` 或 `wss://`）。 |
 
@@ -65,7 +65,7 @@ CLI 仍没有聊天命令，守护进程也尚未达到完整等价：会话与�
 git clone https://github.com/GTAStudio/GTA-Claw.git
 cd GTA-Claw
 
-# 根工作空间：31 个库 crate 和 6 个可执行程序
+# 根工作空间：32 个库 crate 和 6 个应用成员
 cargo build --workspace
 cargo test  --workspace
 ```
@@ -118,7 +118,7 @@ usage:
       [--allow-insecure-remote-ws] [--json]
 ```
 
-`--help` 和 `-h` 会打印上面这段用法说明。除此之外没有其他子命令，也没有其他参数。
+`--help` 和 `-h` 会打印当前用法，其中也列出原生业务命令。
 
 ### 3.1 `health`——本地运行时健康状态
 
@@ -130,18 +130,21 @@ gta-claw-cli health
 
 未知命令退出码为 `2`，并在标准错误输出 `error: unknown command`。
 
-### 3.2 `send`——有意保留为不可用
+### 3.2 原生 Gateway 业务命令
 
 ```sh
-gta-claw-cli send session-9 "hello"
+gta-claw-cli send session-9 "hello" --idempotency-key message-1 --endpoint ws://127.0.0.1:18789 --ephemeral-device
 ```
 
-该命令以退出码 `8` 结束，并输出 `error: unsupported operation: message transport is not configured`。
-这是当前的正确行为，不是缺陷：消息传输适配器尚未装配，CLI 拒绝让人误以为消息已被接受。
+需要共享凭据时使用 `--token-stdin`，不能将凭据放入 argv，也不能用 token 绕过设备配对。
+还有 `gateway sessions`、`history`、`abort`、`approvals`、`approval`、`approve` 和 `deny`。
+业务命令请求最小精确 scope，使用独立 schema-v1 JSON；发送返回接收回执，不代表模型已完成，
+当前 daemon 明确报告 `durable: false`，幂等记录仅在进程内。CLI 持久身份和手动配对工作流仍未完成。
+完整语法、凭据输入和输出上限见 [CLI 指南](../apps/gta-claw-cli/README.md)。
 
 ### 3.3 `gateway health`——真实的 Gateway 诊断
 
-这是唯一会执行真实网络操作的命令。它建立一条 `ws://` 或 `wss://` 连接，完成已认证的 Gateway v4
+这个诊断命令建立一条 `ws://` 或 `wss://` 连接，完成已认证的 Gateway v4
 challenge / connect / hello 流程，发送一次 `operator.read` 的 `health` RPC，然后在限定时间内干净地关闭。
 
 ```sh
@@ -283,6 +286,10 @@ Set GTA_CLAW_GATEWAY_TOKEN for authenticated Gateways.
 
 `--help` 和 `-h` 打印上面这段文本并以 `0` 退出。未知参数以 `2` 退出。
 
+连接原生 daemon 时可显式指定 `--device-profile work`，在 Windows/macOS 系统保护存储中
+保留设备身份，不保存共享令牌，也不会在存储失败时退回临时身份。不指定则每次重建连接可换身份。
+设备和所需 scopes 仍须由管理员配对批准；身份持久化不等于自动取得信任。
+
 ### 4.1 启动
 
 ```sh
@@ -320,6 +327,9 @@ GTA_CLAW_GATEWAY_TOKEN='…' gta-claw-tui --gateway wss://gateway.example.test
 Tab / Shift-Tab   切换界面
 Up/Down 或 j/k    选择与滚动
 Enter             打开会话 / 提交回答
+c / i             新建会话 / 编写消息
+Shift-Enter       编写消息时换行
+x                 取消精确观察到的原生 run
 y / n             批准 / 拒绝
 r                 从 Gateway 刷新
 Ctrl-P 或 :       命令面板
@@ -333,7 +343,28 @@ q / Ctrl-C        安全退出
 
 按 `:` 或 `Ctrl-P` 打开，输入命令后回车。可识别的命令（不区分大小写）：
 
-`sessions`、`workspace`、`runs`、`diff`、`artifacts`、`help`、`refresh`、`quit`（或 `q`）。
+`sessions`、`workspace`、`runs`、`diff`、`artifacts`、`help`、`refresh`、`quit`（或 `q`），
+以及 `new`、`message`、`send`、`run`、`partial`、`partial-next`、`cancel`、`retry-send`。
+
+`discard-draft` 明确丢弃未提交草稿。`discard-send` 只允许丢弃所有尝试都确定未发送的输入；
+已排队或曾可能送达的输入不能这样丢弃。下面的记忆动作在重试时仍保留类型，不转为普通聊天。
+
+原生消息在收到持久回执前保留随机幂等键。投递未知时不接受另一个新发送；`retry-send` 是显式
+使用原会话、原文本和原键重试，不自动重放。重连会拒绝旧连接的发送、取消、审批、ACK 和回答。
+选中原生会话会读取保留历史，并分别分页恢复待显示结果和活动 run。完整结果只在工作区绘制后
+按精确 revision 确认；Outcome unknown 独立显示，重复有副作用的操作前须先核对结果。
+Diff/Artifacts 是否可用仍取决于服务器实现。
+
+选中原生终态 run 后，`partial` 显式读取第一段保留的可见文本，`partial-next` 读取下一页；
+尚未观察到终态 revision 时先使用 `run`。每页最多 2048 UTF-8 字节，总量最多 4MiB；请求固定当前连接、
+session、run、turn、revision 和终态，续页同时固定原长度和摘要。选择或 revision 改变会使旧游标失效。
+
+文本以带原字节范围的未确认 partial 数据显示，不冒充完整助手回答；查看页不新增 ACK、不赋予执行或
+重放许可，原有完整终态回执的绘制后 ACK 行为保持不变。先校验原字节，再净化控制字符供显示。
+空保留文本可查看，缺失则拒绝。完整单页会核对全文 SHA256；后续单页只固定全文摘要，不能独立证明全文，
+且 transcript 仍是有界视图而非完整归档。完整收集与摘要校验使用
+[CLI export-partial](../apps/gta-claw-cli/README.md#retained-partial-text)，验证边界见
+[TUI 记录](ledger/native-tui-partial-20260915.json)。
 
 其他输入会在提示行显示 `Unknown command: …`。`Esc` 关闭命令面板。
 
@@ -342,6 +373,47 @@ q / Ctrl-C        安全退出
 传入 `--plain`，或标准输出不是交互式终端时，程序不会进入全屏循环，而是只做一次快照：连接 Gateway，
 最多等待五秒获取会话列表，打印一帧渲染结果后退出。若 Gateway 未在时限内响应，提示行会显示
 `Gateway snapshot timed out`。脚本和 CI 场景应使用这个模式。
+
+### 4.6 显式记忆
+
+使用 `gta-claw-tui --device-profile work` 连接原生 daemon，服务端显式设置
+`GTA_CLAW_MEMORY_POLICY` 为 `{"schemaVersion":1,"enabled":true}`。记忆动作拒绝临时设备身份；
+worker 在同一 ready 连接上确认原生无模型记忆能力后才发 `chat.send`，不支持的服务不会收到
+记忆提交。普通聊天中直接包含 `!tool` 指令行也会被拒绝，包括大写写法。
+
+先选会话，也可让首个记忆动作创建草稿会话，再在命令面板输入：
+
+```text
+memory list [limit [after-id notebook-revision]]
+memory get note-id [note-revision offset]
+memory search [limit]
+memory save note-id fact|preference|procedure expected-notebook-revision
+memory delete note-id expected-notebook-revision
+memory export notebook-revision [offset]
+memory import expected-notebook-revision [overwrite]
+```
+
+动作名不区分大小写；笔记 ID 和输入内容保留原始大小写，类型值及 `overwrite` 使用小写字面值。
+save 打开笔记编辑框，search 打开查询输入，import 打开归档 JSON 输入。Enter 提交，
+Shift-Enter 换行。支持 bracketed paste 的终端会将多行粘贴作为一次纯数据输入，不因换行
+自行提交；超限或含禁止控制字符时整段拒绝，不截断后继续。Esc 暂停编辑，回到原会话后
+按 `i` 继续；切换会话不能把同一记忆草稿提交到另一个会话。
+
+所有动作，包括读取，仍需要查看完整绑定审批预览并明确批准。结果显示在 Workspace，复用
+原生 run 的持久结果、恢复和精确 ACK。预检拒绝显示“未发送”，但重试被拒不能抹掉更早的
+未知投递；`retry-send` 保留原动作、会话和幂等键，不自动批准。草稿和未确认键目前只保存在
+运行中的 TUI 进程内，还没有客户端崩溃恢复日志。
+
+列表默认16条、最多32条，续页 ID 必须配笔记本 revision；正文页最多2048 UTF-8字节，
+非零 offset 必须配该笔记 revision。查询最多4096 UTF-8字节、8个结果；正文最多8192
+UTF-8字节；包含 JSON 转义后的完整直接命令仍须小于等于16 KiB。初始笔记本可用 revision 0，
+纠正、删除和导入须使用当前笔记本 revision，它不等于 run-result ACK revision。
+
+export 返回一个固定 revision 的明文归档页及完整摘要，不自动收集全部页，也不写加密文件。
+import 接受[便携笔记归档](../apps/gta-claw-cli/README.md#explicit-memory-commands)的闭合
+schemaVersion 1 JSON；重复或未知字段、无效笔记/来源/revision、超限编码在提交前拒绝。
+重名默认冲突；明确 `overwrite` 后仍须通过 CAS 与审批。内容和来源标签都是不可信数据，
+不能授予权限；不代表语义/自动召回或完整历史遗忘。服务端既有全库256笔记本、每本256条限制继续生效。
 
 ---
 
@@ -399,8 +471,8 @@ GitHub Copilot，启动已配置的通道传输，并绑定四个监听器：
 - Gateway v4 服务；
 - 单独承载 `/mcp` 路由、仅限回环地址的监听器。
 
-第四个监听器会被绑定和监管，但当前无法访问。生产组装把两个 MCP Bearer 令牌认证器都留空，也没有接入
-JWT 认证器，而该路由会在分派前先执行认证，因此所有 MCP 调用方都会被拒绝。
+第四个监听器使用独立的 `GTA_CLAW_MCP_OWNER_TOKEN` 和 `GTA_CLAW_MCP_TOKEN`；未配置时拒绝访问，
+不会复用主 HTTP 凭据。只读 MCP 凭据不能执行写工具，插件 owner 调用仍需运行时审批。
 
 四条通道路径都按配置启用：Teams 和 WhatsApp 接入遗留 HTTP 门面，Telegram 和 Discord 则作为受监管的
 出站客户端运行。配置 GitHub 令牌后，GitHub Copilot 会在启动时激活；否则提供方保持等待 Device Flow 的
@@ -415,7 +487,7 @@ JWT 认证器，而该路由会在分派前先执行认证，因此所有 MCP �
 | `--legacy-listen ADDRESS` | 遗留 HTTP 监听地址。默认在回环地址上使用 `core.server.port`。绑定到可路由地址时，既要有可信 TLS 前端，也必须由代理执行调用方认证并采用严格的路由白名单；只有守护进程的 TLS 断言并不充分。 |
 | `--gateway-listen ADDRESS` | Gateway 监听地址。默认 `127.0.0.1:0`。 |
 | `--mcp-listen ADDRESS` | MCP 监听地址。默认 `127.0.0.1:0`；任何非回环地址都会被拒绝。该参数只改变绑定的套接字；由于生产组装没有 MCP 令牌/JWT 认证器，所有请求仍会被拒绝。 |
-| `--state-dir PATH` | 状态根目录；未指定时依次使用 `GTA_CLAW_STATE_DIR` 和 `$HOME/.gta-claw`。配对、安全审计和目标会持久化到这里，但会话与轮次不会。 |
+| `--state-dir PATH` | 状态根目录；未指定时依次使用 `GTA_CLAW_STATE_DIR` 和 `$HOME/.gta-claw`。配对、安全审计、目标及 `runtime.redb` 会话/轮次/上下文检查点保存在这里；完整跨对象事务恢复仍未完成。 |
 | `--log-file PATH` | 把普通遥测写入文件，而不是标准错误。 |
 | `--tls-terminated-by-frontend` | 断言可信前端负责终止 TLS。它不会让守护进程自行启用 TLS，也不会添加调用方认证；它只让主 HTTP、遗留 HTTP 或 Gateway 的可路由地址通过守护进程的绑定策略。 |
 | `--smoke` | 使用确定性的本地安装诊断提供方。所有显式指定的监听地址都必须保持为回环地址。 |
@@ -482,14 +554,14 @@ printf 'shutdown\n' | gta-claw-daemon
 
 ### 5.4 当前限制
 
-- **会话与轮次只存在于进程内存。** `RuntimeStateStore` 把两者保存在 `Mutex<HashMap>` 中，守护进程重启后
-  会全部丢失；单独持久化的 Gateway 配对、安全审计和目标存储不受此限制。
-- **没有交互式审批界面。** 运行时使用 `SilentApprovalPort`，它会丢弃审批展示通知；当前装配的插件工具描述
-  均标记为不需要审批。
-- **生产 MCP 监听器无法访问。** 套接字会被绑定，但没有接入 MCP Bearer 凭据或 JWT 认证器，因此路由会在
-  分派前拒绝所有调用方。
+- **恢复能力仍不完整。** redb 已保存会话、轮次和保留的上下文检查点，重启/reload/LRU 不会删除历史；
+  run/context/goal/outbox 尚未组成一个原子事务，没有完整归档及三平台故障恢复验收。
+- **审批策略仍不完整。** Gateway、CLI 和 Slint 已支持完整脱敏预览与一次性批准/拒绝；插件工具要求审批，
+  但主体、资源、工具版本和参数摘要绑定仍需完善。
+- **MCP 需要独立凭据。** 显式设置 `GTA_CLAW_MCP_OWNER_TOKEN` / `GTA_CLAW_MCP_TOKEN`，两者不能相同，
+  长度为 1..4096 ASCII bearer 字节且不含空白或控制字符；缺失时拒绝访问，不复用主 HTTP token。
 - **没有装配 `claw-tools`。** 并非完全不能执行工具：已签名插件注册的工具和持久化目标工具可通过运行时及
-  已认证的主 HTTP 表面执行，但目前不能通过 MCP 执行。缺失的是 `claw-tools` 的工具目录及其模式校验、
+  已认证的主 HTTP 表面执行，MCP owner 插件调用也使用同一审批执行器。缺失的是 `claw-tools` 的工具目录及其模式校验、
   授权、路径限制和目标网络校验。
 - **技能执行和迁移证据接入均未被分派。** 启动时只读取 `claw_skills::registry()` 作为库存计数；生产路径
   没有调用 `WasmSkillHost` 桥接，因此不会执行任何内置技能。应用层同样没有调用
@@ -529,21 +601,53 @@ flow."*（连接会执行真实的 challenge、connect、hello 与安全的 heal
 |---|---|
 | Gateway 端点 | 校验规则与 CLI 相同。 |
 | 令牌 | 仅本次会话有效。提交的瞬间输入框即被清空，且永不持久化。 |
-| 临时身份同意项 | 一个必须显式勾选的复选框：*"I consent to a new ephemeral device identity for this diagnostic session."* |
+| 临时身份同意项 | 显式同意仅本次会话使用设备身份，并申请聊天和审批访问权限。 |
+| 保存设备身份 | 显式使用 Windows/macOS 系统保护的 `desktop` profile，按端点隔离；不保存令牌、不自动授予信任。记忆操作需要此选项。 |
 
 按钮：**Connect**、**Retry**、**Cancel**、**Disconnect**。
 
 连接成功后，摘要面板只展示有界的非敏感字段——端点、协商的协议版本、角色、生效的 scope、健康状态和身份
-模式。可能需要先完成配对；该身份以及签发的任何设备令牌都只存在于有界内存中，断开连接或退出应用时即被丢弃。
+模式。可能需要先完成配对；未明确选择保存则使用临时身份，选择保存后按端点使用系统保护的 profile，
+加载失败不会退回临时身份。签发的设备令牌仍只保存在有界进程内存中。
 
-界面本身也写明了边界：*"This diagnostic does not enroll a persistent device, store credentials, or enable
-chat and account features."*（本诊断不会注册持久设备、不存储凭据，也不启用聊天与账号功能。）
+产品模式精确申请 `operator.read`、`operator.write` 和 `operator.approvals`，不会申请 admin。
+原生聊天/历史/审批已有真实传输，生产模型初始为空；重连后查询待审批，完整有界预览到达前不能批准。
+请求和事件绑定连接 epoch；流式输出、历史/事件合并、工作区信任和完整凭据生命周期仍未完成。
 
-### 6.3 为什么没有 Linux 构建，也没有移动端界面
+### 6.3 平台边界
 
 桌面客户端之所以是独立的 Cargo 工作空间，是因为仓库的可信供应链策略拒绝在根工作空间成员可触及的任何位置
-引入 Slint 依赖。同一条策略也决定了 `gta-claw-android` 和 `gta-claw-ios` 只是与界面无关的客户端内核，
-本仓库中不包含任何用户界面。CI 会对这两条边界做断言，其中包括断言 Linux 桌面构建必须失败。
+引入 Slint 依赖。根目录 Android/iOS crate 是独立客户端内核，另外的 `android/`、`ios/` 工作空间
+已经包含 Slint 连接壳，但平台桥接和完整产品工作流仍未完成。根工作空间排除 Slint、Linux GUI 拒绝
+仍是现有政策，不因本轮原生开发而取消。
+
+### 6.4 显式记忆
+
+选择保存设备身份，连接已显式启用记忆的原生 daemon，再进入 Session 并点击 Memory 工具。
+动作菜单提供 List、Read、Search、Save、Delete、Export、Import；ID、类型、revision、
+字节 offset 和正文分开输入，只有当前动作需要的字段可编辑。List 的可选 ID 是续页 after，
+Read 使用笔记 revision，保存/删除/导入使用当前笔记本 revision；导入重名默认冲突，必须
+明确勾选覆盖才允许尝试覆盖。这些数值不等于 run-result ACK revision，所有动作仍须经过
+原有完整绑定审批预览和明确批准。
+
+controller 在同一 ready epoch 上确认原生无模型能力后才提交，临时身份或不支持的服务会被
+拒绝；普通聊天直接写 `!tool` 不能绕过。归档使用已有 Gateway 严格 codec，重复键、错误字段/
+revision、超限或过深 JSON、未知版本在提交前拒绝；合法多行 JSON 安全压成一条直接命令。
+正文是数据，不是额外指令。正文/查询与最终编码上限和 TUI 指南相同。
+
+表单绑定屏幕上显示的会话和连接；绑定改变会关闭表单并丢弃未提交的本地字段。确认后的完整
+记忆结果显示在独立的可滚动、可选择只读区域，不受普通聊天摘要截断；连接失效时清空该视图。
+发送未知保留原键，在当前尝试结束后可明确重试原请求；重试前被拒不会抹掉此前未知状态。
+只有完整持久收据把原键关联到精确 run 后，结果才可释放原请求，提前到达的事件不能代替收据。
+继续复用审批、持久结果查询和精确 ACK，不自动批准或重放。
+
+桌面使用相应端点的系统保护 `desktop` profile；其他 profile 名称对应不同设备身份，笔记不会
+自动合并。表单草稿、未确认键及最近结果视图目前是进程内状态，没有客户端崩溃日志。
+导出仍是带 revision/摘要的明文页，不自动收集或加密落盘；大归档分阶段导入、完整来源/遗忘流程
+和 Windows/macOS 交互实机验收仍开放，无窗口软件渲染测试不能代替这些验收。
+
+CLI 已有独立的[加密记忆文件流程](../apps/gta-claw-cli/README.md#encrypted-memory-files)，
+不代表桌面表单已自动传输文件，也不取消每页导出的审批要求。
 
 ---
 
@@ -660,7 +764,7 @@ gta-claw-updater \
 
 这里明确列出，免得有人去找并不存在的参数：
 
-- **没有 Rust 聊天命令。** `gta-claw-cli send` 是有意失败的。
+- **CLI 对话工作流尚不完整。** 已有发送/历史/取消/审批，持久身份、配对 onboarding、流式输出和持久 run 查询仍未完成。
 - **没有达到完整等价的 Rust 生产服务。** 守护进程会提供真实传输、提供方和四条已配置的通道路径，但仍有
   5.4 节列出的限制。
 - **其他已注册通道没有传输实现。** Teams、Telegram、Discord 和 WhatsApp 会按配置装配；其余通道库存不是
@@ -670,7 +774,7 @@ gta-claw-updater \
 - **没有 JavaScript 技能。** 技能执行只有三种形式：原生 Rust、声明式 HTTP 端口，或 WebAssembly 组件。
   永远不会引入内嵌的 JavaScript 引擎。
 - **CLI 和桌面客户端都没有持久设备身份**，目前只支持临时身份。
-- **本仓库不包含 Android 或 iOS 应用**，也没有 Linux 桌面构建。
+- **移动产品尚不完整。** Android/iOS 各有 Slint 连接壳，平台桥接、凭据存储和完整对话仍待实现；Linux GUI 未支持。
 
 各 crate 与可执行程序的当前状态见 [PROGRESS.md](PROGRESS.md)；架构与这些边界背后的取舍见
 [PROJECT_PLAN.md](PROJECT_PLAN.md)。

@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-whatsapp-text-reply-service-window",
+  "capturedAtUtc": "2026-09-14T20:47:15.8837765Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-channels/src/whatsapp.rs","sha256":"f889b733c19cc25bb85957694241c3c4ee1534e497d064a13c35f4c05ee28dcc"},
+    {"path":"apps/gta-claw-daemon/src/adapters/legacy.rs","sha256":"b7c9f66a6aaee4b6b224fce6b928f7a0cd0fc1b51266f4d2259fd6ee2bb8bf47"}
+  ],
+  "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p claw-channels -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":335, "failed":0, "ignored":4, "testBinaries":17,
+      "log":"target/native-whatsapp-window-tests-20260914T204547664Z.log",
+      "sha256":"5517e59695f46813700bc3a75aa3e21c33b11fcfc17174f96117747b9d116656"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p claw-channels -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-whatsapp-window-clippy-20260914T204645078Z.log",
+      "sha256":"039499890bb7b26d3d9f0d9d10d7a359ed58a45b4141a38361672930b3a9d420"
+    }
+  ],
+  "behaviorEvidence": [
+    "native_whatsapp_text_reply_window_is_rechecked_before_each_transport_call",
+    "native_whatsapp_ingress_requires_timestamps_before_enqueuing_any_batch_member",
+    "native_whatsapp_webhook_retains_confirmed_prefix_and_never_resends_after_restart",
+    "native_whatsapp_dropped_request_stops_before_later_queued_input"
+  ],
+  "notes": [
+    "Native text batches validate provider timestamp shape and age before any queue admission",
+    "No native timestamp fallback to local arrival; route/window checks run before execution, claim and each transport call",
+    "A first-segment expiry scenario retains its one receipt and unknown claim across restart without another send",
+    "Legacy ingestion remains compatible; expiration never triggers template sends or automatic replay",
+    "No new dependencies or changes to the existing Cargo.lock witness"
+  ],
+  "unverified": [
+    "approved templates, latest-customer-message aggregation and durable replay timestamp provenance",
+    "all legacy/generic send APIs, external clock policy and live Cloud account acceptance",
+    "cross-platform and physical power-loss acceptance, deployment and whole-project completion"
+  ]
+}

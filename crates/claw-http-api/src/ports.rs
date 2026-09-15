@@ -173,6 +173,8 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+pub use claw_application::ports::provider::UsageReporting;
+
 /// Completed provider generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerationOutput {
@@ -182,6 +184,43 @@ pub struct GenerationOutput {
     pub tool_calls: Vec<ToolCall>,
     /// Usage accounting.
     pub usage: Usage,
+    /// Coverage of the primary usage counters, not billing settlement.
+    pub usage_reporting: UsageReporting,
+    /// Confirmed provider terminal, including known partial output.
+    pub finish_reason: GenerationFinishReason,
+}
+
+/// Provider-neutral terminal classification; unknown or cancelled results are errors.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GenerationFinishReason {
+    /// A natural, complete response.
+    #[default]
+    Stop,
+    /// A complete set of function calls.
+    ToolCalls,
+    /// The output token limit stopped a partial response.
+    Length,
+    /// A provider filter stopped the response.
+    ContentFilter,
+}
+
+impl GenerationFinishReason {
+    /// Returns whether the result may be retained as a complete conversation turn.
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        matches!(self, Self::Stop | Self::ToolCalls)
+    }
+}
+
+/// Final accounting and terminal classification for one streamed generation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GenerationSummary {
+    /// Usage reported by the provider.
+    pub usage: Usage,
+    /// Coverage of the reported token counters.
+    pub usage_reporting: UsageReporting,
+    /// Confirmed terminal classification.
+    pub finish_reason: GenerationFinishReason,
 }
 
 /// One backpressured streaming provider event.
@@ -216,13 +255,13 @@ pub trait ProviderPort: Send + Sync {
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<GenerationOutput, PortError>>;
 
-    /// Streams deltas through a bounded sender and returns final usage.
+    /// Streams deltas through a bounded sender and returns final accounting and status.
     fn stream(
         &self,
         request: GenerationRequest,
         events: mpsc::Sender<GenerationEvent>,
         cancellation: CancellationToken,
-    ) -> PortFuture<'_, Result<Usage, PortError>>;
+    ) -> PortFuture<'_, Result<GenerationSummary, PortError>>;
 
     /// Embeds one bounded batch.
     fn embed(
@@ -252,6 +291,10 @@ pub struct ToolOutcome {
 /// Complete routing and policy context for one tool invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ToolInvocationContext {
+    /// Host-verified caller claims, never populated from routing headers or request JSON.
+    pub authority: Option<claw_application::ports::tool::InvocationAuthority>,
+    /// Exact publication selected before approval; inbound HTTP/MCP never sets this field.
+    pub binding: Option<claw_application::ports::tool::ToolBinding>,
     /// Optional explicit session key.
     pub session_key: Option<String>,
     /// Optional explicit agent ID.
@@ -449,6 +492,8 @@ pub enum PortErrorKind {
     Timeout,
     /// The mutation committed, but its durability could not be confirmed.
     CommittedButNotDurable,
+    /// Side effects may have occurred without a confirmed terminal result.
+    OutcomeUnknown,
     /// Internal adapter failure.
     Internal,
 }

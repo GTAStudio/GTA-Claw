@@ -32,6 +32,1047 @@ use support::{
 const TOKEN: &str = "stdin-only-diagnostic-token";
 const TOKEN_WRAPPED: &str = "prefix-stdin-only-diagnostic-token-suffix";
 
+#[cfg(windows)]
+struct ProfileCleanup {
+    endpoint: String,
+    alias: String,
+    root: PathBuf,
+}
+
+#[cfg(windows)]
+impl Drop for ProfileCleanup {
+    fn drop(&mut self) {
+        if let Ok(store) = claw_platform::identity::native_store()
+            && let Ok(profile) = claw_platform::identity::DeviceProfile::new(
+                &self.endpoint,
+                &self.alias,
+                self.root.join("gta-claw-device-locks-v1"),
+            )
+        {
+            let _ = profile.forget(store.as_ref());
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_memory_encrypted_export_collects_approved_pages_and_never_publishes_bad_data() {
+    const PASSPHRASE: &str = "fixture archive passphrase only";
+    let archive = json!({"schemaVersion":1,"notebook":{"revision":7,"entries":[{"id":"Note","kind":"fact","content":format!("private-archive-marker {}", "\u{4e2d}\u{6587}".repeat(1_000)),"sourceSession":"source-session","revision":7}]}}).to_string();
+    let digest = |bytes: &[u8]| {
+        use std::fmt::Write as _;
+        let mut text = String::with_capacity(64);
+        for byte in ring::digest::digest(&ring::digest::SHA256, bytes).as_ref() {
+            write!(text, "{byte:02x}").expect("string write");
+        }
+        text
+    };
+    let sha256 = digest(archive.as_bytes());
+    let mut pages = Vec::new();
+    let mut offset = 0;
+    while offset < archive.len() {
+        let mut end = archive.len().min(offset + 2_048);
+        while !archive.is_char_boundary(end) {
+            end -= 1;
+        }
+        pages.push(json!({"archiveSchemaVersion":1,"notebookRevision":7,"sha256":sha256,"totalBytes":archive.len(),"offset":offset,"data":&archive[offset..end],"nextOffset":(end < archive.len()).then_some(end),"plaintext":true,"untrustedContent":true,"grantsAuthority":false}));
+        offset = end;
+    }
+    for mode in [
+        "valid",
+        "tampered",
+        "revision-changed",
+        "wrong-run",
+        "timeout",
+        "existing-target",
+        "unsupported",
+    ] {
+        let submitted = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&submitted);
+        let server_pages = pages.clone();
+        let server_archive = archive.clone();
+        let gateway = TestGateway::spawn(handler(move |mut socket, connection_index| {
+            let submitted = Arc::clone(&captured);
+            let pages = server_pages.clone();
+            let archive = server_archive.clone();
+            async move {
+                send_challenge(&mut socket).await;
+                let (connect, params) = receive_connect(&mut socket).await;
+                support::verify_connect_proof(&params);
+                assert_eq!(serde_json::to_value(&params).expect("handshake")["auth"]["token"], TOKEN);
+                send_hello(&mut socket, connect.id(), "archive-native-fixture", 4, AUTHENTICATED_MAX_FRAME_BYTES, "operator", &["operator.read", "operator.write"]).await;
+                if mode == "valid" && connection_index == 1 {
+                    let health = receive_request(&mut socket).await;
+                    assert_eq!(health.method().as_str(), "health");
+                    send_json(&mut socket, json!({"type":"res","id":health.id().as_str(),"ok":true,"payload":{"ok":true,"protocol":4,"native":{"schemaVersion":1,"directTool":{"version":1,"prefix":"!tool ","modelInvoked":false,"authenticated":true,"durableRuns":true,"approvalPolicy":"per-tool","accepting":true},"explicitMemory":{"enabled":true,"accepting":true,"requiresApproval":true,"partition":"source/subject/account","automaticContextInjection":false,"archiveSchemaVersion":1}}}})).await;
+                    let request = receive_request(&mut socket).await;
+                    assert_eq!(request.method().as_str(), "chat.send");
+                    let params: Value = serde_json::from_str(request.params().value().expect("import parameters").as_json()).expect("JSON");
+                    assert_eq!(params["idempotencyKey"], "archive-import-key");
+                    let envelope: Value = serde_json::from_str(params["message"].as_str().expect("import message").strip_prefix("!tool ").expect("direct prefix")).expect("envelope");
+                    assert_eq!(envelope, json!({"name":"memory_notes","arguments":{"action":"import","expectedRevision":7,"overwrite":true,"archive":serde_json::from_str::<Value>(&archive).expect("original archive")}}));
+                    submitted.fetch_add(1, Ordering::SeqCst);
+                    send_json(&mut socket, json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":{"status":"accepted","durable":true,"sessionId":"memory-export-session","runId":"b".repeat(64),"revision":1,"phase":"queued"}})).await;
+                    wait_for_close(&mut socket).await;
+                    return;
+                }
+                for (index, page) in pages.into_iter().enumerate() {
+                    let health = receive_request(&mut socket).await;
+                    assert_eq!(health.method().as_str(), "health");
+                    let capabilities = if mode == "unsupported" { json!({"ok":true,"protocol":4}) } else { json!({"ok":true,"protocol":4,"native":{"schemaVersion":1,"directTool":{"version":1,"prefix":"!tool ","modelInvoked":false,"authenticated":true,"durableRuns":true,"approvalPolicy":"per-tool","accepting":true},"explicitMemory":{"enabled":true,"accepting":true,"requiresApproval":true,"partition":"source/subject/account","automaticContextInjection":false,"archiveSchemaVersion":1}}}) };
+                    send_json(&mut socket, json!({"type":"res","id":health.id().as_str(),"ok":true,"payload":capabilities})).await;
+                    if mode == "unsupported" { break; }
+                    let request = receive_request(&mut socket).await;
+                    assert_eq!(request.method().as_str(), "chat.send");
+                    let params: Value = serde_json::from_str(request.params().value().expect("params").as_json()).expect("JSON");
+                    let expected_key = if index == 0 { "archive-original-key".to_owned() } else { format!("memory-export-{}", digest(json!(["memory-export/v1", "archive-original-key", "memory-export-session", 7, page["offset"]]).to_string().as_bytes())) };
+                    assert_eq!(params["idempotencyKey"], expected_key);
+                    assert_eq!(params["sessionKey"], "memory-export-session");
+                    let envelope: Value = serde_json::from_str(params["message"].as_str().expect("direct message").strip_prefix("!tool ").expect("direct prefix")).expect("tool envelope");
+                    assert_eq!(envelope, json!({"name":"memory_notes","arguments":{"action":"export","revision":7,"offset":page["offset"]}}));
+                    submitted.fetch_add(1, Ordering::SeqCst);
+                    let run_id = format!("{:064x}", index + 1);
+                    send_json(&mut socket, json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":{"durable":true,"sessionId":"memory-export-session","runId":run_id,"status":"accepted","revision":1,"phase":"executing"}})).await;
+                    let waiting = receive_request(&mut socket).await;
+                    assert_eq!(waiting.method().as_str(), "agent.wait");
+                    send_json(&mut socket, json!({"type":"res","id":waiting.id().as_str(),"ok":true,"payload":{"durable":true,"sessionId":"memory-export-session","runId":run_id,"revision":2,"phase":"executing","result":null}})).await;
+                    if mode == "timeout" { break; }
+                    send_json(&mut socket, json!({"type":"event","event":"chat","seq":index + 1,"payload":{"sessionId":"memory-export-session","runId":run_id,"resultAvailable":true}})).await;
+                    let complete = receive_request(&mut socket).await;
+                    assert_eq!(complete.method().as_str(), "agent.wait");
+                    assert_ne!(waiting.id(), complete.id());
+                    let mut page = page;
+                    if mode == "tampered" { page["sha256"] = json!("0".repeat(64)); }
+                    if mode == "revision-changed" && index == 1 { page["notebookRevision"] = json!(8); }
+                    send_json(&mut socket, json!({"type":"res","id":complete.id().as_str(),"ok":true,"payload":{"durable":true,"sessionId":"memory-export-session","runId":if mode == "wrong-run" { "f".repeat(64) } else { run_id },"revision":3,"phase":"finished","result":{"status":"completed","text":page.to_string()}}})).await;
+                    if mode == "wrong-run" || mode == "revision-changed" && index == 1 { break; }
+                }
+                loop {
+                    match socket.read_frame().await {
+                        Ok(frame) if frame.opcode == fastwebsockets::OpCode::Text => { submitted.fetch_add(1, Ordering::SeqCst); }
+                        Ok(frame) if frame.opcode == fastwebsockets::OpCode::Close => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        })).await;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let cleanup = ProfileCleanup {
+            endpoint: gateway.url.as_str().to_owned(),
+            alias: format!("archive-{}-{nonce}", std::process::id()),
+            root: std::env::temp_dir()
+                .join(format!("claw-cli-archive-{}-{nonce}", std::process::id())),
+        };
+        fs::create_dir_all(&cleanup.root).expect("owned archive root");
+        let destination = cleanup.root.join("memory.age");
+        if mode == "existing-target" {
+            fs::write(&destination, b"existing target must survive").expect("existing target");
+        }
+        let arguments = vec![
+            "gateway".into(),
+            "memory".into(),
+            "export".into(),
+            "memory-export-session".into(),
+            "--revision".into(),
+            "7".into(),
+            "--device-profile".into(),
+            cleanup.alias.clone().into(),
+            "--idempotency-key".into(),
+            "archive-original-key".into(),
+            "--endpoint".into(),
+            gateway.url.as_str().trim_end_matches('/').into(),
+            "--destination".into(),
+            destination.clone().into_os_string(),
+            "--request-stdin".into(),
+            "--timeout-ms".into(),
+            if mode == "timeout" { "1000" } else { "5000" }.into(),
+        ];
+        let output = run_cli_in(
+            arguments,
+            Some(&json!({"token":TOKEN,"passphrase":PASSPHRASE}).to_string()),
+            Some(&cleanup.root),
+        )
+        .await;
+        let document = parse_json(&output);
+        assert_eq!(
+            output.status.success(),
+            mode == "valid",
+            "{mode}: {document}"
+        );
+        assert_eq!(document["operation"], "memory.export_file");
+        assert_eq!(document["originalIdempotencyKey"], "archive-original-key");
+        for bytes in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(
+                !text.contains(TOKEN)
+                    && !text.contains(PASSPHRASE)
+                    && !text.contains("private-archive-marker")
+            );
+        }
+        if mode == "valid" {
+            assert_eq!(document["result"]["archiveValidated"], true);
+            assert_eq!(document["result"]["fileCreated"], true);
+            assert_eq!(document["result"]["sha256"], sha256);
+            assert_eq!(document["result"]["pages"], pages.len());
+            let ciphertext = fs::read(&destination).expect("encrypted archive exists");
+            assert!(ciphertext.starts_with(b"age-encryption.org/v1\n"));
+            assert!(
+                !ciphertext
+                    .windows(b"private-archive-marker".len())
+                    .any(|bytes| bytes == b"private-archive-marker")
+            );
+            let decryptor = age::Decryptor::new(ciphertext.as_slice()).expect("age header");
+            let mut identity =
+                age::scrypt::Identity::new(age::secrecy::SecretString::from(PASSPHRASE.to_owned()));
+            identity.set_max_work_factor(18);
+            let mut decrypted = decryptor
+                .decrypt(std::iter::once(&identity as &dyn age::Identity))
+                .expect("independent age decryption");
+            let mut plaintext = Vec::new();
+            std::io::Read::read_to_end(&mut decrypted, &mut plaintext)
+                .expect("authenticated plaintext");
+            assert_eq!(plaintext, archive.as_bytes());
+            let import_arguments = |source: &std::path::Path| {
+                vec![
+                    "gateway".into(),
+                    "memory".into(),
+                    "import".into(),
+                    "memory-export-session".into(),
+                    "--expected-revision".into(),
+                    "7".into(),
+                    "--overwrite".into(),
+                    "--device-profile".into(),
+                    cleanup.alias.clone().into(),
+                    "--idempotency-key".into(),
+                    "archive-import-key".into(),
+                    "--endpoint".into(),
+                    gateway.url.as_str().trim_end_matches('/').into(),
+                    "--archive-file".into(),
+                    source.to_path_buf().into_os_string(),
+                    "--request-stdin".into(),
+                    "--timeout-ms".into(),
+                    "5000".into(),
+                ]
+            };
+            let tampered_file = cleanup.root.join("tampered.age");
+            let mut tampered = ciphertext.clone();
+            *tampered.last_mut().expect("encrypted payload") ^= 1;
+            fs::write(&tampered_file, tampered).expect("owned corrupt fixture");
+            let oversized_file = cleanup.root.join("oversized.age");
+            fs::File::create(&oversized_file)
+                .expect("owned oversized fixture")
+                .set_len(4 * 1024 * 1024 + 128 * 1024 + 1)
+                .expect("bounded oversized length");
+            for (source, passphrase) in [
+                (&destination, "wrong fixture passphrase only"),
+                (&tampered_file, PASSPHRASE),
+                (&oversized_file, PASSPHRASE),
+            ] {
+                let output = run_cli_in(
+                    import_arguments(source),
+                    Some(&json!({"token":TOKEN,"passphrase":passphrase}).to_string()),
+                    Some(&cleanup.root),
+                )
+                .await;
+                let document = parse_json(&output);
+                assert!(!output.status.success());
+                assert_eq!(document["operation"], "memory.import_file");
+                assert_eq!(document["delivery"], "not_sent");
+                assert_eq!(
+                    gateway.connections.load(Ordering::SeqCst),
+                    1,
+                    "bad archive must be refused before connecting"
+                );
+            }
+            let output = run_cli_in(
+                import_arguments(&destination),
+                Some(&json!({"token":TOKEN,"passphrase":PASSPHRASE}).to_string()),
+                Some(&cleanup.root),
+            )
+            .await;
+            let document = parse_json(&output);
+            assert!(output.status.success(), "encrypted import: {document}");
+            assert_eq!(document["operation"], "memory.import_file");
+            assert_eq!(document["sourceModified"], false);
+            assert_eq!(document["result"]["durable"], true);
+            for bytes in [&output.stdout, &output.stderr] {
+                let text = String::from_utf8_lossy(bytes);
+                assert!(
+                    !text.contains(TOKEN)
+                        && !text.contains(PASSPHRASE)
+                        && !text.contains("private-archive-marker")
+                );
+            }
+            assert_eq!(
+                fs::read(&destination).expect("unchanged encrypted source"),
+                ciphertext
+            );
+        } else if mode == "existing-target" {
+            assert_eq!(
+                fs::read(&destination).expect("retained target"),
+                b"existing target must survive"
+            );
+        } else {
+            assert!(!destination.exists(), "{mode} must not publish an archive");
+        }
+        let expected = match mode {
+            "valid" => pages.len() + 1,
+            "unsupported" => 0,
+            "wrong-run" | "timeout" => 1,
+            "revision-changed" => 2,
+            _ => pages.len(),
+        };
+        assert_eq!(submitted.load(Ordering::SeqCst), expected, "{mode}");
+        gateway.shutdown().await;
+        drop(cleanup);
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_memory_commands_verify_capabilities_before_sending_once() {
+    const ARCHIVE: &str = r#"{"schemaVersion":1,"notebook":{"revision":2,"entries":[{"id":"units","kind":"preference","content":"private-cli-memory import","sourceSession":"source","revision":1}]}}"#;
+    for mode in [
+        "list",
+        "save",
+        "save-auth",
+        "export",
+        "import",
+        "import-auth",
+        "archive-missing",
+        "unsupported",
+        "disabled",
+        "model",
+        "bad-receipt",
+    ] {
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let submitted = Arc::clone(&submissions);
+        let permitted = matches!(
+            mode,
+            "list" | "save" | "save-auth" | "export" | "import" | "import-auth" | "bad-receipt"
+        );
+        let framed = matches!(mode, "save-auth" | "import-auth");
+        let action = match mode {
+            "save" | "save-auth" => "save",
+            "export" => "export",
+            "import" | "import-auth" | "archive-missing" => "import",
+            _ => "list",
+        };
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let submitted = Arc::clone(&submitted);
+            async move {
+                send_challenge(&mut socket).await;
+                let (connect, params) = receive_connect(&mut socket).await;
+                support::verify_connect_proof(&params);
+                let handshake = serde_json::to_value(&params).expect("handshake JSON");
+                assert_eq!(handshake["auth"]["token"], if framed { json!(TOKEN) } else { Value::Null });
+                let scopes: Vec<_> = params.scopes.as_ref().expect("memory scopes").iter().map(claw_protocol::gateway::Name::as_str).collect();
+                assert_eq!(scopes, ["operator.read", "operator.write"]);
+                send_hello(&mut socket, connect.id(), "memory-native-fixture", 4, AUTHENTICATED_MAX_FRAME_BYTES, "operator", &["operator.read", "operator.write"]).await;
+                let health = receive_request(&mut socket).await;
+                assert_eq!(health.method().as_str(), "health", "capability discovery must precede any command");
+                let mut payload = json!({"ok":true,"protocol":4,"native":{"schemaVersion":1,"directTool":{"version":1,"prefix":"!tool ","modelInvoked":false,"authenticated":true,"durableRuns":true,"approvalPolicy":"per-tool","accepting":true},"explicitMemory":{"enabled":true,"accepting":true,"requiresApproval":true,"partition":"source/subject/account","automaticContextInjection":false}}});
+                payload["native"]["explicitMemory"]["archiveSchemaVersion"] = json!(1);
+                match mode {
+                    "archive-missing" => { payload["native"]["explicitMemory"].as_object_mut().expect("memory capability").remove("archiveSchemaVersion"); }
+                    "unsupported" => { payload.as_object_mut().expect("object").remove("native"); }
+                    "disabled" => payload["native"]["explicitMemory"]["enabled"] = json!(false),
+                    "model" => payload["native"]["directTool"]["modelInvoked"] = json!(true),
+                    _ => {},
+                }
+                send_json(&mut socket, json!({"type":"res","id":health.id().as_str(),"ok":true,"payload":payload})).await;
+                if permitted {
+                    let request = receive_request(&mut socket).await;
+                    assert_eq!(request.method().as_str(), "chat.send");
+                    let params: Value = serde_json::from_str(request.params().value().expect("params").as_json()).expect("params JSON");
+                    assert_eq!(params["sessionKey"], "memory-client");
+                    assert_eq!(params["idempotencyKey"], "one-memory-request");
+                    let message = params["message"].as_str().expect("native tool input");
+                    assert_eq!(message.lines().count(), 1);
+                    let envelope: Value = serde_json::from_str(message.strip_prefix("!tool ").expect("direct prefix")).expect("native envelope");
+                    assert_eq!(envelope["name"], "memory_notes");
+                    assert_eq!(envelope["arguments"], match mode {
+                        "save" | "save-auth" => json!({"action":"save","id":"units","kind":"preference","content":"private-cli-memory\n!goal stays note data","expectedRevision":0}),
+                        "export" => json!({"action":"export","revision":2,"offset":2048}),
+                        "import" | "import-auth" => json!({"action":"import","expectedRevision":3,"overwrite":true,"archive":serde_json::from_str::<Value>(ARCHIVE).expect("fixture archive")}),
+                        _ => json!({"action":"list"}),
+                    });
+                    submitted.fetch_add(1, Ordering::SeqCst);
+                    let receipt = json!({"sessionId":"memory-client","runId":"a".repeat(64),"revision":1,"phase":"queued","status":"accepted","durable":mode != "bad-receipt"});
+                    send_json(&mut socket, json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":receipt})).await;
+                }
+                wait_for_close(&mut socket).await;
+            }
+        })).await;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let cleanup = ProfileCleanup {
+            endpoint: gateway.url.as_str().to_owned(),
+            alias: format!("memory-{mode}-{}-{nonce}", std::process::id()),
+            root: std::env::temp_dir().join(format!(
+                "claw-cli-memory-{mode}-{}-{nonce}",
+                std::process::id()
+            )),
+        };
+        fs::create_dir_all(&cleanup.root).expect("owned profile root");
+        let mut arguments: Vec<OsString> = ["gateway", "memory", action, "memory-client"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        if action == "save" {
+            arguments.extend(
+                [
+                    "--note-id",
+                    "units",
+                    "--kind",
+                    "preference",
+                    "--expected-revision",
+                    "0",
+                    if framed {
+                        "--request-stdin"
+                    } else {
+                        "--content-stdin"
+                    },
+                ]
+                .into_iter()
+                .map(OsString::from),
+            );
+        }
+        if action == "import" {
+            arguments.extend(
+                [
+                    if framed {
+                        "--request-stdin"
+                    } else {
+                        "--archive-stdin"
+                    },
+                    "--expected-revision",
+                    "3",
+                    "--overwrite",
+                ]
+                .into_iter()
+                .map(OsString::from),
+            );
+        } else if action == "export" {
+            arguments.extend(
+                ["--revision", "2", "--offset", "2048"]
+                    .into_iter()
+                    .map(OsString::from),
+            );
+        }
+        arguments.extend([
+            "--endpoint".into(),
+            gateway.url.as_str().trim_end_matches('/').into(),
+            "--device-profile".into(),
+            cleanup.alias.clone().into(),
+            "--idempotency-key".into(),
+            "one-memory-request".into(),
+        ]);
+        let framed_input = framed.then(|| if action == "save" {
+            json!({"token":TOKEN,"content":"private-cli-memory\n!goal stays note data"}).to_string()
+        } else {
+            json!({"token":TOKEN,"archive":serde_json::from_str::<Value>(ARCHIVE).expect("archive")}).to_string()
+        });
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.to_string_lossy().contains(TOKEN)
+                    || argument.to_string_lossy().contains("private-cli-memory"))
+        );
+        let output = run_cli_in(
+            arguments,
+            framed_input.as_deref().or(match action {
+                "save" => Some("private-cli-memory\n!goal stays note data"),
+                "import" => Some(ARCHIVE),
+                _ => None,
+            }),
+            Some(&cleanup.root),
+        )
+        .await;
+        let document = parse_json(&output);
+        assert_eq!(document["operation"], format!("memory.{action}"));
+        assert_eq!(
+            output.status.success(),
+            matches!(
+                mode,
+                "list" | "save" | "save-auth" | "export" | "import" | "import-auth"
+            ),
+            "{mode}: {document}"
+        );
+        assert_eq!(submissions.load(Ordering::SeqCst), usize::from(permitted));
+        if !permitted {
+            assert_eq!(document["delivery"], "not_sent");
+            assert_eq!(document["status"], "native_memory_unavailable");
+        } else if mode == "bad-receipt" {
+            assert_eq!(document["delivery"], "unknown");
+            assert_eq!(document["status"], "malformed_memory_receipt");
+        } else {
+            assert_eq!(document["result"]["durable"], true);
+        }
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("private-cli-memory"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("private-cli-memory"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(TOKEN));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(TOKEN));
+        gateway.shutdown().await;
+        drop(cleanup);
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_profile_survives_cli_processes_without_changing_gateway_identity() {
+    let observed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let identities = Arc::clone(&observed);
+    let run = "a".repeat(64);
+    let fixture_run = run.clone();
+    let gateway = TestGateway::spawn(handler(move |mut socket, index| {
+        let identities = Arc::clone(&identities);
+        let run = fixture_run.clone();
+        async move {
+            send_challenge(&mut socket).await;
+            let (connect, params) = receive_connect(&mut socket).await;
+            support::verify_connect_proof(&params);
+            let device = serde_json::to_value(&params).expect("handshake")["device"]["id"].as_str().expect("device identity").to_owned();
+            identities.lock().expect("identity list").push(device);
+            let scope = if index == 0 { "operator.write" } else { "operator.read" };
+            send_hello(&mut socket, connect.id(), "persistent-native-fixture", 4, AUTHENTICATED_MAX_FRAME_BYTES, "operator", &[scope]).await;
+            let request = receive_request(&mut socket).await;
+            assert_eq!(request.method().as_str(), if index == 0 { "chat.send" } else { "agent.wait" });
+            let result = if index == 0 { json!({"runId": run, "status": "accepted", "durable": true}) } else { json!({"runId": run, "phase": "finished", "result": {"status": "completed", "text": "retained result"}, "durable": true}) };
+            send_json(&mut socket, json!({"type": "res", "id": request.id().as_str(), "ok": true, "payload": result})).await;
+            wait_for_close(&mut socket).await;
+        }
+    })).await;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let cleanup = ProfileCleanup {
+        endpoint: gateway.url.as_str().to_owned(),
+        alias: format!("test-{}-{nonce}", std::process::id()),
+        root: std::env::temp_dir().join(format!("claw-cli-profile-{}-{nonce}", std::process::id())),
+    };
+    fs::create_dir_all(&cleanup.root).expect("isolated profile coordination root");
+    let options = || {
+        vec![
+            "--endpoint".into(),
+            gateway.url.as_str().trim_end_matches('/').into(),
+            "--device-profile".into(),
+            cleanup.alias.clone().into(),
+            "--token-stdin".into(),
+        ]
+    };
+    for mut arguments in [
+        vec![
+            "send".into(),
+            "profile-session".into(),
+            "first request".into(),
+            "--idempotency-key".into(),
+            "message-one".into(),
+        ],
+        vec!["gateway".into(), "run".into(), run.into()],
+    ] {
+        arguments.extend(options());
+        let output = run_cli_in(arguments, Some(TOKEN), Some(&cleanup.root)).await;
+        assert!(
+            output.status.success(),
+            "profile command: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(parse_json(&output)["result"]["durable"], true);
+    }
+    let captured = observed.lock().expect("captured identities").clone();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(captured[0], captured[1]);
+    let mut forget = vec!["gateway".into(), "forget-device".into()];
+    forget.extend(
+        options()
+            .into_iter()
+            .filter(|argument: &OsString| argument != "--token-stdin"),
+    );
+    let output = run_cli_in(forget, None, Some(&cleanup.root)).await;
+    assert!(output.status.success());
+    assert_eq!(parse_json(&output)["result"]["removed"], true);
+    assert_eq!(parse_json(&output)["result"]["remoteGrantsRevoked"], false);
+    gateway.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_business_commands_use_real_rpc_and_the_minimum_exact_scope() {
+    let baseline = Arc::new(
+        claw_conformance::ReleaseBaseline::load(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../compat/releases/v2026.9.4"),
+        )
+        .expect("reviewed candidate request schemas"),
+    );
+    let cases = [
+        (
+            vec![
+                "gateway",
+                "run",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--wait-ms",
+                "1000",
+            ],
+            "agent.wait",
+            "operator.read",
+            json!({"runId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "timeoutMs": 1000}),
+            json!({"phase": "finished", "result": {"status": "completed", "text": "durable result"}, "revision": 4}),
+        ),
+        (
+            vec![
+                "gateway",
+                "ack-run",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "4",
+            ],
+            "agent.wait",
+            "operator.read",
+            json!({"runId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "acknowledgeRevision": 4}),
+            json!({"acknowledged": true}),
+        ),
+        (
+            vec![
+                "gateway",
+                "partial-run",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "4",
+            ],
+            "agent.wait",
+            "operator.read",
+            json!({"runId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","partialPage":{"revision":4,"offset":0}}),
+            json!({"runId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sessionId":"owned-session","revision":4,"turn":0,"status":"outcome_unknown","durable":true,"acknowledged":false,"automaticReplay":false,
+                "partial":{"available":true,"text":"abc","offset":0,"nextOffset":null,"totalBytes":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","messageComplete":false,"untrusted":true,"reasoningIncluded":false,"toolArgumentsIncluded":false}}),
+        ),
+        (
+            vec![
+                "gateway",
+                "partial-run",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "4",
+                "--offset",
+                "2048",
+                "--sha256",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ],
+            "agent.wait",
+            "operator.read",
+            json!({"runId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","partialPage":{"revision":4,"offset":2048,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}),
+            json!({"runId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sessionId":"owned-session","revision":4,"turn":0,"status":"outcome_unknown","durable":true,"acknowledged":false,"automaticReplay":false,
+                "partial":{"available":true,"text":"last","offset":2048,"nextOffset":null,"totalBytes":2052,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","messageComplete":false,"untrusted":true,"reasoningIncluded":false,"toolArgumentsIncluded":false}}),
+        ),
+        (
+            vec!["gateway", "results", "native-session"],
+            "sessions.get",
+            "operator.read",
+            json!({"sessionKey": "native-session"}),
+            json!({"pendingRuns": [], "nextCursor": null}),
+        ),
+        (
+            vec!["gateway", "sessions"],
+            "sessions.list",
+            "operator.read",
+            json!({}),
+            json!({"sessions": []}),
+        ),
+        (
+            vec!["gateway", "history", "native-session"],
+            "chat.history",
+            "operator.read",
+            json!({"sessionKey": "native-session"}),
+            json!({"messages": [{"role": "user", "text": "stored history"}]}),
+        ),
+        (
+            vec!["gateway", "describe", "native-session"],
+            "sessions.describe",
+            "operator.read",
+            json!({"key":"native-session"}),
+            json!({"session":{"key":"native-session","state":"completed"},"durable":true,"contentIncluded":false}),
+        ),
+        (
+            vec!["gateway", "history", "native-session", "--limit", "1"],
+            "chat.history",
+            "operator.read",
+            json!({"sessionKey": "native-session", "limit": 1}),
+            json!({"messages": [{"role": "assistant", "text": "latest entry"}], "windowLimit": 1}),
+        ),
+        (
+            vec!["gateway", "abort", "native-session"],
+            "chat.abort",
+            "operator.write",
+            json!({"sessionKey": "native-session"}),
+            json!({"aborted": true}),
+        ),
+        (
+            vec!["gateway", "approvals", "native-session"],
+            "exec.approval.list",
+            "operator.approvals",
+            json!({"sessionId": "native-session"}),
+            json!({"requests": [], "nextCursor": null}),
+        ),
+        (
+            vec!["gateway", "approval", "approval-1"],
+            "exec.approval.get",
+            "operator.approvals",
+            json!({"id": "approval-1"}),
+            json!({"id": "approval-1", "prompt": "safe preview", "previewComplete": true}),
+        ),
+        (
+            vec!["gateway", "approve", "approval-1"],
+            "exec.approval.resolve",
+            "operator.approvals",
+            json!({"id": "approval-1", "decision": "approve"}),
+            json!({"ok": true, "scope": "once"}),
+        ),
+        (
+            vec!["gateway", "deny", "approval-1"],
+            "exec.approval.resolve",
+            "operator.approvals",
+            json!({"id": "approval-1", "decision": "deny"}),
+            json!({"ok": true, "scope": "once"}),
+        ),
+        (
+            vec![
+                "send",
+                "native-session",
+                "native message",
+                "--idempotency-key",
+                "once-1",
+            ],
+            "chat.send",
+            "operator.write",
+            json!({"sessionKey": "native-session", "message": "native message", "idempotencyKey": "once-1"}),
+            json!({"runId": "server-run", "status": "accepted", "durable": false}),
+        ),
+    ];
+    for (arguments, method, scope, expected, result) in cases {
+        let returned = result.clone();
+        let baseline = Arc::clone(&baseline);
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let mut expected = expected.clone();
+            let result = result.clone();
+            let baseline = Arc::clone(&baseline);
+            async move {
+                send_challenge(&mut socket).await;
+                let (connect, params) = receive_connect(&mut socket).await;
+                support::verify_connect_proof(&params);
+                let scopes: Vec<_> = params.scopes.as_ref().expect("requested scopes").iter().map(claw_protocol::gateway::Name::as_str).collect();
+                assert_eq!(scopes, [scope]);
+                send_hello(&mut socket, connect.id(), "native-fixture", 4, AUTHENTICATED_MAX_FRAME_BYTES, "operator", &[scope]).await;
+                if method == "exec.approval.resolve" {
+                    let preview = receive_request(&mut socket).await;
+                    assert_eq!(preview.method().as_str(), "exec.approval.get");
+                    let token = "b".repeat(64);
+                    let fingerprint = claw_security::authorization::approval_preview_fingerprint(&token).expect("fixture fingerprint");
+                    let mut payload = json!({"id": expected["id"], "sessionId": "native-session", "tool": "fs_write", "previewComplete": true, "bindingToken": token, "previewFingerprint": fingerprint,
+                        "toolPublication": "workspace-fixture", "toolRevision": 1, "resourceScope": "workspace: reviewed.txt",
+                        "caller": {"source": "Http", "subject": "verified-device", "account": null, "permissionGeneration": 0, "owner": true}});
+                    payload["prompt"] = json!(format!("{}fs_write\n{{}}", claw_protocol::native_approval::bound_approval_context_header(&payload).expect("context")));
+                    send_json(&mut socket, json!({"type": "res", "id": preview.id().as_str(), "ok": true, "payload": payload})).await;
+                    expected["bindingToken"] = json!(token);
+                }
+                let request = receive_request(&mut socket).await;
+                assert_eq!(request.method().as_str(), method);
+                let actual: Value = serde_json::from_str(request.params().value().expect("params").as_json()).expect("request JSON");
+                assert_eq!(actual, expected);
+                if method == "agent.wait" && (actual.get("acknowledgeRevision").is_some() || actual.get("partialPage").is_some()) {
+                    assert!(baseline.validate_gateway_request(method, &actual).is_err(), "native ACK and partial paging remain distinct extensions");
+                } else if matches!(method, "chat.send" | "chat.abort" | "chat.history" | "agent.wait" | "sessions.describe") {
+                    baseline.validate_gateway_request(method, &actual).expect("actual CLI request matches reviewed upstream parameters");
+                }
+                send_json(&mut socket, json!({"type": "res", "id": request.id().as_str(), "ok": true, "payload": result})).await;
+                wait_for_close(&mut socket).await;
+            }
+        })).await;
+        let mut args: Vec<OsString> = arguments.into_iter().map(OsString::from).collect();
+        if method == "exec.approval.resolve" {
+            args.extend([
+                "--preview-fingerprint".into(),
+                claw_security::authorization::approval_preview_fingerprint(&"b".repeat(64))
+                    .expect("fixture fingerprint")
+                    .into(),
+            ]);
+        }
+        args.extend(gateway_arguments(gateway.url.as_str()).into_iter().skip(2));
+        let output = run_cli(args, Some(TOKEN)).await;
+        assert!(
+            output.status.success(),
+            "native CLI failed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let document: Value = serde_json::from_slice(&output.stdout).expect("pure JSON stdout");
+        assert_eq!(document["schema_version"], 1);
+        assert_eq!(document["method"], method);
+        assert_eq!(document["result"], returned);
+        assert_eq!(document["shutdown_clean"], true);
+        assert!(output.stderr.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(TOKEN));
+        gateway.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_export_cli_collects_verified_pages_without_ack_or_overwriting_files() {
+    use std::fmt::Write as _;
+
+    for mode in [
+        "valid",
+        "empty",
+        "corrupt",
+        "identity-changed",
+        "disconnect",
+        "existing-target",
+        "absent",
+    ] {
+        let text = if mode == "empty" {
+            String::new()
+        } else {
+            format!(
+                "{}\u{754c}private-partial-must-not-render",
+                "x".repeat(2047)
+            )
+        };
+        let mut sha256 = String::new();
+        for byte in ring::digest::digest(&ring::digest::SHA256, text.as_bytes()).as_ref() {
+            write!(sha256, "{byte:02x}").expect("digest");
+        }
+        let first_end = text.len().min(2047);
+        let mut pages = vec![
+            json!({"runId":"a".repeat(64),"sessionId":"owned-session","revision":4,"turn":0,"status":"outcome_unknown","durable":true,"acknowledged":false,"automaticReplay":false,
+            "partial":{"available":true,"text":&text[..first_end],"offset":0,"nextOffset":(first_end < text.len()).then_some(first_end),"totalBytes":text.len(),"sha256":sha256,"messageComplete":false,"untrusted":true,"reasoningIncluded":false,"toolArgumentsIncluded":false}}),
+        ];
+        if first_end < text.len() {
+            let mut last = pages[0].clone();
+            last["partial"]["text"] = json!(&text[first_end..]);
+            last["partial"]["offset"] = json!(first_end);
+            last["partial"]["nextOffset"] = Value::Null;
+            if mode == "corrupt" {
+                last["partial"]["text"] = json!("q".repeat(text.len() - first_end));
+            }
+            if mode == "identity-changed" {
+                last["sessionId"] = json!("other-session");
+            }
+            pages.push(last);
+        }
+        if mode == "absent" {
+            pages.truncate(1);
+            pages[0]["turn"] = Value::Null;
+            pages[0]["partial"] = json!({"available":false});
+        }
+        let expected_pages = pages.len();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let digest = sha256.clone();
+        let gateway = TestGateway::spawn(handler(move |mut socket, connection| {
+            let pages = pages.clone();
+            let calls = Arc::clone(&observed);
+            let digest = digest.clone();
+            async move {
+                assert_eq!(connection, 0, "export cannot reconnect");
+                send_challenge(&mut socket).await;
+                let (connect, params) = receive_connect(&mut socket).await;
+                support::verify_connect_proof(&params);
+                let scopes: Vec<_> = params.scopes.as_ref().expect("scopes").iter().map(claw_protocol::gateway::Name::as_str).collect();
+                assert_eq!(scopes, ["operator.read"]);
+                send_hello(&mut socket, connect.id(), "partial-export-fixture", 4, AUTHENTICATED_MAX_FRAME_BYTES, "operator", &["operator.read"]).await;
+                for (index, page) in pages.into_iter().enumerate() {
+                    let request = receive_request(&mut socket).await;
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(request.method().as_str(), "agent.wait");
+                    let actual: Value = serde_json::from_str(request.params().value().expect("parameters").as_json()).expect("JSON");
+                    let mut expected = json!({"runId":"a".repeat(64),"partialPage":{"revision":4,"offset":if index == 0 { 0 } else { first_end }}});
+                    if index > 0 { expected["partialPage"]["sha256"] = json!(digest); }
+                    assert_eq!(actual, expected, "no ACK, wait, or unrelated operation");
+                    if mode == "disconnect" && index == 1 { return; }
+                    send_json(&mut socket, json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":page})).await;
+                }
+                wait_for_close(&mut socket).await;
+            }
+        })).await;
+        let destination = log_path(&format!("partial-export-{mode}-{}.txt", std::process::id()));
+        if mode == "existing-target" {
+            fs::write(&destination, b"keep-original-output").expect("owned existing file");
+        }
+        let mut arguments = vec![
+            "gateway".into(),
+            "export-partial".into(),
+            "a".repeat(64).into(),
+            "4".into(),
+            "--destination".into(),
+            destination.as_os_str().to_owned(),
+        ];
+        arguments.extend(gateway_arguments(gateway.url.as_str()).into_iter().skip(2));
+        let output = run_cli(arguments, Some(TOKEN)).await;
+        let success = matches!(mode, "valid" | "empty");
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let document = parse_json(&output);
+        assert_eq!(document["operation"], "run.export_partial");
+        assert_eq!(document["sourceModified"], false);
+        assert_eq!(document["acknowledged"], false);
+        assert_eq!(document["automaticReplay"], false);
+        assert_eq!(calls.load(Ordering::SeqCst), expected_pages);
+        if success {
+            assert_eq!(
+                fs::read(&destination).expect("verified file"),
+                text.as_bytes()
+            );
+            assert_eq!(document["result"]["sha256"], sha256);
+            assert_eq!(document["result"]["fileCreated"], true);
+            assert_eq!(document["result"]["plaintext"], true);
+            assert_eq!(document["result"]["messageComplete"], false);
+        } else if mode == "existing-target" {
+            assert_eq!(
+                fs::read(&destination).expect("original file"),
+                b"keep-original-output"
+            );
+        } else {
+            assert!(
+                !destination.exists(),
+                "unverified export must create no target"
+            );
+            assert_eq!(document["fileMayExist"], false);
+        }
+        let stdout = String::from_utf8(output.stdout).expect("JSON output");
+        assert!(!stdout.contains("private-partial-must-not-render"));
+        assert!(!stdout.contains(TOKEN));
+        assert!(output.stderr.is_empty());
+        let _ = fs::remove_file(destination);
+        gateway.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_run_cli_rejects_corrupt_pages_without_rendering_their_text() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+        let observed = Arc::clone(&observed);
+        async move {
+            send_challenge(&mut socket).await;
+            let (connect,params) = receive_connect(&mut socket).await;
+            support::verify_connect_proof(&params);
+            send_hello(&mut socket,connect.id(),"partial-fixture",4,AUTHENTICATED_MAX_FRAME_BYTES,"operator",&["operator.read"]).await;
+            let request = receive_request(&mut socket).await;
+            observed.fetch_add(1,Ordering::SeqCst);
+            assert_eq!(request.method().as_str(),"agent.wait");
+            let parameters: Value = serde_json::from_str(request.params().value().expect("page parameters").as_json()).expect("JSON request");
+            assert_eq!(parameters,json!({"runId":"a".repeat(64),"partialPage":{"revision":4,"offset":0}}));
+            send_json(&mut socket,json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":{
+                "runId":"a".repeat(64),"sessionId":"owned-session","revision":4,"turn":0,"status":"outcome_unknown","durable":true,"acknowledged":false,"automaticReplay":false,
+                "partial":{"available":true,"text":"private-page-must-not-render","offset":0,"nextOffset":null,"totalBytes":28,"sha256":"0".repeat(64),"messageComplete":false,"untrusted":true,"reasoningIncluded":false,"toolArgumentsIncluded":false}
+            }})).await;
+            wait_for_close(&mut socket).await;
+        }
+    })).await;
+    let mut arguments = vec![
+        "gateway".into(),
+        "partial-run".into(),
+        "a".repeat(64).into(),
+        "4".into(),
+    ];
+    arguments.extend(gateway_arguments(gateway.url.as_str()).into_iter().skip(2));
+    let output = run_cli(arguments, Some(TOKEN)).await;
+    assert!(!output.status.success());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let document = String::from_utf8(output.stdout).expect("JSON output");
+    assert!(document.contains("invalid_partial_page"));
+    assert!(!document.contains("private-page-must-not-render"));
+    assert!(!document.contains(TOKEN));
+    assert!(output.stderr.is_empty());
+    gateway.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_commands_reject_overgrants_and_never_echo_remote_error_secrets() {
+    for overgrant in [true, false] {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let observed = Arc::clone(&observed);
+            async move {
+                send_challenge(&mut socket).await;
+                let (connect, _) = receive_connect(&mut socket).await;
+                send_hello(&mut socket, connect.id(), "native-fixture", 4, AUTHENTICATED_MAX_FRAME_BYTES, "operator", if overgrant { &["operator.admin"] } else { &["operator.approvals"] }).await;
+                if overgrant {
+                    count_requests_until_close(&mut socket, &observed).await;
+                } else {
+                    let request = receive_request(&mut socket).await;
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    send_json(&mut socket, json!({"type": "res", "id": request.id().as_str(), "ok": false, "error": {"code": "UNAUTHORIZED", "message": TOKEN_WRAPPED}})).await;
+                    wait_for_close(&mut socket).await;
+                }
+            }
+        })).await;
+        let mut arguments = vec!["gateway".into(), "approve".into(), "approval-1".into()];
+        arguments.extend(["--preview-fingerprint".into(), "a".repeat(64).into()]);
+        arguments.extend(gateway_arguments(gateway.url.as_str()).into_iter().skip(2));
+        let output = run_cli(arguments, Some(TOKEN)).await;
+        assert!(!output.status.success());
+        let document: Value = serde_json::from_slice(&output.stdout).expect("failure JSON");
+        assert_eq!(
+            document["delivery"],
+            if overgrant { "not_sent" } else { "rejected" }
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(TOKEN));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(TOKEN));
+        gateway.shutdown().await;
+        assert_eq!(requests.load(Ordering::SeqCst), usize::from(!overgrant));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_cli_keeps_unconfirmed_server_outcomes_unknown_without_replay() {
+    for code in ["OUTCOME_UNKNOWN", "UNAVAILABLE"] {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let observed = Arc::clone(&observed);
+            async move {
+                send_challenge(&mut socket).await;
+                let (connect, _) = receive_connect(&mut socket).await;
+                send_hello(&mut socket, connect.id(), "uncertain-fixture", 4, AUTHENTICATED_MAX_FRAME_BYTES, "operator", &["operator.write"]).await;
+                let request = receive_request(&mut socket).await;
+                observed.fetch_add(1, Ordering::SeqCst);
+                send_json(&mut socket, json!({"type": "res", "id": request.id().as_str(), "ok": false, "error": {"code": code, "message": TOKEN_WRAPPED, "retryable": false}})).await;
+                count_requests_until_close(&mut socket, &observed).await;
+            }
+        })).await;
+        let mut arguments = vec![
+            "send".into(),
+            "session-one".into(),
+            "once".into(),
+            "--idempotency-key".into(),
+            "original-key".into(),
+        ];
+        arguments.extend(gateway_arguments(gateway.url.as_str()).into_iter().skip(2));
+        let output = run_cli(arguments, Some(TOKEN)).await;
+        assert!(!output.status.success());
+        let result: Value = serde_json::from_slice(&output.stdout).expect("JSON failure");
+        assert_eq!(result["delivery"], "unknown");
+        assert_eq!(result["status"], "outcome_unknown");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(TOKEN));
+        gateway.shutdown().await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "writes must not be replayed"
+        );
+    }
+}
+
 #[derive(Clone, Debug)]
 enum GatewayBehavior {
     Healthy {
@@ -334,7 +1375,18 @@ async fn send_health(socket: &mut support::TestSocket, id: &str, ok: bool) {
 }
 
 async fn run_cli(arguments: Vec<OsString>, stdin: Option<&str>) -> Output {
+    run_cli_in(arguments, stdin, None).await
+}
+
+async fn run_cli_in(
+    arguments: Vec<OsString>,
+    stdin: Option<&str>,
+    profile_root: Option<&std::path::Path>,
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-cli"));
+    if let Some(root) = profile_root {
+        command.env("LOCALAPPDATA", root);
+    }
     command
         .args(arguments)
         .env_remove("GTA_CLAW_LOG")

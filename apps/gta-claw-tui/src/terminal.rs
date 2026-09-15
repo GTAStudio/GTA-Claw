@@ -5,7 +5,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -42,7 +44,13 @@ impl TerminalControl for CrosstermControl {
     fn enter(&self) -> io::Result<()> {
         enable_raw_mode()?;
         self.active.store(true, Ordering::Release);
-        let result = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide);
+        let result = execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            Hide
+        );
         if result.is_err() {
             let _ = self.restore();
             return result;
@@ -58,6 +66,7 @@ impl TerminalControl for CrosstermControl {
             io::stdout(),
             Show,
             DisableMouseCapture,
+            DisableBracketedPaste,
             LeaveAlternateScreen
         );
         let raw_result = disable_raw_mode();
@@ -215,6 +224,7 @@ pub fn best_effort_restore() {
         io::stdout(),
         Show,
         DisableMouseCapture,
+        DisableBracketedPaste,
         LeaveAlternateScreen
     );
     let _ = disable_raw_mode();

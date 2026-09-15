@@ -12,6 +12,10 @@ publish = false
 claw-security.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = "=0.1.11"
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"

@@ -358,6 +358,8 @@ pub trait DiscordTransport {
     ) -> Result<ProviderResponse, ChannelError>;
 }
 
+type InboundAdmission<'a> = dyn FnMut(&InboundMessage) -> Result<bool, ChannelError> + 'a;
+
 /// Discord Gateway plus REST message adapter.
 pub struct DiscordChannel<T, C> {
     account_id: String,
@@ -525,6 +527,69 @@ impl<T, C> DiscordChannel<T, C> {
 }
 
 impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
+    /// Drains a durably admitted message while READY or replaying the saved authenticated session.
+    ///
+    /// # Errors
+    /// Refuses uninitialized, identifying, reconnecting or stopped sessions.
+    pub fn poll_admitted_inbound(&mut self) -> Result<Option<InboundMessage>, ChannelError> {
+        self.require_gateway_open()?;
+        if !matches!(
+            self.phase,
+            DiscordGatewayPhase::Ready | DiscordGatewayPhase::Resuming
+        ) {
+            return Err(ChannelError::NotConnected {
+                state: self.state(),
+            });
+        }
+        Ok(self.inbound.pop())
+    }
+
+    /// Restores host-verified resume metadata before the first Gateway attempt.
+    ///
+    /// Saved addresses must pass the current origin and transport routing policy again.
+    ///
+    /// # Errors
+    /// Refuses running adapters, invalid session/sequence data or a no-longer-approved resume URL.
+    pub fn restore_resume_state(
+        &mut self,
+        session_id: &str,
+        sequence: i64,
+        resume_url: Option<&str>,
+    ) -> Result<(), ChannelError> {
+        if self.state() != ConnectionState::Disconnected
+            || self.queued_inbound() != 0
+            || invalid_routing_identifier(session_id)
+            || session_id.len() > 256
+            || sequence < 0
+        {
+            return Err(ChannelError::Configuration(
+                ConfigurationError::InvalidAdapterConfiguration,
+            ));
+        }
+        let resume_url = resume_url
+            .map(|url| {
+                if url.len() > 2_048
+                    || url.split_once('?').is_some_and(|(_, query)| {
+                        !matches!(query, "v=10&encoding=json" | "encoding=json&v=10")
+                    })
+                {
+                    return Err(ChannelError::Configuration(
+                        ConfigurationError::InvalidAdapterConfiguration,
+                    ));
+                }
+                validated_resume_gateway_url(url, &self.gateway_origin)
+                    .filter(|url| self.transport.gateway_url_allowed(url))
+                    .ok_or(ChannelError::Configuration(
+                        ConfigurationError::InvalidAdapterConfiguration,
+                    ))
+            })
+            .transpose()?;
+        self.session_id = Some(session_id.to_owned());
+        self.sequence = Some(sequence);
+        self.resume_gateway_url = resume_url;
+        Ok(())
+    }
+
     /// Starts one Gateway connection attempt.
     ///
     /// Repeated calls while connecting, connected, or waiting to reconnect are
@@ -555,8 +620,14 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
         self.reconnect_attempts = 0;
         self.lifecycle
             .apply(LifecycleEvent::ConnectRequested, &mut ())?;
-        self.active_gateway_attempt = Some(DiscordGatewayAttempt::Bootstrap);
-        match self.transport.open_gateway(&self.gateway_url) {
+        let using_resume_gateway = self.session_id.is_some() && self.resume_gateway_url.is_some();
+        self.active_gateway_attempt = Some(if using_resume_gateway {
+            DiscordGatewayAttempt::Resume
+        } else {
+            DiscordGatewayAttempt::Bootstrap
+        });
+        let gateway_url = self.reconnect_gateway_url().to_owned();
+        match self.transport.open_gateway(&gateway_url) {
             Ok(()) => {
                 diagnostics.record(self.diagnostic(
                     DiagnosticLevel::Info,
@@ -568,6 +639,9 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
                 Ok(true)
             }
             Err(error) => {
+                if using_resume_gateway {
+                    self.resume_gateway_url = None;
+                }
                 self.active_gateway_attempt = None;
                 self.lifecycle
                     .apply(LifecycleEvent::ConnectionLost, &mut ())?;
@@ -781,6 +855,51 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
         gateway_credential: &ChannelCredential,
         diagnostics: &mut impl DiagnosticSink,
     ) -> Result<DiscordPacketOutcome, ChannelError> {
+        self.handle_gateway_packet_admitted(raw, now, gateway_credential, diagnostics, None)
+    }
+
+    /// Contains a packet and advances dispatch sequence only after durable host admission.
+    ///
+    /// A refused admission, malformed dispatch or full queue forces reconnect from the last
+    /// accepted sequence. Returning false from admission skips an already handled durable input.
+    ///
+    /// # Errors
+    /// Returns packet/credential/transport or host-admission failures without acknowledging them.
+    pub fn handle_gateway_packet_with_admission(
+        &mut self,
+        raw: &[u8],
+        now: Duration,
+        gateway_credential: &ChannelCredential,
+        diagnostics: &mut impl DiagnosticSink,
+        mut admission: impl FnMut(&InboundMessage) -> Result<bool, ChannelError>,
+    ) -> Result<DiscordPacketOutcome, ChannelError> {
+        let result = self.handle_gateway_packet_admitted(
+            raw,
+            now,
+            gateway_credential,
+            diagnostics,
+            Some(&mut admission),
+        );
+        if (result.is_err()
+            || matches!(
+                result,
+                Ok(DiscordPacketOutcome::Malformed | DiscordPacketOutcome::MessageDropped)
+            ))
+            && self.require_gateway_open().is_ok()
+        {
+            self.request_reconnect(now, diagnostics)?;
+        }
+        result
+    }
+
+    fn handle_gateway_packet_admitted(
+        &mut self,
+        raw: &[u8],
+        now: Duration,
+        gateway_credential: &ChannelCredential,
+        diagnostics: &mut impl DiagnosticSink,
+        admission: Option<&mut InboundAdmission<'_>>,
+    ) -> Result<DiscordPacketOutcome, ChannelError> {
         self.require_gateway_open()?;
         if raw.len() > MAX_PROVIDER_RESPONSE_BYTES {
             self.record_malformed(diagnostics);
@@ -790,15 +909,25 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
             self.record_malformed(diagnostics);
             return Ok(DiscordPacketOutcome::Malformed);
         };
-        if let Some(sequence) = packet.sequence {
+        let deferred = admission.is_some();
+        if deferred
+            && packet.opcode == 0
+            && packet.sequence.is_none_or(|sequence| {
+                sequence < 0 || self.sequence.is_some_and(|current| sequence < current)
+            })
+        {
+            self.record_malformed(diagnostics);
+            return Ok(DiscordPacketOutcome::Malformed);
+        }
+        if !deferred && let Some(sequence) = packet.sequence {
             self.sequence = Some(sequence);
         }
 
-        match packet.opcode {
+        let result = match packet.opcode {
             10 if self.phase == DiscordGatewayPhase::AwaitingHello => {
                 self.handle_hello(packet.data.get(), now, gateway_credential, diagnostics)
             }
-            0 => self.handle_dispatch(packet.event_type, packet.data.get(), diagnostics),
+            0 => self.handle_dispatch(packet.event_type, packet.data.get(), diagnostics, admission),
             1 => {
                 self.send_heartbeat(now, diagnostics)?;
                 Ok(DiscordPacketOutcome::Ignored)
@@ -819,7 +948,14 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
                 Ok(DiscordPacketOutcome::HeartbeatAcknowledged)
             }
             _ => Ok(DiscordPacketOutcome::Ignored),
+        };
+        if deferred
+            && packet.opcode == 0
+            && matches!(result, Ok(outcome) if !matches!(outcome, DiscordPacketOutcome::Malformed | DiscordPacketOutcome::MessageDropped))
+        {
+            self.sequence = packet.sequence;
         }
+        result
     }
 
     /// Permanently stops the Gateway and clears timers and queued input.
@@ -941,6 +1077,7 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
         event_type: Option<&str>,
         data: &str,
         diagnostics: &mut impl DiagnosticSink,
+        admission: Option<&mut InboundAdmission<'_>>,
     ) -> Result<DiscordPacketOutcome, ChannelError> {
         match event_type {
             Some("READY") if self.phase == DiscordGatewayPhase::Identifying => {
@@ -1033,6 +1170,11 @@ impl<T: DiscordTransport, C: UnixClock> DiscordChannel<T, C> {
                     attachments: Vec::new(),
                     received_at_unix_ms: self.clock.now_unix_ms(),
                 };
+                if let Some(admit) = admission
+                    && !admit(&normalized)?
+                {
+                    return Ok(DiscordPacketOutcome::Ignored);
+                }
                 if let Err(dropped) = self.inbound.push(normalized) {
                     diagnostics.record(self.diagnostic(
                         DiagnosticLevel::Warning,

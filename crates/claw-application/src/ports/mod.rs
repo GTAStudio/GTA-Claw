@@ -40,6 +40,10 @@ pub enum PortError {
     ///
     /// Retrying the same request is unsafe because the committed state may already be visible.
     CommittedButNotDurable(String),
+    /// The operation may have taken effect, but its outcome could not be determined.
+    ///
+    /// Reconcile the original operation identity before any explicit retry.
+    OutcomeUnknown(String),
     /// The adapter aborted the work because it was cancelled.
     Cancelled,
 }
@@ -54,6 +58,7 @@ impl PortError {
             Self::NotFound(_) => "not_found",
             Self::Invalid(_) => "invalid",
             Self::CommittedButNotDurable(_) => "committed_but_not_durable",
+            Self::OutcomeUnknown(_) => "outcome_unknown",
             Self::Cancelled => "cancelled",
         }
     }
@@ -72,7 +77,8 @@ impl Display for PortError {
             | Self::Conflict(detail)
             | Self::NotFound(detail)
             | Self::Invalid(detail)
-            | Self::CommittedButNotDurable(detail) => {
+            | Self::CommittedButNotDurable(detail)
+            | Self::OutcomeUnknown(detail) => {
                 write!(formatter, "{}: {detail}", self.label())
             }
             Self::Cancelled => formatter.write_str("cancelled"),
@@ -94,6 +100,7 @@ mod tests {
             PortError::NotFound("session-1".to_owned()),
             PortError::Invalid("empty name".to_owned()),
             PortError::CommittedButNotDurable("rename landed".to_owned()),
+            PortError::OutcomeUnknown("commit result was lost".to_owned()),
             PortError::Cancelled,
         ];
         let labels: Vec<&str> = errors.iter().map(PortError::label).collect();
@@ -106,6 +113,7 @@ mod tests {
                 "not_found",
                 "invalid",
                 "committed_but_not_durable",
+                "outcome_unknown",
                 "cancelled"
             ]
         );
@@ -118,6 +126,7 @@ mod tests {
         assert!(!PortError::NotFound("x".to_owned()).is_retryable());
         assert!(!PortError::Invalid("x".to_owned()).is_retryable());
         assert!(!PortError::CommittedButNotDurable("x".to_owned()).is_retryable());
+        assert!(!PortError::OutcomeUnknown("x".to_owned()).is_retryable());
         assert!(!PortError::Cancelled.is_retryable());
     }
 

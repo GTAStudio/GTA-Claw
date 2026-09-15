@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-stream-primary-usage-provenance",
+  "capturedAtUtc": "2026-09-15T07:52:54.7244564Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-provider-sdk/src/stream.rs","sha256":"d44a0220f88efdac583b01b73b6a6a49ceab24717e4bea3c80ff0f4356cc348e"},
+    {"path":"crates/claw-providers/src/openai_compatible.rs","sha256":"7632428c0f28997a786224b90e7a66ef95921d7b8cff83e24fe89f1bd8f06ba6"},
+    {"path":"crates/claw-providers/src/anthropic.rs","sha256":"6aa17b73ebbdbdf193fcd219c1e59a66e5c11808e8408aee7193fdff0c73d0a3"},
+    {"path":"crates/claw-providers/src/responses.rs","sha256":"11884de57251f23bb26d94738f5bf11bfcc84c97384c87b17db799cc6488243d"},
+    {"path":"crates/claw-providers/tests/wire.rs","sha256":"b145baaf36fecb5ae918e295fa6d68a4fe5c29997528b63abf48f2feee0dd66b"},
+    {"path":"apps/gta-claw-daemon/src/adapters/http_api.rs","sha256":"1dadd62febb6c7536dabfbe0ed1719c038833e05ddec5dd99d50f6a20029fae5"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-provider-sdk -p claw-providers -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":725, "failed":0, "ignored":5, "testBinaries":17,
+      "log":"target/native-stream-usage-tests-20260915T075039386Z.log",
+      "sha256":"c296e18c14538e792357fdb7c8799cdba8bd514f86485f1c911d65de7213bb8a"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-provider-sdk -p claw-providers -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-stream-usage-clippy-20260915T075402370Z.log",
+      "sha256":"ebe613f46b851f7cbd500e3175668b6b9479c4c7da4a3f067f6e48ae8b1e2fbb"
+    },
+    {
+      "command":"cargo +stable check --manifest-path D:/GTA-Claw/Cargo.toml --workspace --all-targets --locked --offline",
+      "result":"passed",
+      "log":"target/native-stream-usage-workspace-check-20260915T074838328Z.log",
+      "sha256":"d3aaab98b876795cf2b052a74a3323ddf829706ed817d386aea8391b12182f3d"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-providers --test wire --locked --offline --quiet",
+      "result":"passed", "passed":40, "failed":0, "ignored":0, "testBinaries":1,
+      "log":"target/native-stream-usage-wire-20260915T074739622Z.log",
+      "sha256":"2beb987612c1639ddceb97fdfe7b27715a5be2da50013abda0f3ad3a282e9553",
+      "scopeNote":"Focused wire regression is also included in the complete three-package cohort"
+    }
+  ],
+  "retainedFailures": [
+    {"log":"target/native-stream-usage-clippy-20260915T074131247Z.log","sha256":"7923626036babbf3bc80eee33b0e7f61c2c27c83824f158ad77083405a5bdfc9","reason":"New primary-counter presence flags exceeded the decoder's flat boolean limit; grouped into PrimaryUsageFields without changing coverage"},
+    {"log":"target/native-stream-usage-clippy-20260915T074237109Z.log","sha256":"63652561bca92f073a8e7e1d2760fc5569fa9c8ac11ecec044a80831bfc7cb2e","reason":"Test provider computed an eager fallback; changed to lazy fallback without changing cases"},
+    {"log":"target/native-stream-usage-clippy-20260915T074435851Z.log","sha256":"ce00a89741091d5502b74589f751a5619e8aecb0b579045c18f3568e7b8c9571","reason":"Test SSE format/collect lint; reused the existing Anthropic encoder and wrote Chat frames directly"}
+  ],
+  "behaviorEvidence": [
+    "accumulator_usage_reporting_distinguishes_missing_partial_and_explicit_zero",
+    "accumulator_usage_reporting_does_not_certify_changed_legacy_terminal_counters",
+    "chat_stream_usage_reporting_tracks_primary_fields_across_updates",
+    "anthropic_stream_usage_reporting_retains_zero_and_cumulative_primary_fields",
+    "provider_adapter_holds_tools_until_complete_and_does_not_remember_failed_turns",
+    "an_openai_stream_round_trips_over_the_wire",
+    "an_anthropic_stream_round_trips_over_the_wire",
+    "responses_terminal_closes_a_held_socket_and_releases_the_only_capacity_slot",
+    "copilot_streams_and_lists_models_over_the_wire"
+  ],
+  "notes": [
+    "UsageReported carries a validated counter snapshot plus primary-field coverage; old UsageUpdate remains accepted but does not prove complete field reporting",
+    "Explicit complete zeroes differ from absent usage; matching terminal counts preserve coverage, changed positive legacy terminal counts are conservative Partial",
+    "Chat preserves split primary-field presence and later omitted fields; Anthropic distinguishes absent from empty usage and emits zero/unchanged counter coverage updates",
+    "Responses uses its validated terminal response coverage; native HTTP summaries now consume accumulator coverage instead of an always-partial flag",
+    "The existing adapter barrier fixture covers 50 finish/tool/usage profiles without permitting early tool output or writing partials into complete history",
+    "An initial local provider-library test expected text immediately after Started; it now explicitly asserts the new empty-usage snapshot before the original partial text and error. That focused failure was recorded in terminal conversation output, not a separate log file",
+    "Public HTTP usage JSON and terminal TurnRecord persistence policy are unchanged; this is not a new streaming runtime execution path or automatic HTTP-stream persistence",
+    "Both older native-credential anomalies and the prior stdio-lock/durable-revocation joint failures remain unresolved; no policy, timeout, retry or test-serialization workaround was introduced",
+    "No dependency download, lock change, real account/browser/device migration, production/proxy action, deployment or Git write occurred"
+  ],
+  "unverified": [
+    "Crash-safe in-flight per-round journals, pre-request monetary budgets, actual pricing and remote invoice reconciliation",
+    "Complete usage retention for all failed/cancelled external responses and real-account protocol variants",
+    "External exhaustive SDK consumers and binary compatibility; the root workspace check covers repository consumers only",
+    "Root causes of prior native-credential and stdio fixture anomalies, other platforms, release and whole-project acceptance"
+  ]
+}

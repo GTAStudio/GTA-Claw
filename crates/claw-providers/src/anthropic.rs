@@ -6,8 +6,8 @@
 //! turn, and streaming is a typed event protocol rather than a single chunk
 //! shape.
 
-use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet};
 
 use claw_provider_sdk::error::{ErrorKind, Operation, ProviderError};
 use claw_provider_sdk::http::{Body, HttpRequest, Method, TlsPolicy};
@@ -668,7 +668,7 @@ pub fn encode_messages(
 // Response decoding
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[expect(
     clippy::struct_field_names,
     reason = "these are Anthropic's wire field names; renaming them to drop the \
@@ -677,25 +677,84 @@ pub fn encode_messages(
 )]
 struct WireUsage {
     #[serde(default)]
-    input_tokens: u64,
+    input_tokens: Option<u64>,
     #[serde(default)]
-    output_tokens: u64,
+    output_tokens: Option<u64>,
     #[serde(default)]
-    cache_read_input_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
     #[serde(default)]
-    cache_creation_input_tokens: u64,
+    cache_creation_input_tokens: Option<u64>,
 }
 
-impl From<WireUsage> for Usage {
-    fn from(usage: WireUsage) -> Self {
-        Self {
-            input_tokens: usage
-                .input_tokens
-                .saturating_add(usage.cache_creation_input_tokens),
-            output_tokens: usage.output_tokens,
-            cached_input_tokens: usage.cache_read_input_tokens,
-            reasoning_tokens: 0,
+impl WireUsage {
+    const fn reporting(self) -> claw_provider_sdk::model::UsageReporting {
+        if self.input_tokens.is_some() && self.output_tokens.is_some() {
+            claw_provider_sdk::model::UsageReporting::Complete
+        } else {
+            claw_provider_sdk::model::UsageReporting::Partial
         }
+    }
+
+    fn validated(self, provider: &str, operation: Operation) -> Result<Usage, ProviderError> {
+        let input_tokens = self
+            .input_tokens
+            .unwrap_or_default()
+            .checked_add(self.cache_creation_input_tokens.unwrap_or_default())
+            .and_then(|tokens| tokens.checked_add(self.cache_read_input_tokens.unwrap_or_default()))
+            .ok_or_else(|| {
+                protocol_error(
+                    provider,
+                    operation,
+                    "Anthropic input usage overflows its counter",
+                )
+            })?;
+        let output_tokens = self.output_tokens.unwrap_or_default();
+        if input_tokens.checked_add(output_tokens).is_none() {
+            return Err(protocol_error(
+                provider,
+                operation,
+                "Anthropic total usage overflows its counter",
+            ));
+        }
+        Ok(Usage {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens: self.cache_read_input_tokens.unwrap_or_default(),
+            reasoning_tokens: 0,
+        })
+    }
+
+    fn merge(self, update: Self, provider: &str) -> Result<Self, ProviderError> {
+        let fields = [
+            (self.input_tokens, update.input_tokens),
+            (self.output_tokens, update.output_tokens),
+            (self.cache_read_input_tokens, update.cache_read_input_tokens),
+            (
+                self.cache_creation_input_tokens,
+                update.cache_creation_input_tokens,
+            ),
+        ];
+        if fields.into_iter().any(|(previous, next)| {
+            previous
+                .zip(next)
+                .is_some_and(|(previous, next)| next < previous)
+        }) {
+            return Err(protocol_error(
+                provider,
+                Operation::StreamCompletion,
+                "Anthropic cumulative usage decreased",
+            ));
+        }
+        Ok(Self {
+            input_tokens: update.input_tokens.or(self.input_tokens),
+            output_tokens: update.output_tokens.or(self.output_tokens),
+            cache_read_input_tokens: update
+                .cache_read_input_tokens
+                .or(self.cache_read_input_tokens),
+            cache_creation_input_tokens: update
+                .cache_creation_input_tokens
+                .or(self.cache_creation_input_tokens),
+        })
     }
 }
 
@@ -727,11 +786,19 @@ struct WireMessageResponse {
     #[serde(default)]
     stop_reason: Option<String>,
     #[serde(default)]
-    usage: WireUsage,
+    usage: Option<WireUsage>,
 }
 
 fn protocol_error(provider: &str, operation: Operation, detail: &str) -> ProviderError {
     ProviderError::new(ErrorKind::Protocol, provider, operation, detail)
+}
+
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= claw_provider_sdk::stream::MAX_TOOL_NAME_BYTES
+        && !value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
 }
 
 /// Maps an Anthropic `stop_reason` onto the portable enumeration.
@@ -762,12 +829,37 @@ pub fn decode_message(provider: &str, body: &[u8]) -> Result<CompletionResponse,
     let mut content = Vec::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
+    let mut call_ids = BTreeSet::new();
+    let mut output_bytes = 0_usize;
+    if wire.content.len() > claw_provider_sdk::stream::MAX_TOOL_CALLS {
+        return Err(protocol_error(
+            provider,
+            Operation::Complete,
+            "message content block count exceeds its limit",
+        ));
+    }
     for block in wire.content {
         match block {
-            WireResponseBlock::Text { text } => content.push(ContentPart::Text(text)),
-            WireResponseBlock::Thinking { thinking } => reasoning.push_str(&thinking),
+            WireResponseBlock::Text { text } => {
+                output_bytes = output_bytes.saturating_add(text.len());
+                content.push(ContentPart::Text(text));
+            }
+            WireResponseBlock::Thinking { thinking } => {
+                output_bytes = output_bytes.saturating_add(thinking.len());
+                reasoning.push_str(&thinking);
+            }
             WireResponseBlock::RedactedThinking {} => {}
             WireResponseBlock::ToolUse { id, name, input } => {
+                if !valid_identifier(&id)
+                    || !valid_identifier(&name)
+                    || !call_ids.insert(id.clone())
+                {
+                    return Err(protocol_error(
+                        provider,
+                        Operation::Complete,
+                        "message function identity is invalid or duplicated",
+                    ));
+                }
                 let arguments = serde_json::to_string(&input).map_err(|error| {
                     protocol_error(
                         provider,
@@ -776,17 +868,34 @@ pub fn decode_message(provider: &str, body: &[u8]) -> Result<CompletionResponse,
                     )
                 })?;
                 tool_calls.push(ToolCall {
+                    arguments: {
+                        output_bytes = output_bytes.saturating_add(arguments.len());
+                        if arguments.len() > claw_provider_sdk::stream::MAX_TOOL_ARGUMENT_BYTES {
+                            return Err(protocol_error(
+                                provider,
+                                Operation::Complete,
+                                "message function arguments exceed their limit",
+                            ));
+                        }
+                        ToolArguments::new(arguments).map_err(|_| {
+                            protocol_error(
+                                provider,
+                                Operation::Complete,
+                                "message function arguments must be a JSON object",
+                            )
+                        })?
+                    },
                     id,
                     name,
-                    arguments: ToolArguments::new(arguments).map_err(|error| {
-                        protocol_error(
-                            provider,
-                            Operation::Complete,
-                            &format!("a tool call carried invalid arguments: {error}"),
-                        )
-                    })?,
                 });
             }
+        }
+        if output_bytes > claw_provider_sdk::stream::MAX_TOTAL_TOOL_ARGUMENT_BYTES {
+            return Err(protocol_error(
+                provider,
+                Operation::Complete,
+                "message output exceeds its aggregate byte limit",
+            ));
         }
     }
     let model = ModelId::new(if wire.model.is_empty() {
@@ -801,6 +910,25 @@ pub fn decode_message(provider: &str, body: &[u8]) -> Result<CompletionResponse,
             &format!("the response named an invalid model: {error}"),
         )
     })?;
+    let finish_reason = wire.stop_reason.as_deref().map_or_else(
+        || {
+            if tool_calls.is_empty() {
+                FinishReason::Stop
+            } else {
+                FinishReason::ToolCalls
+            }
+        },
+        stop_reason,
+    );
+    if (!tool_calls.is_empty() && finish_reason != FinishReason::ToolCalls)
+        || (tool_calls.is_empty() && finish_reason == FinishReason::ToolCalls)
+    {
+        return Err(protocol_error(
+            provider,
+            Operation::Complete,
+            "message stop reason is inconsistent with its function calls",
+        ));
+    }
     Ok(CompletionResponse {
         id: wire.id,
         model,
@@ -813,11 +941,21 @@ pub fn decode_message(provider: &str, body: &[u8]) -> Result<CompletionResponse,
             },
             tool_calls,
         },
-        finish_reason: wire
-            .stop_reason
-            .as_deref()
-            .map_or(FinishReason::Stop, stop_reason),
-        usage: Usage::from(wire.usage),
+        finish_reason,
+        usage_reporting: wire.usage.as_ref().map_or(
+            claw_provider_sdk::model::UsageReporting::Unreported,
+            |usage| {
+                if usage.input_tokens.is_some() && usage.output_tokens.is_some() {
+                    claw_provider_sdk::model::UsageReporting::Complete
+                } else {
+                    claw_provider_sdk::model::UsageReporting::Partial
+                }
+            },
+        ),
+        usage: wire
+            .usage
+            .unwrap_or_default()
+            .validated(provider, Operation::Complete)?,
     })
 }
 
@@ -880,20 +1018,30 @@ struct WireStreamMessage {
     #[serde(default)]
     model: String,
     #[serde(default)]
-    usage: WireUsage,
+    usage: Option<WireUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum WireStartBlock {
     #[serde(rename = "text")]
-    Text {},
+    Text {
+        #[serde(default)]
+        text: String,
+    },
     #[serde(rename = "thinking")]
-    Thinking {},
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+    },
     #[serde(rename = "redacted_thinking")]
     RedactedThinking {},
     #[serde(rename = "tool_use")]
-    ToolUse { id: String, name: String },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Option<Value>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -933,7 +1081,7 @@ enum WireStreamEvent {
     MessageDelta {
         delta: WireMessageDelta,
         #[serde(default)]
-        usage: WireUsage,
+        usage: Option<WireUsage>,
     },
     #[serde(rename = "message_stop")]
     MessageStop {},
@@ -951,6 +1099,29 @@ struct WireStreamError {
     message: String,
 }
 
+impl WireStreamEvent {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::MessageStart { .. } => "message_start",
+            Self::ContentBlockStart { .. } => "content_block_start",
+            Self::ContentBlockDelta { .. } => "content_block_delta",
+            Self::ContentBlockStop { .. } => "content_block_stop",
+            Self::MessageDelta { .. } => "message_delta",
+            Self::MessageStop { .. } => "message_stop",
+            Self::Ping { .. } => "ping",
+            Self::Error { .. } => "error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockKind {
+    Text,
+    Thinking,
+    RedactedThinking,
+    Tool,
+}
+
 /// Turns Anthropic stream events into portable [`StreamEvent`] values.
 #[derive(Debug)]
 pub struct AnthropicStreamDecoder {
@@ -958,6 +1129,13 @@ pub struct AnthropicStreamDecoder {
     assembler: ToolCallAssembler,
     /// Maps an Anthropic content-block index onto a tool-call ordinal.
     tool_indices: BTreeMap<usize, usize>,
+    completed_tools: BTreeMap<usize, StreamEvent>,
+    blocks: Vec<(BlockKind, bool)>,
+    call_ids: BTreeSet<String>,
+    output_bytes: usize,
+    started: bool,
+    stop_seen: bool,
+    wire_usage: WireUsage,
     usage: Usage,
     finish_reason: Option<FinishReason>,
     completed: bool,
@@ -971,6 +1149,13 @@ impl AnthropicStreamDecoder {
             provider: provider.into(),
             assembler: ToolCallAssembler::new(),
             tool_indices: BTreeMap::new(),
+            completed_tools: BTreeMap::new(),
+            blocks: Vec::new(),
+            call_ids: BTreeSet::new(),
+            output_bytes: 0,
+            started: false,
+            stop_seen: false,
+            wire_usage: WireUsage::default(),
             usage: Usage::default(),
             finish_reason: None,
             completed: false,
@@ -998,58 +1183,186 @@ impl AnthropicStreamDecoder {
                 &format!("a stream event could not be parsed: {error}"),
             )
         })?;
+        if !event.event.is_empty() && event.event != "message" && event.event != parsed.kind() {
+            return Err(protocol_error(
+                &self.provider,
+                Operation::StreamCompletion,
+                "Anthropic SSE event name does not match its payload",
+            ));
+        }
+        if !self.started
+            && !matches!(
+                parsed,
+                WireStreamEvent::MessageStart { .. }
+                    | WireStreamEvent::Ping { .. }
+                    | WireStreamEvent::Error { .. }
+            )
+        {
+            let detail = if matches!(
+                parsed,
+                WireStreamEvent::ContentBlockDelta {
+                    delta: WireBlockDelta::InputJson { .. },
+                    ..
+                }
+            ) {
+                "an input_json_delta arrived for a block that never started"
+            } else {
+                "Anthropic content arrived before message_start"
+            };
+            return Err(protocol_error(
+                &self.provider,
+                Operation::StreamCompletion,
+                detail,
+            ));
+        }
         let mut events = Vec::new();
         match parsed {
             WireStreamEvent::MessageStart { message } => {
-                self.usage = Usage::from(message.usage);
+                if self.started
+                    || !valid_identifier(&message.id)
+                    || ModelId::new(message.model.clone()).is_err()
+                {
+                    return Err(protocol_error(
+                        &self.provider,
+                        Operation::StreamCompletion,
+                        "message_start is repeated or has an invalid identity",
+                    ));
+                }
+                self.started = true;
+                self.wire_usage = message.usage.unwrap_or_default();
+                self.usage = self
+                    .wire_usage
+                    .validated(&self.provider, Operation::StreamCompletion)?;
                 events.push(StreamEvent::Started {
                     id: message.id,
                     model: message.model,
                 });
-                if self.usage != Usage::default() {
-                    events.push(StreamEvent::UsageUpdate(self.usage));
+                if message.usage.is_some() {
+                    events.push(StreamEvent::UsageReported {
+                        usage: self.usage,
+                        reporting: self.wire_usage.reporting(),
+                    });
                 }
             }
             WireStreamEvent::ContentBlockStart {
                 index,
                 content_block,
             } => {
-                if let WireStartBlock::ToolUse { id, name } = content_block {
-                    let ordinal = self.assembler.len();
-                    self.tool_indices.insert(index, ordinal);
-                    events.extend(self.assembler.accept(ordinal, Some(&id), Some(&name), None));
+                if index != self.blocks.len()
+                    || index >= claw_provider_sdk::stream::MAX_TOOL_CALLS
+                    || self.blocks.last().is_some_and(|(_, stopped)| !stopped)
+                    || self.finish_reason.is_some()
+                {
+                    return Err(protocol_error(
+                        &self.provider,
+                        Operation::StreamCompletion,
+                        "Anthropic content block start is repeated, out of order or exceeds its limit",
+                    ));
+                }
+                let kind = match content_block {
+                    WireStartBlock::Text { text } => {
+                        self.add_output_bytes(text.len())?;
+                        if !text.is_empty() {
+                            events.push(StreamEvent::TextDelta(text));
+                        }
+                        BlockKind::Text
+                    }
+                    WireStartBlock::Thinking { thinking } => {
+                        self.add_output_bytes(thinking.len())?;
+                        if !thinking.is_empty() {
+                            events.push(StreamEvent::ReasoningDelta(thinking));
+                        }
+                        BlockKind::Thinking
+                    }
+                    WireStartBlock::RedactedThinking {} => BlockKind::RedactedThinking,
+                    WireStartBlock::ToolUse { id, name, input } => {
+                        if !valid_identifier(&id)
+                            || !valid_identifier(&name)
+                            || !self.call_ids.insert(id.clone())
+                            || input.is_some_and(|value| {
+                                value.as_object().is_none_or(|input| !input.is_empty())
+                            })
+                        {
+                            return Err(protocol_error(
+                                &self.provider,
+                                Operation::StreamCompletion,
+                                "Anthropic streamed function start has invalid identity or initial input",
+                            ));
+                        }
+                        let ordinal = self.assembler.len();
+                        self.tool_indices.insert(index, ordinal);
+                        events.extend(self.assembler.accept(ordinal, Some(&id), Some(&name), None));
+                        BlockKind::Tool
+                    }
+                };
+                self.blocks.push((kind, false));
+            }
+            WireStreamEvent::ContentBlockDelta { index, delta } => {
+                let expected = match &delta {
+                    WireBlockDelta::Text { .. } => BlockKind::Text,
+                    WireBlockDelta::Thinking { .. } | WireBlockDelta::Signature { .. } => {
+                        BlockKind::Thinking
+                    }
+                    WireBlockDelta::InputJson { .. } => BlockKind::Tool,
+                };
+                if self.blocks.get(index) != Some(&(expected, false))
+                    || self.finish_reason.is_some()
+                {
+                    return Err(protocol_error(
+                        &self.provider,
+                        Operation::StreamCompletion,
+                        "Anthropic delta has no active matching content block",
+                    ));
+                }
+                match delta {
+                    WireBlockDelta::Text { text } => {
+                        self.add_output_bytes(text.len())?;
+                        if !text.is_empty() {
+                            events.push(StreamEvent::TextDelta(text));
+                        }
+                    }
+                    WireBlockDelta::Thinking { thinking } => {
+                        self.add_output_bytes(thinking.len())?;
+                        if !thinking.is_empty() {
+                            events.push(StreamEvent::ReasoningDelta(thinking));
+                        }
+                    }
+                    WireBlockDelta::Signature {} => {}
+                    WireBlockDelta::InputJson { partial_json } => {
+                        self.add_output_bytes(partial_json.len())?;
+                        if let Some(&ordinal) = self.tool_indices.get(&index) {
+                            events.extend(self.assembler.accept(
+                                ordinal,
+                                None,
+                                None,
+                                Some(&partial_json),
+                            ));
+                        } else {
+                            return Err(protocol_error(
+                                &self.provider,
+                                Operation::StreamCompletion,
+                                "an input_json_delta arrived for a block that never started",
+                            ));
+                        }
+                    }
                 }
             }
-            WireStreamEvent::ContentBlockDelta { index, delta } => match delta {
-                WireBlockDelta::Text { text } => {
-                    if !text.is_empty() {
-                        events.push(StreamEvent::TextDelta(text));
-                    }
-                }
-                WireBlockDelta::Thinking { thinking } => {
-                    if !thinking.is_empty() {
-                        events.push(StreamEvent::ReasoningDelta(thinking));
-                    }
-                }
-                WireBlockDelta::Signature {} => {}
-                WireBlockDelta::InputJson { partial_json } => {
-                    if let Some(&ordinal) = self.tool_indices.get(&index) {
-                        events.extend(self.assembler.accept(
-                            ordinal,
-                            None,
-                            None,
-                            Some(&partial_json),
-                        ));
-                    } else {
-                        return Err(protocol_error(
-                            &self.provider,
-                            Operation::StreamCompletion,
-                            "an input_json_delta arrived for a block that never started",
-                        ));
-                    }
-                }
-            },
             WireStreamEvent::ContentBlockStop { index } => {
+                let Some((_, stopped)) = self.blocks.get_mut(index) else {
+                    return Err(protocol_error(
+                        &self.provider,
+                        Operation::StreamCompletion,
+                        "Anthropic block stop has no matching start",
+                    ));
+                };
+                if *stopped || self.finish_reason.is_some() {
+                    return Err(protocol_error(
+                        &self.provider,
+                        Operation::StreamCompletion,
+                        "Anthropic content block was already stopped",
+                    ));
+                }
+                *stopped = true;
                 if let Some(&ordinal) = self.tool_indices.get(&index) {
                     let completed = self.assembler.complete(ordinal).map_err(|error| {
                         protocol_error(
@@ -1058,28 +1371,36 @@ impl AnthropicStreamDecoder {
                             &format!("a streamed tool call could not be assembled: {error}"),
                         )
                     })?;
-                    events.push(completed);
+                    self.completed_tools.insert(ordinal, completed);
                 }
             }
             WireStreamEvent::MessageDelta { delta, usage } => {
+                if self.blocks.iter().any(|(_, stopped)| !stopped)
+                    || (self.finish_reason.is_some() && delta.stop_reason.is_some())
+                {
+                    return Err(protocol_error(
+                        &self.provider,
+                        Operation::StreamCompletion,
+                        "Anthropic message delta arrived before blocks closed or repeated its stop reason",
+                    ));
+                }
                 if let Some(raw) = delta.stop_reason {
                     self.finish_reason = Some(stop_reason(&raw));
                 }
-                let reported = Usage::from(usage);
-                if reported != Usage::default() {
-                    self.usage = Usage {
-                        input_tokens: self.usage.input_tokens.max(reported.input_tokens),
-                        output_tokens: reported.output_tokens,
-                        cached_input_tokens: self
-                            .usage
-                            .cached_input_tokens
-                            .max(reported.cached_input_tokens),
-                        reasoning_tokens: 0,
-                    };
-                    events.push(StreamEvent::UsageUpdate(self.usage));
+                if let Some(usage) = usage {
+                    let combined = self.wire_usage.merge(usage, &self.provider)?;
+                    self.usage = combined.validated(&self.provider, Operation::StreamCompletion)?;
+                    self.wire_usage = combined;
+                    events.push(StreamEvent::UsageReported {
+                        usage: self.usage,
+                        reporting: self.wire_usage.reporting(),
+                    });
                 }
             }
-            WireStreamEvent::MessageStop {} => events.extend(self.finish()),
+            WireStreamEvent::MessageStop {} => {
+                self.stop_seen = true;
+                events.extend(self.finish_checked()?);
+            }
             WireStreamEvent::Ping {} => {}
             WireStreamEvent::Error { error } => {
                 self.completed = true;
@@ -1100,16 +1421,72 @@ impl AnthropicStreamDecoder {
     }
 
     /// Emits the terminal event for a stream that ended.
+    ///
+    /// Legacy direct callers receive an `incomplete_stream` reason on failure;
+    /// live and recorded streams surface a typed protocol error instead.
     #[must_use]
     pub fn finish(&mut self) -> Vec<StreamEvent> {
+        self.finish_checked().unwrap_or_else(|_| {
+            vec![StreamEvent::Completed {
+                finish_reason: FinishReason::Other("incomplete_stream".to_owned()),
+                usage: self.usage,
+            }]
+        })
+    }
+
+    fn add_output_bytes(&mut self, bytes: usize) -> Result<(), ProviderError> {
+        self.output_bytes = self.output_bytes.saturating_add(bytes);
+        if self.output_bytes > claw_provider_sdk::stream::MAX_TOTAL_TOOL_ARGUMENT_BYTES {
+            return Err(protocol_error(
+                &self.provider,
+                Operation::StreamCompletion,
+                "Anthropic stream exceeds its aggregate output byte limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish_checked(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
         if self.completed {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         self.completed = true;
-        vec![StreamEvent::Completed {
-            finish_reason: self.finish_reason.clone().unwrap_or(FinishReason::Stop),
+        if !self.started
+            || !self.stop_seen
+            || self.completed_tools.len() != self.assembler.len()
+            || self.blocks.iter().any(|(_, stopped)| !stopped)
+        {
+            return Err(protocol_error(
+                &self.provider,
+                Operation::StreamCompletion,
+                "Anthropic stream ended without a complete message_stop",
+            ));
+        }
+        let finish_reason =
+            self.finish_reason
+                .clone()
+                .unwrap_or(if self.completed_tools.is_empty() {
+                    FinishReason::Stop
+                } else {
+                    FinishReason::ToolCalls
+                });
+        if (!self.completed_tools.is_empty() && finish_reason != FinishReason::ToolCalls)
+            || (self.completed_tools.is_empty() && finish_reason == FinishReason::ToolCalls)
+        {
+            return Err(protocol_error(
+                &self.provider,
+                Operation::StreamCompletion,
+                "Anthropic message stop reason is inconsistent with its function calls",
+            ));
+        }
+        let mut events: Vec<_> = std::mem::take(&mut self.completed_tools)
+            .into_values()
+            .collect();
+        events.push(StreamEvent::Completed {
+            finish_reason,
             usage: self.usage,
-        }]
+        });
+        Ok(events)
     }
 
     /// Returns the usage seen so far.
@@ -1164,7 +1541,7 @@ pub fn decode_event_stream(provider: &str, body: &[u8]) -> Result<Vec<StreamEven
     })? {
         events.extend(decoder.accept(&event)?);
     }
-    events.extend(decoder.finish());
+    events.extend(decoder.finish_checked()?);
     Ok(events)
 }
 
@@ -1172,7 +1549,7 @@ struct StreamState {
     chunks: ChunkStream,
     sse: SseDecoder,
     decoder: AnthropicStreamDecoder,
-    pending: VecDeque<StreamEvent>,
+    pending: VecDeque<Result<StreamEvent, ProviderError>>,
     exhausted: bool,
 }
 
@@ -1189,7 +1566,7 @@ fn event_stream(provider: String, chunks: ChunkStream) -> EventStream {
         |(mut state, provider)| async move {
             loop {
                 if let Some(event) = state.pending.pop_front() {
-                    return Some((Ok(event), (state, provider)));
+                    return Some((event, (state, provider)));
                 }
                 if state.exhausted {
                     return None;
@@ -1199,10 +1576,17 @@ fn event_stream(provider: String, chunks: ChunkStream) -> EventStream {
                         Ok(framed) => {
                             for event in framed {
                                 match state.decoder.accept(&event) {
-                                    Ok(events) => state.pending.extend(events),
+                                    Ok(events) => {
+                                        state.pending.extend(events.into_iter().map(Ok));
+                                        if state.decoder.completed {
+                                            state.exhausted = true;
+                                            break;
+                                        }
+                                    }
                                     Err(error) => {
                                         state.exhausted = true;
-                                        return Some((Err(error), (state, provider)));
+                                        state.pending.push_back(Err(error));
+                                        break;
                                     }
                                 }
                             }
@@ -1227,9 +1611,12 @@ fn event_stream(provider: String, chunks: ChunkStream) -> EventStream {
                             Ok(framed) => {
                                 for event in framed {
                                     match state.decoder.accept(&event) {
-                                        Ok(events) => state.pending.extend(events),
+                                        Ok(events) => {
+                                            state.pending.extend(events.into_iter().map(Ok));
+                                        }
                                         Err(error) => {
-                                            return Some((Err(error), (state, provider)));
+                                            state.pending.push_back(Err(error));
+                                            break;
                                         }
                                     }
                                 }
@@ -1243,8 +1630,12 @@ fn event_stream(provider: String, chunks: ChunkStream) -> EventStream {
                                 return Some((Err(error), (state, provider)));
                             }
                         }
-                        let tail = state.decoder.finish();
-                        state.pending.extend(tail);
+                        if !state.pending.iter().any(Result::is_err) {
+                            match state.decoder.finish_checked() {
+                                Ok(tail) => state.pending.extend(tail.into_iter().map(Ok)),
+                                Err(error) => state.pending.push_back(Err(error)),
+                            }
+                        }
                     }
                 }
             }
@@ -1504,7 +1895,7 @@ mod tests {
         assert_eq!(
             response.usage,
             Usage {
-                input_tokens: 22,
+                input_tokens: 27,
                 output_tokens: 9,
                 cached_input_tokens: 5,
                 reasoning_tokens: 0,
@@ -1566,20 +1957,26 @@ mod tests {
                     id: "msg_1".to_owned(),
                     model: "claude-sonnet-4-5".to_owned(),
                 },
-                StreamEvent::UsageUpdate(Usage {
-                    input_tokens: 12,
-                    output_tokens: 1,
-                    cached_input_tokens: 0,
-                    reasoning_tokens: 0,
-                }),
+                StreamEvent::UsageReported {
+                    usage: Usage {
+                        input_tokens: 12,
+                        output_tokens: 1,
+                        cached_input_tokens: 0,
+                        reasoning_tokens: 0,
+                    },
+                    reporting: claw_provider_sdk::model::UsageReporting::Complete,
+                },
                 StreamEvent::TextDelta("Hei".to_owned()),
                 StreamEvent::TextDelta(" der".to_owned()),
-                StreamEvent::UsageUpdate(Usage {
-                    input_tokens: 12,
-                    output_tokens: 7,
-                    cached_input_tokens: 0,
-                    reasoning_tokens: 0,
-                }),
+                StreamEvent::UsageReported {
+                    usage: Usage {
+                        input_tokens: 12,
+                        output_tokens: 7,
+                        cached_input_tokens: 0,
+                        reasoning_tokens: 0,
+                    },
+                    reporting: claw_provider_sdk::model::UsageReporting::Complete,
+                },
                 StreamEvent::Completed {
                     finish_reason: FinishReason::Stop,
                     usage: Usage {
@@ -1616,6 +2013,10 @@ mod tests {
                     id: "msg_2".to_owned(),
                     model: "m".to_owned(),
                 },
+                StreamEvent::UsageReported {
+                    usage: Usage::default(),
+                    reporting: claw_provider_sdk::model::UsageReporting::Partial,
+                },
                 StreamEvent::ReasoningDelta("hmm".to_owned()),
                 StreamEvent::ToolCallStarted {
                     index: 0,
@@ -1630,6 +2031,15 @@ mod tests {
                     index: 0,
                     delta: "ty\":\"Oslo\"}".to_owned(),
                 },
+                StreamEvent::UsageReported {
+                    usage: Usage {
+                        input_tokens: 0,
+                        output_tokens: 31,
+                        cached_input_tokens: 0,
+                        reasoning_tokens: 0,
+                    },
+                    reporting: claw_provider_sdk::model::UsageReporting::Partial,
+                },
                 StreamEvent::ToolCallCompleted {
                     index: 0,
                     call: ToolCall {
@@ -1638,12 +2048,6 @@ mod tests {
                         arguments: ToolArguments::new(r#"{"city":"Oslo"}"#).expect("arguments"),
                     },
                 },
-                StreamEvent::UsageUpdate(Usage {
-                    input_tokens: 0,
-                    output_tokens: 31,
-                    cached_input_tokens: 0,
-                    reasoning_tokens: 0,
-                }),
                 StreamEvent::Completed {
                     finish_reason: FinishReason::ToolCalls,
                     usage: Usage {
@@ -1699,6 +2103,379 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn truncated_or_refused_anthropic_streams_do_not_publish_completed_tools() {
+        let prefix = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"owned-message\",\"model\":\"owned-model\",\"usage\":{}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"owned-call\",\"name\":\"lookup\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        );
+        for suffix in [
+            "",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            let chunks: ChunkStream = Box::pin(futures_util::stream::iter([Ok(
+                bytes::Bytes::from(format!("{prefix}{suffix}")),
+            )]));
+            let mut stream = CompletionStream::new(
+                "anthropic",
+                claw_provider_sdk::cancel::CancelToken::new(),
+                event_stream("anthropic".to_owned(), chunks),
+            );
+            let mut failed = false;
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(StreamEvent::ToolCallCompleted { .. } | StreamEvent::Completed { .. }) => {
+                        panic!("unconfirmed tool round cannot complete")
+                    }
+                    Err(error) => {
+                        assert_eq!(error.kind(), ErrorKind::Protocol);
+                        failed = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(failed);
+        }
+        for body in [
+            "",
+            "data: {\"type\":\"message_stop\"}\n\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"owned\",\"model\":\"owned\"}}\n\n",
+        ] {
+            assert_eq!(
+                decode_event_stream("anthropic", body.as_bytes())
+                    .expect_err("unconfirmed message")
+                    .kind(),
+                ErrorKind::Protocol
+            );
+        }
+    }
+
+    fn lifecycle_frames() -> Vec<Value> {
+        vec![
+            json!({"type":"message_start","message":{"id":"owned-message","model":"owned-model","usage":{}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"initial "}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+            json!({"type":"message_stop"}),
+        ]
+    }
+
+    #[test]
+    fn anthropic_usage_reporting_preserves_unknown_and_explicit_zero() {
+        use claw_provider_sdk::model::UsageReporting;
+
+        let mut body = json!({"id":"owned","model":"owned","content":[],"stop_reason":"end_turn"});
+        assert_eq!(
+            decode_message("anthropic", body.to_string().as_bytes())
+                .expect("no usage")
+                .usage_reporting,
+            UsageReporting::Unreported
+        );
+        for (usage, expected) in [
+            (json!({}), UsageReporting::Partial),
+            (json!({"input_tokens":0}), UsageReporting::Partial),
+            (
+                json!({"input_tokens":0,"output_tokens":0}),
+                UsageReporting::Complete,
+            ),
+        ] {
+            body["usage"] = usage;
+            let response =
+                decode_message("anthropic", body.to_string().as_bytes()).expect("zero usage");
+            assert_eq!(response.usage, Usage::default());
+            assert_eq!(response.usage_reporting, expected);
+        }
+    }
+
+    #[test]
+    fn anthropic_stream_usage_reporting_retains_zero_and_cumulative_primary_fields() {
+        use claw_provider_sdk::model::UsageReporting;
+        use claw_provider_sdk::stream::StreamAccumulator;
+
+        for (initial, last, expected, total) in [
+            (None, None, UsageReporting::Unreported, 0),
+            (Some(json!({})), None, UsageReporting::Partial, 0),
+            (
+                Some(json!({"input_tokens":0})),
+                None,
+                UsageReporting::Partial,
+                0,
+            ),
+            (
+                None,
+                Some(json!({"output_tokens":0})),
+                UsageReporting::Partial,
+                0,
+            ),
+            (
+                Some(json!({"input_tokens":0})),
+                Some(json!({"output_tokens":0})),
+                UsageReporting::Complete,
+                0,
+            ),
+            (
+                Some(json!({"input_tokens":0,"output_tokens":0})),
+                Some(json!({})),
+                UsageReporting::Complete,
+                0,
+            ),
+            (
+                None,
+                Some(json!({"input_tokens":0,"output_tokens":0})),
+                UsageReporting::Complete,
+                0,
+            ),
+            (
+                Some(
+                    json!({"input_tokens":7,"cache_creation_input_tokens":2,"cache_read_input_tokens":5}),
+                ),
+                Some(json!({"output_tokens":3})),
+                UsageReporting::Complete,
+                17,
+            ),
+        ] {
+            let mut frames = lifecycle_frames();
+            if let Some(initial) = initial {
+                frames[0]["message"]["usage"] = initial;
+            } else {
+                frames[0]["message"]
+                    .as_object_mut()
+                    .expect("message")
+                    .remove("usage");
+            }
+            if let Some(last) = last {
+                frames[4]["usage"] = last;
+            } else {
+                frames[4].as_object_mut().expect("delta").remove("usage");
+            }
+            let body = encode_frames(&frames);
+            let mut accumulator = StreamAccumulator::new();
+            for event in decode_event_stream("anthropic", body.as_bytes()).expect("usage stream") {
+                accumulator.accept(&event);
+            }
+            assert_eq!(accumulator.usage_reporting(), expected);
+            assert_eq!(accumulator.usage().total_tokens(), total);
+        }
+    }
+
+    #[test]
+    fn anthropic_usage_includes_cache_reads_and_rejects_overflow_or_cumulative_regression() {
+        let mut message = json!({"id":"owned","model":"owned","content":[],"stop_reason":"end_turn","usage":{"input_tokens":20,"cache_creation_input_tokens":2,"cache_read_input_tokens":5,"output_tokens":7}});
+        let result =
+            decode_message("anthropic", message.to_string().as_bytes()).expect("usage totals");
+        assert_eq!(
+            result.usage,
+            Usage {
+                input_tokens: 27,
+                cached_input_tokens: 5,
+                output_tokens: 7,
+                reasoning_tokens: 0
+            }
+        );
+        for (field, value) in [
+            ("input_tokens", u64::MAX),
+            ("cache_creation_input_tokens", u64::MAX),
+            ("cache_read_input_tokens", u64::MAX),
+            ("output_tokens", u64::MAX),
+        ] {
+            let previous = message["usage"][field].clone();
+            message["usage"][field] = json!(value);
+            assert!(decode_message("anthropic", message.to_string().as_bytes()).is_err());
+            message["usage"][field] = previous;
+        }
+        let mut frames = lifecycle_frames();
+        frames[0]["message"]["usage"] = json!({"input_tokens":20,"cache_creation_input_tokens":2,"cache_read_input_tokens":5,"output_tokens":1});
+        let events = decode_event_stream("anthropic", encode_frames(&frames).as_bytes())
+            .expect("output-only delta keeps input");
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Completed {
+                usage: Usage {
+                    input_tokens: 27,
+                    cached_input_tokens: 5,
+                    output_tokens: 2,
+                    ..
+                },
+                ..
+            })
+        ));
+        for field in [
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "output_tokens",
+        ] {
+            let mut changed = frames.clone();
+            changed[4]["usage"][field] = json!(0);
+            assert!(decode_event_stream("anthropic", encode_frames(&changed).as_bytes()).is_err());
+        }
+        let mut unchanged = frames;
+        unchanged[4]["usage"] = json!({});
+        let events = decode_event_stream("anthropic", encode_frames(&unchanged).as_bytes())
+            .expect("omitted counters retain values");
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Completed {
+                usage: Usage {
+                    input_tokens: 27,
+                    output_tokens: 1,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    fn encode_frames(frames: &[Value]) -> String {
+        use std::fmt::Write as _;
+        let mut encoded = String::new();
+        for frame in frames {
+            write!(encoded, "data: {frame}\n\n").expect("fixture buffer");
+        }
+        encoded
+    }
+
+    #[test]
+    fn anthropic_block_lifecycle_rejects_orphans_wrong_types_reuse_and_unclosed_blocks() {
+        let frames = lifecycle_frames();
+        let events = decode_event_stream("anthropic", encode_frames(&frames).as_bytes())
+            .expect("typed initial text");
+        assert!(events.contains(&StreamEvent::TextDelta("initial ".to_owned())));
+        for (index, pointer, value) in [
+            (0, "/message/id", json!("invalid identity")),
+            (1, "/index", json!(1)),
+            (
+                1,
+                "/index",
+                json!(claw_provider_sdk::stream::MAX_TOOL_CALLS),
+            ),
+            (2, "/index", json!(1)),
+            (2, "/delta/type", json!("signature_delta")),
+            (3, "/index", json!(1)),
+        ] {
+            let mut changed = frames.clone();
+            *changed[index].pointer_mut(pointer).expect("field") = value;
+            assert_eq!(
+                decode_event_stream("anthropic", encode_frames(&changed).as_bytes())
+                    .expect_err("invalid lifecycle")
+                    .kind(),
+                ErrorKind::Protocol
+            );
+        }
+        for missing in [0, 1, 3, 5] {
+            let mut changed = frames.clone();
+            changed.remove(missing);
+            assert!(
+                decode_event_stream("anthropic", encode_frames(&changed).as_bytes()).is_err(),
+                "missing frame {missing}"
+            );
+        }
+        for repeated in [0, 1, 3, 4] {
+            let mut changed = frames.clone();
+            changed.insert(repeated + 1, frames[repeated].clone());
+            assert!(
+                decode_event_stream("anthropic", encode_frames(&changed).as_bytes()).is_err(),
+                "repeated frame {repeated}"
+            );
+        }
+        let mut decoder = AnthropicStreamDecoder::new("anthropic");
+        for frame in &frames[..2] {
+            decoder
+                .accept(&SseEvent {
+                    data: frame.to_string(),
+                    ..SseEvent::default()
+                })
+                .expect("start");
+        }
+        decoder.output_bytes = claw_provider_sdk::stream::MAX_TOTAL_TOOL_ARGUMENT_BYTES;
+        assert!(
+            decoder
+                .accept(&SseEvent {
+                    data: frames[2].to_string(),
+                    ..SseEvent::default()
+                })
+                .is_err()
+        );
+        assert!(
+            decode_event_stream(
+                "anthropic",
+                format!("event: ping\ndata: {}\n\n", frames[0]).as_bytes()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn anthropic_buffered_and_streamed_duplicate_function_ids_fail_closed() {
+        let base = json!({"id":"owned","model":"owned","stop_reason":"tool_use","content":[
+            {"type":"tool_use","id":"one","name":"lookup","input":{}},
+            {"type":"tool_use","id":"two","name":"lookup","input":{}}
+        ]});
+        assert!(decode_message("anthropic", base.to_string().as_bytes()).is_ok());
+        for (pointer, value) in [
+            ("/content/1/id", json!("one")),
+            ("/content/1/name", json!("invalid name")),
+            ("/content/1/input", json!([])),
+            ("/stop_reason", json!("max_tokens")),
+        ] {
+            let mut changed = base.clone();
+            *changed.pointer_mut(pointer).expect("field") = value;
+            assert!(decode_message("anthropic", changed.to_string().as_bytes()).is_err());
+        }
+        let frames = [
+            lifecycle_frames()[0].clone(),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"same","name":"lookup","input":{}}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"same","name":"lookup","input":{}}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_stop"}),
+        ];
+        assert!(decode_event_stream("anthropic", encode_frames(&frames).as_bytes()).is_err());
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_keeps_accepted_partial_text_before_a_later_event_error() {
+        let mut frames = lifecycle_frames();
+        frames.truncate(3);
+        frames.push(json!({"type":"content_block_stop","index":1}));
+        let chunks: ChunkStream = Box::pin(futures_util::stream::iter([Ok(bytes::Bytes::from(
+            encode_frames(&frames),
+        ))]));
+        let mut events = event_stream("anthropic".to_owned(), chunks);
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(StreamEvent::Started { .. }))
+        ));
+        assert_eq!(
+            events.next().await.expect("usage").expect("usage coverage"),
+            StreamEvent::UsageReported {
+                usage: Usage::default(),
+                reporting: claw_provider_sdk::model::UsageReporting::Partial,
+            }
+        );
+        assert_eq!(
+            events.next().await.expect("initial").expect("text"),
+            StreamEvent::TextDelta("initial ".to_owned())
+        );
+        assert_eq!(
+            events.next().await.expect("partial").expect("text"),
+            StreamEvent::TextDelta("answer".to_owned())
+        );
+        assert_eq!(
+            events
+                .next()
+                .await
+                .expect("error")
+                .expect_err("bad block")
+                .kind(),
+            ErrorKind::Protocol
+        );
+        assert!(events.next().await.is_none());
+    }
+
     #[test]
     fn an_error_event_becomes_a_typed_provider_error() {
         let body = concat!(
@@ -1748,7 +2525,9 @@ mod tests {
     fn every_chunk_split_of_a_recorded_stream_yields_identical_events() {
         let body = concat!(
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\",\"usage\":{\"input_tokens\":3}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
             "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"alpha\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         )

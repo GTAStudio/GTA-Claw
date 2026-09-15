@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "stage": "mcp-public-client-oauth-login-and-bounded-loopback-callback",
+  "capturedAtUtc": "2026-09-15T01:47:10.8414448Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-mcp/src/oauth.rs","sha256":"0494356bc18b464715c1663f1017818313a5376fee7d1fc9dc7888223fe477bd"},
+    {"path":"crates/claw-mcp/src/oauth/loopback.rs","sha256":"8def9729cb6bde0bcf7aef7d0a41238b99a2b06bc42db74b7bf953d39a29cf38"},
+    {"path":"crates/claw-mcp/Cargo.toml","sha256":"a1747bbdba85833e299c0921f97842b57cf1579029344cf03bed688ecd4f84ae"},
+    {"path":"apps/gta-claw-cli/src/mcp_oauth.rs","sha256":"686bd03af4e862fd0d5e7b2cd235f239d8bf8452def02eeb7f5ebaa01aec0a68"},
+    {"path":"apps/gta-claw-cli/src/lib.rs","sha256":"f176282f6e9306a77bbb62c851b4a2db3684ac371bf9ae789d74309f94fff818"},
+    {"path":"apps/gta-claw-cli/tests/foundation.rs","sha256":"b31185a7ff7bf11e001c25774ba873773f11fcecb8c38cdf6f6063e1c5c0b1ec"},
+    {"path":"apps/gta-claw-cli/Cargo.toml","sha256":"56601384014a58afd2ac336b683f4ce8e5d5a253d25391ba4fb3999de967f47f"}
+  ],
+  "cargoLockSha256": "5955c2233d8cad3f8d4c72b61bdfef396f609c5a2b90c50fb56c69e8ba262b1e",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p gta-claw-cli --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":180, "failed":0, "ignored":1, "testBinaries":11,
+      "log":"target/native-mcp-oauth-login-tests-20260915T014533569Z.log",
+      "sha256":"82044749b59c0fb6e76bbad538c66572a9916e75857661119da15f9d35c9183a"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p gta-claw-cli --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-oauth-login-clippy-20260915T014455211Z.log",
+      "sha256":"c0333221a8ebbb3b7e7fb0a87730eaaedb424f4783a53ee969295cf95427b151"
+    }
+  ],
+  "behaviorEvidence": [
+    "callback_redirects_require_exact_unique_state_target_and_optional_issuer",
+    "loopback_callback_admission_requires_exact_host_path_method_and_valid_state",
+    "loopback_callback_cancellation_expiry_and_connection_budget_release_listener",
+    "oauth_login_requires_explicit_confirmation_endpoints_and_safe_proxy_routes",
+    "mcp_oauth_login_uses_reviewed_metadata_real_callback_and_native_pending_recovery",
+    "local_authorization_server_covers_registration_exchange_and_refresh"
+  ],
+  "notes": [
+    "CLI public-client login requires explicit endpoint/client confirmation and explicit proxy routing for remote HTTPS",
+    "A bounded staged authorization URL is emitted for manual browser use; no browser is automatically launched",
+    "Loopback callback checks exact Host/path, unique code/state/issuer and bounded bodyless GET admission",
+    "One token exchange persists original authority; response loss leaves native reauthorization-required state",
+    "Actual Windows child CLI covers success/denied/timeout/lost token response/metadata substitution with PKCE and cleanup checks",
+    "No dependency versions, lock changes, real accounts, production proxy changes or browser execution"
+  ],
+  "unverified": [
+    "Real provider registration and browser interaction, macOS runtime and active Ctrl+C integration",
+    "Confidential clients, dynamic CLI client registration and cross-process credential coordination",
+    "Daemon OAuth credential consumption and real MCP resource access after login",
+    "Deployment, complete frozen build manifests and whole-project acceptance"
+  ]
+}

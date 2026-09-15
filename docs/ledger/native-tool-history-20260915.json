@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-typed-tool-context-and-data-role-preservation",
+  "capturedAtUtc": "2026-09-15T05:58:50.1010792Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-application/src/ports/context.rs","sha256":"b6744bf65d640ab809916062b3dc3ba077d7277b8f35f2b8a680e29379a537ef"},
+    {"path":"crates/claw-runtime/src/context_engine/reference.rs","sha256":"4c9b82415420a77c881739047793d6ec99591b03b2c4639dde9fa8030faf0cac"},
+    {"path":"crates/claw-runtime/src/runtime.rs","sha256":"038f1c6e853a23f449a0ba929cd029a25d1e88d1322fffaea54de281cd9e512b"},
+    {"path":"crates/claw-runtime/tests/support/mod.rs","sha256":"3d89899b48f6d349f11d7bfa9516bc76e754415acab141c4f0a6fd2c5f00521d"},
+    {"path":"crates/claw-runtime/tests/session_lifecycle.rs","sha256":"18ed4acaef7ca4db078121479641c791785373d540112554a2ea29485226b67f"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"93eba429f3b85c834243a5b3b68add8e072ae09d98e83826545aac9e85578f52"},
+    {"path":"apps/gta-claw-daemon/src/adapters/http_api.rs","sha256":"a45e9f9e727f9b1bbfadff71bc90fa4b086dcd2b84b74c96cb60bdd5f8ee73d0"},
+    {"path":"apps/gta-claw-daemon/src/adapters/persistent_context.rs","sha256":"b94856db6d280540a1aaf139be52c40dc68937f437fd5c0867d88eecac381a99"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"3e7ff39bedce9e0368fffeb38670b5d0286af78b0a3d122ae71674d7a69bff7e"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-application -p claw-runtime -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":621, "failed":0, "ignored":4, "testBinaries":21,
+      "log":"target/native-tool-history-tests-20260915T055427473Z.log",
+      "sha256":"575796993ba60ebcc650d5bfe5f608ed242d7c1c975f675ecc7941d601c46fb3"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-application -p claw-runtime -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-tool-history-clippy-20260915T055235317Z.log",
+      "sha256":"2670e6ee7445a88f0699f2377f620eb99c63a17e508bf0313c2a55d3c88ad038"
+    },
+    {
+      "command":"cargo +stable check --manifest-path D:/GTA-Claw/Cargo.toml --workspace --all-targets --locked --offline",
+      "result":"passed",
+      "log":"target/native-tool-history-workspace-check-20260915T055641365Z.log",
+      "sha256":"e216aa47a4a741429b1adf6b11de2cd9abc8ca4dd9c5d7e9ebb807da774a4df0"
+    }
+  ],
+  "retainedFailures": [
+    {"log":"target/native-tool-history-clippy-20260915T055049536Z.log","sha256":"e05231d9407ef2278220dc5acfe87db7bd6eb596a7b44268e12791e071933241","reason":"New history parameter too similar to content; renamed locally"},
+    {"log":"target/native-tool-history-clippy-20260915T055139926Z.log","sha256":"3a3d74ddfca8b92a197c7fdfc7e1789fb3d3fc5b97122cfb711058fbaff83271","reason":"Two fixture option branches needed map_or_else; corrected without weakening checks"}
+  ],
+  "behaviorEvidence": [
+    "memory_tool_results_and_retrieval_are_not_promoted_to_system_instructions",
+    "memory_tool_history_retains_call_identity_through_checkpoint_and_refuses_tampering",
+    "a_mutating_tool_turn_ends_in_completed_with_changes",
+    "runtime_provider_keeps_typed_function_history_and_refuses_orphan_results",
+    "persistent_context_eviction_rehydrates_without_erasing_history",
+    "bound_explicit_memory_model_calls_keep_notes_scoped_to_the_gateway_device"
+  ],
+  "notes": [
+    "New ContextItem AssistantToolCalls and ToolCallResult preserve original call IDs, order, parameters, result and failure state; legacy text variants remain readable",
+    "Native checkpoints store explicit typed metadata matching canonical message content and role; ordinary model text is never parsed as a tool call, and malformed/orphan metadata is refused",
+    "Serialized typed content participates in existing message/token budgets, with the existing 1-MiB message bound; compaction removes metadata for removed messages",
+    "Native runtime generation now passes structured SDK messages through the selected provider rather than flattening them into a user prompt or synthesizing tool result IDs",
+    "This native path uses persistent context as its history authority and does not duplicate HTTP adapter history; unmatched or unanswered calls fail before inference",
+    "Legacy tool output, retrieved records and summaries are data-role messages instead of system instructions; host rules and current goals keep their system role",
+    "The existing actual model-memory fixture runs Chat, Responses and Anthropic, verifies original call IDs in second-round wire fields, bound approval and separate-device notes with six inference requests per mode",
+    "Existing LRU context test now closes and reopens redb, validating restored typed calls/results and explicit reset",
+    "The first role test used an orphan tool entry before the first user turn; it was corrected to actual conversation order without changing truncation rules",
+    "New readers accept old checkpoints without typed metadata. Downgrading to older closed-schema readers after writing the new field is not claimed compatible",
+    "No dependency changes/downloads, real accounts, production proxy/process changes, browser execution, device migration, deployment or Git writes"
+  ],
+  "unverified": [
+    "Recovery UX for incomplete historical tool groups: these currently fail before a new provider request rather than inventing missing results",
+    "Opaque/signed reasoning replay, all third-party context engines and actual provider-account acceptance",
+    "Role separation is not proof that a model resists all prompt injection; tool authority/approval remains mandatory",
+    "Runtime usage/finish/cost durability, both earlier native-credential anomalies and whole-project acceptance"
+  ]
+}

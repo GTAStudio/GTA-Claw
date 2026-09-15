@@ -71,6 +71,21 @@ fn fixture(rounds: Vec<Round>, config: RuntimeConfig) -> Fixture {
 }
 
 #[tokio::test]
+async fn cancellation_matches_the_observed_turn_and_never_a_replacement() {
+    let fixture = fixture(vec![tool_round("call-1", "write_file", "{}")], RuntimeConfig::default());
+    let session = session("fenced-cancel");
+    let handle = fixture.runtime.submit(&session, "approval-gated work").await.expect("turn");
+    support::eventually("pending approval", || !fixture.runtime.approvals().outstanding().is_empty()).await;
+    assert!(!fixture.runtime.cancel_turn_if_current(&session, TurnId::new(handle.turn().ordinal() + 1)));
+    assert!(!handle.cancellation_token().is_cancelled());
+    assert!(fixture.runtime.cancel_turn_if_current(&session, handle.turn()));
+    assert_eq!(handle.join().await.expect("cancelled result").state, SessionState::Cancelled);
+    assert!(fixture.tools.invoked().is_empty());
+    assert!(!fixture.runtime.cancel_turn_if_current(&session, TurnId::FIRST));
+    fixture.runtime.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
 async fn an_idle_runtime_shuts_down_with_no_tracked_tasks() {
     let fixture = fixture(Vec::new(), RuntimeConfig::default());
 

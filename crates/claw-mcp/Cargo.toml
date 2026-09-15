@@ -13,10 +13,11 @@ async-trait = "=0.1.91"
 base64 = "=0.22.1"
 bytes = "=1.12.1"
 claw-domain.workspace = true
+claw-provider-sdk.workspace = true
 futures-util = { version = "=0.3.33", default-features = false, features = ["alloc", "std"] }
 http = "=1.4.2"
 http-body-util = "=0.1.4"
-hyper = { version = "=1.11.0", features = ["client", "http1"] }
+hyper = { version = "=1.11.0", features = ["client", "server", "http1"] }
 hyper-util = { version = "=0.1.20", features = ["client-legacy", "client-proxy", "http1", "tokio"] }
 httparse = "=1.10.1"
 rmcp = { version = "=2.2.0", default-features = false, features = [

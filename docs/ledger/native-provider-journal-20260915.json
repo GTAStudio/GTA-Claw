@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-crash-persistent-provider-intents-and-reports",
+  "capturedAtUtc": "2026-09-15T08:16:21.0335113Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-application/src/ports/state.rs","sha256":"2e284600de8a021f48227cbfb8fae3591aef73649111c055c7f5e61437929897"},
+    {"path":"crates/claw-state/src/runtime.rs","sha256":"a733413d66ccff4231d1e94ccec3ba2753531e94bb7677c51893f6a1af93a66a"},
+    {"path":"crates/claw-runtime/src/runtime.rs","sha256":"3c08a205c580783519bf7d6153f057aa04f468f0463de9b2cc667df6a219bcf1"},
+    {"path":"crates/claw-runtime/tests/support/mod.rs","sha256":"0f17de20caefef6c45df8192af0144e6f8551568ed64fee1a4cfcc03313e10d3"},
+    {"path":"crates/claw-runtime/tests/session_lifecycle.rs","sha256":"b52c1b241a9d6d43be080e1b10f32e63e60afd72c465d4f6183573bc2aa00562"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"38204c5bd64e0f79627d83667ae693e84deab4bf9b31c02420ca2e59e5d17731"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"84e8d5f517465e8088e3a2a2a07eb7e3cbdd71cd79d9a0a9da65a278428e9fc4"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-application -p claw-runtime -p claw-state -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":674, "failed":0, "ignored":4, "testBinaries":22,
+      "log":"target/native-provider-journal-tests-20260915T081843603Z.log",
+      "sha256":"c44f999d7b9639722c8b5717fb3c92309efba05e93db8a28e53702fcd48c5317"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-application -p claw-runtime -p claw-state -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-provider-journal-clippy-20260915T081249656Z.log",
+      "sha256":"e55084ffaa6fb64897ecd877733399d2e5fc21ac820a7d1d2620f4e60bbd3b09"
+    },
+    {
+      "command":"cargo +stable check --manifest-path D:/GTA-Claw/Cargo.toml --workspace --all-targets --locked --offline",
+      "result":"passed",
+      "log":"target/native-provider-journal-workspace-check-20260915T081804362Z.log",
+      "sha256":"364214ee1b384b2f20ea15620765d9582c332a9a3503de1362917829ebb5becc"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --test production_composition bound_explicit_memory_model_calls_keep_notes_scoped_to_the_gateway_device --locked --offline -- --exact --nocapture",
+      "result":"passed", "passed":1, "failed":0, "ignored":0, "testBinaries":1,
+      "log":"target/native-provider-journal-composition-20260915T080820610Z.log",
+      "sha256":"a24b1b2114200852776444a44002e67d4b347b7e5f7e98e54a20e3908ac31180",
+      "scopeNote":"Initial actual three-dialect/restart test; final cohort includes later cancellation boundary and lint-only changes"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-application -p claw-runtime -p claw-state -p gta-claw-daemon --test production_composition native_mcp_http_client_interoperates_with_owned_daemon_sessions --locked --offline -- --exact --nocapture",
+      "result":"passed", "passed":1, "failed":0, "ignored":0, "testBinaries":1,
+      "log":"target/native-provider-journal-mcp-recheck-20260915T081541780Z.log",
+      "sha256":"1df5aa8d86c4280649b78e07956c4733f05c06d841c62c0dce2d50ea0e17e1f8",
+      "scopeNote":"Unmodified isolated recheck, not a root-cause fix"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-application -p claw-runtime -p claw-state -p gta-claw-daemon --lib native_mcp_oauth_records_require_original_fresh_generation_without_automatic_refresh --locked --offline -- --nocapture",
+      "result":"passed", "passed":1, "failed":0, "ignored":0, "testBinaries":4,
+      "log":"target/native-provider-journal-oauth-recheck-20260915T081658441Z.log",
+      "sha256":"25b06c2fcd63accd42bb20efa10151b44d47d99b8b6447a4a5ba2ed2ddcf659c",
+      "scopeNote":"Three filtered-out summaries and one unmodified OAuth fixture pass, not root-cause resolution"
+    }
+  ],
+  "retainedFailures": [
+    {"log":"target/native-provider-journal-clippy-20260915T081215143Z.log","sha256":"2fae73f58c3c7f6b27c2ea0ffa61423bfeffbed991eb36aa3ffad2a63b775210","reason":"Memory adapters held their locks past final writes; explicitly dropped after atomic updates"},
+    {"log":"target/native-provider-journal-tests-20260915T081314626Z.log","sha256":"7b0172a91f3b3e8241ef8fc9600312230d5d03eb245235eb7ee9a202fc6bb269","passed":659,"failed":1,"ignored":4,"testBinaries":21,"reason":"Existing MCP client session reported SessionExpired during typed discovery after initialization; original isolated and final joint tests pass, root cause unresolved"},
+    {"log":"target/native-provider-journal-tests-20260915T081602519Z.log","sha256":"a1991605ac8fb85f89a5379e6ef3c96d0f457fa00a5f70859a5e2c4495863122","passed":613,"failed":1,"ignored":3,"testBinaries":14,"reason":"Existing native OAuth fixture reported changed token record during write verification; original isolated and final joint tests pass, root cause unresolved"}
+  ],
+  "behaviorEvidence": [
+    "provider_journal_is_cas_append_only_reopens_and_seals_with_the_terminal_turn",
+    "provider_journal_terminal_seal_competes_atomically_with_the_first_response",
+    "provider_journal_failure_blocks_inference_or_tools_and_live_reports_precede_output",
+    "provider_round_accounting_survives_later_failure_without_inventing_missing_usage",
+    "bound_explicit_memory_model_calls_keep_notes_scoped_to_the_gateway_device"
+  ],
+  "notes": [
+    "Runtime awaits a durable unknown intent before constructing start_round, then persists first confirmed response metadata before consuming output; cancellation after an intent write is rechecked before provider invocation",
+    "Independent versioned CAS journals preserve unknown attempts and immutable first reports; terminal result and exact matching closed journal are committed atomically",
+    "Unsupported state adapters fail closed; in-memory test/smoke stores mirror semantics but are not durable across process exit",
+    "Owner-bound recovered runs can read a journal without a terminal turn; recordSource and attemptsMayBeUnsent prevent confusing intention with confirmed transport or a bill",
+    "The actual owned Chat daemon is killed only before tool approval and restarted; original unknown/dedupe state keeps a revision-2 open journal with one 7-token response, no tool or inference replay, and six original audit records remain unchanged",
+    "Write-before-inference and write-before-tool failure tests, live-report ordering, gated-write cancellation, real CAS races and redb reopen pass",
+    "An initial new runtime test referenced Runtime.cancel, which does not exist; corrected to the adjacent TurnHandle.cancel pattern. That compile failure exists in terminal conversation output, not a separate log",
+    "MCP/OAuth failed cohorts remain evidence; no affected MCP production code, credential policy, timeout, retry or test-serialization setting was changed",
+    "Dependencies, root lock and checklist marks are unchanged; no production/proxy operation, real account/browser/device migration, deployment or Git write occurred"
+  ],
+  "unverified": [
+    "Remote responses lost before first report commit, full paid-request reconciliation and knowledge of whether an unconfirmed intent actually reached the provider",
+    "Automatic standalone HTTP-stream persistence, continuous partial-text checkpoints, monetary budgets/pricing/invoices and old-record reconstruction",
+    "Old-version downgrade behavior with journals, external custom state-adapter migration, real-account and cross-platform crash acceptance",
+    "Root causes of all retained native credential, stdio lock, MCP SessionExpired and OAuth verification anomalies",
+    "Complete frozen build manifests, release and whole-project acceptance"
+  ]
+}

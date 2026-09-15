@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-tui-bound-partial-text-page-inspection",
+  "capturedAtUtc": "2026-09-15T09:39:18.5558464Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-tui/src/gateway.rs","sha256":"8cb98c765b5c77123b5d48e4b70124ea8d1138ef52be18a5914f4c555a2110d5"},
+    {"path":"apps/gta-claw-tui/src/lib.rs","sha256":"d8a2650bb1bc17f608d940de043f3a059e212e246ef28146401ec5a6acf0ced4"},
+    {"path":"apps/gta-claw-tui/src/model.rs","sha256":"d17274906f486c9a246b7fb9f9bfb190f3ac273613f1f67a83dc3e3750303176"},
+    {"path":"apps/gta-claw-tui/src/render.rs","sha256":"c8340083407cc2cdddf8bd0700648eaddcd03006deaf7affebc3abedfa68beb0"},
+    {"path":"apps/gta-claw-tui/tests/gateway_double.rs","sha256":"7cbdc07bac6d50bf3d172f6dba216a7a3e6ce834823fc941eb6fedd06314aed4"},
+    {"path":"apps/gta-claw-tui/tests/rendering.rs","sha256":"11675f8bdf4b26764234793f86be20e55c19061961d97d93a4ae32252987d585"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-tui --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":66, "failed":0, "ignored":0, "testBinaries":5,
+      "log":"target/native-tui-partial-tests-20260915T093906377Z.log",
+      "sha256":"ede241bc9977487babd9896e45746552fa394846c67d71baa34576ff3d3d191e"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-tui --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-tui-partial-clippy-20260915T093847179Z.log",
+      "sha256":"aa724a9e9cd8a84fccd693094c41aa39f1ed59b5f97a6e8f41f5e64099a299ef"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-tui --lib --test gateway_double --test rendering partial_ --locked --offline --quiet",
+      "result":"passed", "passed":4, "failed":0, "ignored":0, "testBinaries":3,
+      "log":"target/native-tui-partial-focused-20260915T093708339Z.log",
+      "sha256":"673be26e063669a6c11ffc63359caa2158c37a2eb1ec21f0e39f15aba1a81cba",
+      "scopeNote":"Two state/decoder tests, one seven-case WebSocket test and one rendering test, also included in the full cohort"
+    }
+  ],
+  "retainedFailures": [
+    {"log":"target/native-tui-partial-clippy-20260915T093809122Z.log","sha256":"2d62ec5b2c69b3d9d3603236aa7072c0957ce6a78b4af2b9f59cc79b7884c2b6","reason":"Unreadable test limit literal; added separators without changing the 4 MiB plus one boundary"}
+  ],
+  "behaviorEvidence": [
+    "partial_page_identity_bounds_and_content_are_checked_before_display",
+    "partial_pages_preserve_unknown_state_and_never_enqueue_result_acknowledgements",
+    "native_tui_partial_pages_are_bound_read_only_and_never_acknowledge_results",
+    "partial_transcript_pages_wrap_inside_the_workspace_at_narrow_and_wide_sizes"
+  ],
+  "notes": [
+    "Explicit partial/partial-next actions issue one read for the observed connection and selected terminal session/run/turn/revision/state; they add no permission, ACK or replay",
+    "Closed responses validate identity, contiguous UTF-8 pages, 2048-byte/4 MiB limits, untrusted incomplete flags and continuation length/digest",
+    "A complete single page checks SHA256; later pages only pin the whole-content digest and are not independent whole-result verification",
+    "Partial pages are separately labeled and display-sanitized, do not change unknown run state or enter completion/ACK queues, and stale/duplicate/changed-selection pages are dropped",
+    "Existing ACK behavior for complete terminal receipts is unchanged; bounded transcript and last-page cursor are not a full archive",
+    "Actual local WebSocket tests cover seven page/connection outcomes and refusal of an attempted partial-only ACK; deterministic rendering covers 40/80/120 columns and 10/24 rows without opening a visible terminal",
+    "No daemon paging protocol or dependencies changed; scoped TUI all-target tests/lint are the gate, not external SDK or whole-project compatibility acceptance",
+    "All earlier credential/MCP/stdio evidence remains retained; no production/proxy, real account, browser/device migration, deployment or Git action occurred"
+  ],
+  "unverified": [
+    "A later individual page cannot independently verify the whole digest; automatic collection/export remains the separate CLI workflow",
+    "TUI usage/cost display, full partial archives, desktop counterpart and real interactive cross-platform acceptance",
+    "Real-provider TUI end-to-end testing and prior native-credential anomalies; daemon page ownership evidence is separate",
+    "Complete frozen build manifests, release and whole-project acceptance"
+  ]
+}

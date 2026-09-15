@@ -23,6 +23,8 @@ pub enum RunState {
     Paused,
     /// Progress is blocked by an external condition.
     Blocked,
+    /// An effect may have occurred; its result must be reconciled, not automatically repeated.
+    OutcomeUnknown,
     /// The run failed.
     Failed,
     /// The run was cancelled.
@@ -35,7 +37,7 @@ pub enum RunState {
 
 impl RunState {
     /// All states in stable display order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Draft,
         Self::Queued,
         Self::Starting,
@@ -44,6 +46,7 @@ impl RunState {
         Self::WaitingForAnswer,
         Self::Paused,
         Self::Blocked,
+        Self::OutcomeUnknown,
         Self::Failed,
         Self::Cancelled,
         Self::Completed,
@@ -62,6 +65,7 @@ impl RunState {
             Self::WaitingForAnswer => "Waiting for answer",
             Self::Paused => "Paused",
             Self::Blocked => "Blocked",
+            Self::OutcomeUnknown => "Outcome unknown",
             Self::Failed => "Failed",
             Self::Cancelled => "Cancelled",
             Self::Completed => "Completed",
@@ -81,6 +85,7 @@ impl RunState {
             Self::WaitingForAnswer => '?',
             Self::Paused => 'P',
             Self::Blocked => 'B',
+            Self::OutcomeUnknown => '!',
             Self::Failed => 'F',
             Self::Cancelled => 'X',
             Self::Completed => 'C',
@@ -98,6 +103,7 @@ impl RunState {
             Self::WaitingForAnswer => 220,
             Self::Paused => 141,
             Self::Blocked => 208,
+            Self::OutcomeUnknown => 202,
             Self::Failed => 196,
             Self::Cancelled => 160,
             Self::Completed => 35,
@@ -121,6 +127,7 @@ impl RunState {
             "waiting_for_answer" | "waitinganswer" => Self::WaitingForAnswer,
             "paused" => Self::Paused,
             "blocked" => Self::Blocked,
+            "outcome_unknown" => Self::OutcomeUnknown,
             "failed" => Self::Failed,
             "cancelled" | "canceled" => Self::Cancelled,
             "completed_with_changes" | "completedwithchanges" => Self::CompletedWithChanges,
@@ -174,6 +181,8 @@ pub enum Prompt {
         id: String,
         /// Human-readable request.
         text: String,
+        /// Fingerprint of the complete authenticated preview; absent previews cannot be approved.
+        preview_fingerprint: Option<String>,
     },
     /// A question requiring text input.
     Question {
@@ -224,12 +233,48 @@ impl Screen {
 }
 
 /// Complete state consumed synchronously by the render thread.
+#[derive(Clone, Debug)]
+pub struct PendingMessage {
+    /// Session selected for this exact input.
+    pub session_id: String,
+    /// Original text retained until a definitive receipt.
+    pub text: String,
+    /// Original random idempotency identity, reused only on explicit retry.
+    pub idempotency_key: String,
+    /// A previous attempt has no definitive receipt.
+    pub unconfirmed: bool,
+    /// At least one attempt might have reached the server, retained across refused retries.
+    pub may_have_been_sent: bool,
+    /// Structured operation retained without converting its content into a chat message.
+    pub memory: Option<crate::gateway::MemoryCommand>,
+}
+
+impl PendingMessage {
+    pub(crate) fn command(&self) -> crate::gateway::UiCommand {
+        self.memory.as_ref().map_or_else(
+            || crate::gateway::UiCommand::SendMessage {
+                session_id: self.session_id.clone(),
+                text: self.text.clone(),
+                idempotency_key: self.idempotency_key.clone(),
+            },
+            |command| crate::gateway::UiCommand::InvokeMemory {
+                session_id: self.session_id.clone(),
+                command: command.clone(),
+                idempotency_key: self.idempotency_key.clone(),
+            },
+        )
+    }
+}
+
+/// Complete state consumed synchronously by the render thread.
 #[derive(Debug)]
 pub struct AppModel {
     /// Visible screen.
     pub screen: Screen,
     /// Gateway connection summary.
     pub connection: String,
+    /// Ready worker connection observed by the render loop; cleared on disconnect.
+    pub connection_id: Option<u64>,
     /// Known sessions.
     pub sessions: Vec<SessionSummary>,
     /// Selected session index.
@@ -256,6 +301,30 @@ pub struct AppModel {
     pub notice: Option<String>,
     /// Vertical scroll offset.
     pub scroll: usize,
+    /// Independent scroll position for the fixed approval preview.
+    pub approval_scroll: usize,
+    /// Last rendered terminal dimensions used to refuse unseen approval content.
+    pub viewport: (u16, u16),
+    /// Observed native run for the selected session.
+    pub active_run: Option<(String, String)>,
+    /// Monotonic turn and revision of the currently displayed native run.
+    pub active_run_version: Option<(Option<u64>, u64)>,
+    /// Last explicitly viewed partial page, never eligible for acknowledgement.
+    pub partial_page: Option<crate::gateway::PartialPage>,
+    /// Complete results eligible for acknowledgement only after workspace rendering.
+    pub pending_acks: VecDeque<(String, u64)>,
+    /// Bounded identities of terminal results already added to this session view.
+    pub received_results: VecDeque<(String, u64)>,
+    /// Session with another recovery page, advanced only after rendering the current page.
+    pub pending_recovery: Option<String>,
+    /// Whether message input currently owns ordinary character keys.
+    pub composer_open: bool,
+    /// Bounded unsent message text.
+    pub composer: String,
+    /// Explicit memory input bound to the session selected when editing began.
+    pub memory_draft: Option<(String, crate::gateway::MemoryDraft)>,
+    /// A queued or unconfirmed message that cannot be replaced by another send.
+    pub pending_message: Option<PendingMessage>,
 }
 
 impl Default for AppModel {
@@ -263,6 +332,7 @@ impl Default for AppModel {
         Self {
             screen: Screen::Sessions,
             connection: "Gateway: starting".to_owned(),
+            connection_id: None,
             sessions: Vec::new(),
             selected: 0,
             transcript: VecDeque::new(),
@@ -276,6 +346,18 @@ impl Default for AppModel {
             answer: String::new(),
             notice: None,
             scroll: 0,
+            approval_scroll: 0,
+            viewport: (0, 0),
+            active_run: None,
+            active_run_version: None,
+            partial_page: None,
+            pending_acks: VecDeque::new(),
+            received_results: VecDeque::new(),
+            pending_recovery: None,
+            composer_open: false,
+            composer: String::new(),
+            memory_draft: None,
+            pending_message: None,
         }
     }
 }
@@ -298,19 +380,48 @@ impl AppModel {
 
     pub(crate) fn select_next(&mut self) {
         if !self.sessions.is_empty() {
-            self.selected = (self.selected + 1).min(self.sessions.len() - 1);
+            let next = (self.selected + 1).min(self.sessions.len() - 1);
+            if self.selected != next {
+                self.selected = next;
+                self.clear_session_view();
+            }
         }
     }
 
-    pub(crate) const fn select_previous(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+    pub(crate) fn select_previous(&mut self) {
+        let previous = self.selected.saturating_sub(1);
+        if self.selected != previous {
+            self.selected = previous;
+            self.clear_session_view();
+        }
+    }
+
+    pub(crate) fn clear_session_view(&mut self) {
+        if self.memory_draft.is_some() {
+            self.composer_open = false;
+        }
+        self.transcript.clear();
+        self.tools.clear();
+        self.prompt = None;
+        self.answer.clear();
+        self.diff.clear();
+        self.artifacts.clear();
+        self.artifact_content.clear();
+        self.active_run = None;
+        self.active_run_version = None;
+        self.partial_page = None;
+        self.pending_acks.clear();
+        self.received_results.clear();
+        self.pending_recovery = None;
+        self.scroll = 0;
+        self.approval_scroll = 0;
     }
 
     /// Rows the active screen can scroll through.
     fn scrollable_rows(&self) -> usize {
         match self.screen {
             Screen::Sessions | Screen::Runs => self.sessions.len(),
-            Screen::Workspace => self.transcript.len(),
+            Screen::Workspace => crate::render::transcript_row_count(self),
             Screen::Diff => self.diff.len(),
             Screen::Artifacts => self.artifacts.len().max(self.artifact_content.len()),
             Screen::Help => 0,

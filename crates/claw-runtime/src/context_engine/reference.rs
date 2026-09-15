@@ -124,16 +124,34 @@ impl EngineState {
     }
 }
 
-const fn item_bytes(item: &ContextItem) -> usize {
+fn item_bytes(item: &ContextItem) -> usize {
     match item {
         ContextItem::UserInput { text }
         | ContextItem::AssistantMessage { text }
         | ContextItem::SystemNote { text } => text.len(),
+        ContextItem::AssistantToolCalls { text, tool_calls } => {
+            tool_calls.iter().fold(text.len(), |bytes, call| {
+                bytes
+                    .saturating_add(call.call_id.as_str().len())
+                    .saturating_add(call.name.len())
+                    .saturating_add(call.arguments.len())
+            })
+        }
         ContextItem::GoalStatement { objective } => objective.len(),
         ContextItem::GoalCleared => 0,
         ContextItem::ToolResult {
             tool_name, output, ..
         } => tool_name.len() + output.len(),
+        ContextItem::ToolCallResult {
+            call_id,
+            tool_name,
+            output,
+            ..
+        } => call_id
+            .as_str()
+            .len()
+            .saturating_add(tool_name.len())
+            .saturating_add(output.len()),
     }
 }
 
@@ -143,6 +161,20 @@ fn prompt_message(index: usize, item: &ContextItem) -> PromptMessage {
         ContextItem::AssistantMessage { text } => PromptMessage::Assistant {
             text: text.clone(),
             tool_calls: Vec::new(),
+        },
+        ContextItem::AssistantToolCalls { text, tool_calls } => PromptMessage::Assistant {
+            text: text.clone(),
+            tool_calls: tool_calls.clone(),
+        },
+        ContextItem::ToolCallResult {
+            call_id,
+            output,
+            failed,
+            ..
+        } => PromptMessage::ToolResult {
+            call_id: call_id.clone(),
+            output: output.clone(),
+            failed: *failed,
         },
         ContextItem::SystemNote { text } => PromptMessage::System { text: text.clone() },
         ContextItem::GoalStatement { objective } => PromptMessage::System {

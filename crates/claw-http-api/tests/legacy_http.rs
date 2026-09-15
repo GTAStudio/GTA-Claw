@@ -261,6 +261,13 @@ impl LegacyWhatsAppPort for ScriptedWhatsApp {
                             .process(
                                 LegacyChannelMessage {
                                     channel: "whatsapp",
+                                    account_id: "fixture-phone".to_owned(),
+                                    message_id: message
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("fixture-message")
+                                        .to_owned(),
+                                    sender_id: from.to_owned(),
                                     conversation_id: format!("whatsapp:{from}"),
                                     user_name: from.to_owned(),
                                     text: text.to_owned(),
@@ -1103,6 +1110,55 @@ async fn whatsapp_webhook_authenticates_bounded_raw_bytes_before_parse_and_scope
     assert_eq!(
         fixtures.messages.received.lock().expect("messages").len(),
         1
+    );
+
+    let callback = serde_json::to_vec(&json!({"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"fixture-phone"},"statuses":[{"id":"wamid.confirmed","recipient_id":"15551234567","status":"read","timestamp":"42"}]}}]}]})).expect("status callback");
+    let unsigned = request(
+        &server,
+        "POST",
+        "/whatsapp/webhook",
+        None,
+        &[("Content-Type", "application/json")],
+        &callback,
+    )
+    .await;
+    assert_eq!(unsigned.status, 403);
+    let signature = whatsapp_signature(&callback);
+    let mut tampered = callback.clone();
+    tampered.push(b' ');
+    let forged = request(
+        &server,
+        "POST",
+        "/whatsapp/webhook",
+        None,
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Hub-Signature-256", &signature),
+        ],
+        &tampered,
+    )
+    .await;
+    assert_eq!(forged.status, 403);
+    assert_eq!(
+        fixtures.whatsapp.webhook_calls.load(Ordering::Acquire),
+        1,
+        "unsigned or byte-modified callbacks cannot reach the adapter"
+    );
+    assert_eq!(signed_whatsapp_bytes(&server, &callback).await.status, 200);
+    assert_eq!(fixtures.whatsapp.webhook_calls.load(Ordering::Acquire), 2);
+    assert_eq!(
+        fixtures
+            .whatsapp
+            .webhook_payloads
+            .lock()
+            .expect("webhook bytes")
+            .last(),
+        Some(&callback)
+    );
+    assert_eq!(
+        fixtures.messages.received.lock().expect("messages").len(),
+        1,
+        "status callbacks are not model input"
     );
 }
 

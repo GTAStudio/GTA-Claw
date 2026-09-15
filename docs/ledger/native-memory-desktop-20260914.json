@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "stage": "slint-explicit-memory-forms-and-exact-run-reconciliation",
+  "capturedAtUtc": "2026-09-14T17:45:46.9558733Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"desktop/apps/gta-claw-desktop/src/controller.rs","sha256":"17ebf5d6d7e78525c6d9ac3ac8c7431ca1c0d1c8946acc8ff96d11608bb2e04b"},
+    {"path":"desktop/apps/gta-claw-desktop/src/product_state.rs","sha256":"a0e382e347f6bba48c3616d42a865eed099f0b72aac290d9acc91a0c88653ab6"},
+    {"path":"desktop/apps/gta-claw-desktop/src/main.rs","sha256":"b3966c7a3c9eeb541e94a7da5163f72af4153ad4aaced493a59abcb945591ff5"},
+    {"path":"desktop/apps/gta-claw-desktop/src/software_renderer_smoke.rs","sha256":"98d780485063fb47c0453d9fa416e24e515cc5db19f5e7b6de70fa02f02b06a5"},
+    {"path":"desktop/apps/gta-claw-desktop/ui/app-window.slint","sha256":"ddf8133ff63206c5dcfe3c0143d6f534067378ef814101ea148a5d355fcf5c06"},
+    {"path":"desktop/apps/gta-claw-desktop/ui/modules/product-shell.slint","sha256":"e6efca9d1a3f61ac5a2fc766c47d628c2c0eacbcb9d916af9e262f88e8f55cc7"}
+  ],
+  "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "desktopCargoLockSha256": "7294aad1d9e779cb2bd58bfb8a49dfa9398d58661c4d9c00e738e832f3619964",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/desktop/Cargo.toml -p gta-claw-desktop --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":84, "failed":0, "ignored":0, "testSummaries":1,
+      "log":"desktop/target/native-memory-desktop-tests-20260914T174343128Z.log",
+      "sha256":"913b3b9b618ebfe43d9e2bac796e966090c605587432746137f010302c3b85d6"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/desktop/Cargo.toml -p gta-claw-desktop --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"desktop/target/native-memory-desktop-clippy-20260914T174507857Z.log",
+      "sha256":"247588237834c569dc1122a984a1ae22018875e702f260499cecf46cff9f7e0f"
+    }
+  ],
+  "behaviorEvidence": [
+    "native_memory_health_requires_model_free_approved_durable_identity_scope",
+    "native_memory_form_keeps_revision_body_and_archive_bytes_separate_from_chat",
+    "native_memory_uncertainty_survives_refused_retry_and_checks_durable_receipts",
+    "native_memory_result_before_receipt_cannot_release_the_original_input",
+    "product_memory_gateway_preflights_on_the_same_epoch_and_never_falls_back_to_chat",
+    "native_memory_form_renders_at_narrow_and_wide_sizes_and_closes_on_binding_change"
+  ],
+  "notes": [
+    "Fourteen actual local controller/WebSocket scenarios cover all seven actions and seven refusal cases",
+    "Existing strict Gateway JSON codec handles archives; no new dependency or RPC method was added",
+    "Complete durable receipts associate the original key with the exact memory run before pending input is released",
+    "Early results and refused retries cannot silently release unconfirmed input or generate a replacement key",
+    "Actual software-rendered Slint component trees at 1080x720 and 720x520; no native visible window",
+    "Captured source witnesses follow tests/lint and are not a complete frozen input manifest"
+  ],
+  "unverified": [
+    "actual Windows/macOS interactive, accessibility and protected-profile acceptance outside owned local fixtures",
+    "persistent client draft/unconfirmed-key crash journal and full persistent memory-result management",
+    "automatic encrypted archive-page collection and staged large imports",
+    "complete semantic/provenance/deletion workflows and whole-project completion",
+    "real model/channel accounts, deployment and release acceptance"
+  ]
+}

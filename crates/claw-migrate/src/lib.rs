@@ -10,6 +10,7 @@ mod contract;
 mod engine;
 mod platform;
 mod providers;
+pub mod openclaw;
 
 pub use contract::{
     Artifact, ArtifactKind, ArtifactSignature, Bridge, ContractViolation, Diagnostic,

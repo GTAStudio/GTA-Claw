@@ -5,6 +5,9 @@ use claw_protocol::RuntimeDescriptor;
 
 pub mod suspend;
 
+#[cfg(feature = "native-identity")]
+pub mod identity;
+
 /// Reads platform identity from the Rust target.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeSystemProbe;

@@ -8,7 +8,8 @@
 use claw_domain::SessionId;
 
 use super::{PortError, PortFuture};
-use crate::model::ids::TurnId;
+use crate::model::ids::{ToolCallId, TurnId};
+use crate::model::message::ToolCall;
 use crate::model::time::Timestamp;
 use crate::ports::provider::PromptMessage;
 
@@ -25,6 +26,13 @@ pub enum ContextItem {
         /// The response text.
         text: String,
     },
+    /// A completed model response containing the original function-call identities.
+    AssistantToolCalls {
+        /// Visible assistant text.
+        text: String,
+        /// Calls in the provider's original order.
+        tool_calls: Vec<ToolCall>,
+    },
     /// The result of a tool call.
     ToolResult {
         /// The tool that produced the output.
@@ -32,6 +40,17 @@ pub enum ContextItem {
         /// The serialised output.
         output: String,
         /// Whether the tool failed.
+        failed: bool,
+    },
+    /// One tool result bound to the model call it answers.
+    ToolCallResult {
+        /// Original model call identity.
+        call_id: ToolCallId,
+        /// Tool that was invoked.
+        tool_name: String,
+        /// Untrusted tool output.
+        output: String,
+        /// Whether execution failed.
         failed: bool,
     },
     /// A durable goal restated for the engine.

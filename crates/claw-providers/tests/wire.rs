@@ -18,7 +18,7 @@ use claw_provider_sdk::http::{HttpRequest, HttpTransport, Method, TlsPolicy, Tra
 use claw_provider_sdk::model::{
     AssistantMessage, Capability, CapabilitySet, ChatMessage, CompletionRequest, ContentPart,
     FinishReason, ModelId, ProviderId, ToolArguments, ToolCall, ToolDefinition, ToolParameters,
-    Usage,
+    ToolResultMessage, Usage,
 };
 use claw_provider_sdk::origin::{BoundApiKey, Origin, OriginApproval};
 use claw_provider_sdk::provider::{Provider as _, ProviderPhase, RequestContext};
@@ -31,7 +31,9 @@ use claw_providers::github_copilot::{
     DeviceFlow, DeviceFlowConfig, DeviceFlowSession, DevicePollOutcome, GitHubCopilot,
     GitHubCopilotConfig,
 };
-use claw_providers::openai_compatible::{AuthStyle, OpenAiCompatible, OpenAiConfig};
+use claw_providers::openai_compatible::{
+    AuthStyle, CompletionDialect, OpenAiCompatible, OpenAiConfig,
+};
 use claw_providers::runtime::{ProviderRuntime, ReliabilityConfig};
 use futures_util::StreamExt as _;
 use serde_json::json;
@@ -360,6 +362,471 @@ fn anthropic_client(server: &TestServer) -> Anthropic {
     Anthropic::new(config).expect("build client")
 }
 
+fn responses_client(server: &TestServer) -> OpenAiCompatible {
+    let runtime = ProviderRuntime::with_parts(
+        "openai",
+        HttpTransport::with_config(&TransportConfig {
+            tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+            proxy_policy: claw_provider_sdk::http::ProxyPolicy::Disabled,
+            ..TransportConfig::default()
+        })
+        .expect("owned direct transport"),
+        ReliabilityConfig {
+            retry: RetryPolicy::never(),
+            max_concurrency: 1,
+            ..ReliabilityConfig::default()
+        },
+        Arc::new(ManualClock::new(0)),
+        Arc::new(FixedJitter::new(0.0)),
+    );
+    openai_client(server)
+        .with_completion_dialect(CompletionDialect::Responses)
+        .with_runtime(runtime)
+}
+
+fn responses_answer() -> serde_json::Value {
+    json!({"id":"resp-owned","model":"gpt-4o-mini","status":"completed","output":[{"type":"message","id":"msg-owned","role":"assistant","status":"completed","content":[{"type":"output_text","text":"owned answer"}]}],"usage":{"input_tokens":12,"output_tokens":5,"input_tokens_details":{"cached_tokens":2},"output_tokens_details":{"reasoning_tokens":1}}})
+}
+
+fn responses_text_frames() -> Vec<String> {
+    [
+        json!({"type":"response.created","response":{"id":"resp-owned","model":"gpt-4o-mini","status":"in_progress","output":[],"usage":null}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg-owned","role":"assistant","status":"in_progress","content":[]}}),
+        json!({"type":"response.content_part.added","output_index":0,"item_id":"msg-owned","content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
+        json!({"type":"response.output_text.delta","output_index":0,"item_id":"msg-owned","content_index":0,"delta":"owned answer"}),
+        json!({"type":"response.output_text.done","output_index":0,"item_id":"msg-owned","content_index":0,"text":"owned answer"}),
+        json!({"type":"response.content_part.done","output_index":0,"item_id":"msg-owned","content_index":0,"part":{"type":"output_text","text":"owned answer","annotations":[]}}),
+        json!({"type":"response.output_item.done","output_index":0,"item":responses_answer()["output"][0]}),
+        json!({"type":"response.completed","response":responses_answer()}),
+    ].into_iter().enumerate().map(|(index, mut value)| {
+        value["sequence_number"] = json!(index);
+        format!("event: {}\ndata: {value}\n\n", value["type"].as_str().expect("event type"))
+    }).collect()
+}
+
+#[tokio::test]
+async fn responses_completion_and_function_output_round_trip_over_http() {
+    let mut function = responses_answer();
+    function["output"] = json!([{"type":"function_call","id":"function-owned","call_id":"call-owned","name":"lookup","arguments":"{\"key\":\"one\"}","status":"completed"}]);
+    let server = TestServer::start(vec![
+        Reply::json(&function.to_string()),
+        Reply::json(&responses_answer().to_string()),
+    ])
+    .await;
+    assert_eq!(
+        openai_client(&server).completion_dialect(),
+        CompletionDialect::ChatCompletions
+    );
+    let client = responses_client(&server);
+    let mut request = CompletionRequest::new(
+        model("gpt-4o-mini"),
+        vec![
+            ChatMessage::System("owned instructions".to_owned()),
+            ChatMessage::user_text("lookup one"),
+        ],
+    );
+    request.tools.push(ToolDefinition {
+        name: "lookup".to_owned(),
+        description: "lookup one value".to_owned(),
+        parameters: ToolParameters::new(
+            json!({"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}),
+        )
+        .expect("schema"),
+    });
+    let response = client
+        .complete(&request, &RequestContext::new())
+        .await
+        .expect("first function round");
+    assert_eq!(response.finish_reason, FinishReason::ToolCalls);
+    assert_eq!(response.message.tool_calls[0].id, "call-owned");
+    request
+        .messages
+        .push(ChatMessage::Assistant(response.message));
+    request
+        .messages
+        .push(ChatMessage::ToolResult(ToolResultMessage {
+            tool_call_id: "call-owned".to_owned(),
+            content: "owned tool result".to_owned(),
+            is_error: false,
+        }));
+    let response = client
+        .complete(&request, &RequestContext::new())
+        .await
+        .expect("result round");
+    assert_eq!(response.message.text(), "owned answer");
+    assert_eq!(
+        response.usage,
+        Usage {
+            input_tokens: 12,
+            output_tokens: 5,
+            cached_input_tokens: 2,
+            reasoning_tokens: 1
+        }
+    );
+    request.seed = Some(7);
+    assert_eq!(
+        client
+            .complete(&request, &RequestContext::new())
+            .await
+            .expect_err("unsupported option before I/O")
+            .kind(),
+        ErrorKind::Unsupported
+    );
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+    for sent in &requests {
+        assert_eq!(sent.target, "/responses");
+        assert_eq!(
+            sent.header("authorization"),
+            Some(format!("Bearer {OPENAI_KEY}").as_str())
+        );
+        let body = sent.json();
+        assert_eq!(body["model"], "gpt-4o-mini");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["strict"], false);
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("messages").is_none());
+    }
+    assert_eq!(
+        requests[1].json()["input"][3],
+        json!({"type":"function_call_output","call_id":"call-owned","output":"owned tool result"})
+    );
+}
+
+#[tokio::test]
+async fn responses_terminal_closes_a_held_socket_and_releases_the_only_capacity_slot() {
+    let frames = responses_text_frames();
+    let references: Vec<_> = frames.iter().map(String::as_str).collect();
+    let server = TestServer::start(vec![
+        Reply::sse_hold(&references),
+        Reply::json(&responses_answer().to_string()),
+    ])
+    .await;
+    let client = responses_client(&server);
+    let request = CompletionRequest::new(
+        model("gpt-4o-mini"),
+        vec![ChatMessage::user_text("owned request")],
+    );
+    let mut stream = client
+        .stream(&request, &RequestContext::new())
+        .await
+        .expect("stream opens");
+    let mut accumulator = StreamAccumulator::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(event) = stream.next().await {
+            accumulator.accept(&event.expect("complete stream"));
+        }
+    })
+    .await
+    .expect("terminal does not wait for remote EOF");
+    assert_eq!(accumulator.message().text(), "owned answer");
+    assert_eq!(accumulator.finish_reason(), Some(&FinishReason::Stop));
+    assert_eq!(
+        accumulator.usage_reporting(),
+        claw_provider_sdk::model::UsageReporting::Complete
+    );
+    assert!(server.wait_for_peer_close(Duration::from_secs(2)).await);
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.complete(&request, &RequestContext::new()),
+    )
+    .await
+    .expect("retained fused stream releases capacity")
+    .expect("next request succeeds");
+    assert_eq!(response.message.text(), "owned answer");
+    drop(stream);
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].target, "/responses");
+    assert_eq!(requests[0].header("accept"), Some("text/event-stream"));
+    assert_eq!(requests[0].json()["store"], false);
+    assert_eq!(requests[0].json()["stream"], true);
+    assert!(requests[0].json().get("stream_options").is_none());
+}
+
+#[tokio::test]
+async fn responses_cancellation_drop_and_truncation_never_replay_a_request() {
+    for mode in ["cancel", "drop", "eof", "failed"] {
+        let mut frames = responses_text_frames();
+        frames.truncate(4);
+        if mode == "failed" {
+            frames.push("event: error\ndata: {\"type\":\"error\",\"sequence_number\":4,\"message\":\"private-remote-error\"}\n\n".to_owned());
+        }
+        let references: Vec<_> = frames.iter().map(String::as_str).collect();
+        let held = matches!(mode, "cancel" | "drop");
+        let server = TestServer::start(vec![if held {
+            Reply::sse_hold(&references)
+        } else {
+            Reply::sse(&references)
+        }])
+        .await;
+        let client = responses_client(&server);
+        let request = CompletionRequest::new(
+            model("gpt-4o-mini"),
+            vec![ChatMessage::user_text("owned request")],
+        );
+        let mut stream = client
+            .stream(&request, &RequestContext::new())
+            .await
+            .expect("opens");
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamEvent::Started { .. }))
+        ));
+        if mode == "cancel" {
+            stream.cancel();
+            assert_eq!(
+                stream
+                    .next()
+                    .await
+                    .expect("cancellation")
+                    .expect_err("cancelled")
+                    .kind(),
+                ErrorKind::Cancelled
+            );
+            assert!(stream.next().await.is_none());
+        } else if mode != "drop" {
+            let mut failed = false;
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(StreamEvent::TextDelta(text)) => assert_eq!(text, "owned answer"),
+                    Err(error) => {
+                        assert_eq!(error.kind(), ErrorKind::Protocol);
+                        assert!(!error.detail().contains("private-remote-error"));
+                        failed = true;
+                    }
+                    _ => panic!("partial response must not complete"),
+                }
+            }
+            assert!(failed);
+        }
+        drop(stream);
+        if held {
+            assert!(server.wait_for_peer_close(Duration::from_secs(2)).await);
+        }
+        assert_eq!(server.request_count().await, 1);
+    }
+}
+
+#[tokio::test]
+async fn responses_http_failure_does_not_retry_or_fall_back_to_chat() {
+    let server = TestServer::start(vec![Reply::status(
+        503,
+        r#"{"error":{"message":"owned refusal"}}"#,
+    )])
+    .await;
+    let client = responses_client(&server);
+    let request = CompletionRequest::new(
+        model("gpt-4o-mini"),
+        vec![ChatMessage::user_text("owned request")],
+    );
+    let error = client
+        .complete(&request, &RequestContext::new())
+        .await
+        .expect_err("single paid attempt");
+    assert!(!error.to_string().contains(OPENAI_KEY));
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].target, "/responses");
+}
+
+#[tokio::test]
+async fn chat_stream_identity_errors_close_the_socket_without_completing_or_replaying_tools() {
+    let first = json!({"id":"owned-response","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"owned-call","function":{"name":"lookup","arguments":"{}"}}]}}]});
+    for mode in [
+        "response",
+        "model",
+        "duplicate-call",
+        "changed-call",
+        "choice",
+        "multiple-choices",
+    ] {
+        let mut changed = json!({"id":"owned-response","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]});
+        match mode {
+            "response" => {
+                changed["id"] = json!("foreign-response");
+            }
+            "model" => {
+                changed["model"] = json!("foreign-model");
+            }
+            "duplicate-call" => {
+                changed["choices"][0]["delta"]["tool_calls"] = json!([{"index":1,"id":"owned-call","function":{"name":"lookup","arguments":"{}"}}]);
+            }
+            "changed-call" => {
+                changed["choices"][0]["delta"]["tool_calls"] = json!([{"index":0,"id":"new-call"}]);
+            }
+            "choice" => {
+                changed["choices"][0]["index"] = json!(1);
+            }
+            "multiple-choices" => {
+                let choice = changed["choices"][0].clone();
+                changed["choices"]
+                    .as_array_mut()
+                    .expect("choices")
+                    .push(choice);
+            }
+            _ => unreachable!("fixed fixture modes"),
+        }
+        let first_frame = format!("data: {first}\n\n");
+        let changed_frame = format!("data: {changed}\n\n");
+        let server =
+            TestServer::start(vec![Reply::sse_hold(&[&first_frame, &changed_frame])]).await;
+        let clock = Arc::new(ManualClock::new(0));
+        let client = openai_client(&server).with_runtime(manual_runtime(
+            "openai",
+            &clock,
+            RetryPolicy::never(),
+        ));
+        let request = CompletionRequest::new(
+            model("gpt-4o-mini"),
+            vec![ChatMessage::user_text("owned request")],
+        );
+        let mut stream = client
+            .stream(&request, &RequestContext::new())
+            .await
+            .expect("owned HTTP stream");
+        let mut failed = false;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(StreamEvent::Completed { .. } | StreamEvent::ToolCallCompleted { .. }) => {
+                        panic!("inconsistent stream cannot authorize tools")
+                    }
+                    Err(error) => {
+                        assert_eq!(error.kind(), ErrorKind::Protocol);
+                        assert!(!error.to_string().contains(OPENAI_KEY));
+                        failed = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("protocol failure is immediate");
+        assert!(failed, "{mode}");
+        drop(stream);
+        assert!(
+            server.wait_for_peer_close(Duration::from_secs(2)).await,
+            "{mode}"
+        );
+        assert_eq!(server.request_count().await, 1, "{mode}");
+    }
+}
+
+#[tokio::test]
+async fn chat_http_done_usage_and_output_limits_close_and_release_capacity() {
+    for mode in ["complete", "usage", "budget"] {
+        let first = json!({"id":"owned","model":"owned","choices":[{"delta":{"content":"partial answer"}}]});
+        let mut frames = vec![format!("data: {first}\n\n")];
+        if mode == "budget" {
+            let delta = json!({"choices":[{"delta":{"content":"x".repeat(8192)}}]});
+            frames.extend(std::iter::repeat_n(format!("data: {delta}\n\n"), 512));
+        }
+        frames
+            .push("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_owned());
+        let usage = json!({"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":if mode == "usage" { 4 } else { 3 },"prompt_tokens_details":{"cached_tokens":1},"completion_tokens_details":{"reasoning_tokens":1}}});
+        frames.push(format!("data: {usage}\n\n"));
+        frames.push("data: [DONE]\n\n".to_owned());
+        let payload = frames.concat();
+        let mut replies = vec![Reply::sse_hold(&[&payload])];
+        if mode == "complete" {
+            replies.push(Reply::json(r#"{"id":"next-owned","model":"owned","choices":[{"message":{"content":"next answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#));
+        }
+        let server = TestServer::start(replies).await;
+        let runtime = ProviderRuntime::with_parts(
+            "openai",
+            HttpTransport::with_config(&TransportConfig {
+                tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+                proxy_policy: claw_provider_sdk::http::ProxyPolicy::Disabled,
+                ..TransportConfig::default()
+            })
+            .expect("owned transport"),
+            ReliabilityConfig {
+                retry: RetryPolicy::never(),
+                max_concurrency: 1,
+                ..ReliabilityConfig::default()
+            },
+            Arc::new(ManualClock::new(0)),
+            Arc::new(FixedJitter::new(0.0)),
+        );
+        let client = openai_client(&server).with_runtime(runtime);
+        let request = CompletionRequest::new(
+            model("owned"),
+            vec![ChatMessage::user_text("owned request")],
+        );
+        let mut stream = client
+            .stream(&request, &RequestContext::new())
+            .await
+            .expect("owned HTTP stream");
+        let mut text = String::new();
+        let mut failed = false;
+        let mut completed = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(StreamEvent::TextDelta(delta)) => text.push_str(&delta),
+                    Ok(StreamEvent::Completed {
+                        finish_reason,
+                        usage,
+                    }) => {
+                        assert_eq!(mode, "complete");
+                        assert_eq!(finish_reason, FinishReason::Stop);
+                        assert_eq!(
+                            usage,
+                            Usage {
+                                input_tokens: 2,
+                                output_tokens: 1,
+                                cached_input_tokens: 1,
+                                reasoning_tokens: 1
+                            }
+                        );
+                        completed = true;
+                    }
+                    Err(error) => {
+                        assert_eq!(error.kind(), ErrorKind::Protocol);
+                        if mode == "budget" {
+                            assert!(
+                                error.detail().contains("aggregate output"),
+                                "must reach actual decoded-output budget: {error}"
+                            );
+                        }
+                        if mode == "usage" {
+                            assert!(error.detail().contains("usage"));
+                        }
+                        failed = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("owned stream terminates within bounded fixture deadline");
+        assert!(text.starts_with("partial answer"));
+        assert!(text.len() <= claw_provider_sdk::stream::MAX_TOTAL_TOOL_ARGUMENT_BYTES);
+        if mode == "complete" {
+            assert!(completed && !failed);
+            assert!(server.wait_for_peer_close(Duration::from_secs(2)).await);
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.complete(&request, &RequestContext::new()),
+            )
+            .await
+            .expect("retained fused stream releases its only slot")
+            .expect("next completion");
+            assert_eq!(response.message.text(), "next answer");
+        } else {
+            assert!(failed && !completed);
+        }
+        drop(stream);
+        assert!(server.wait_for_peer_close(Duration::from_secs(2)).await);
+        assert_eq!(
+            server.request_count().await,
+            if mode == "complete" { 2 } else { 1 }
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI dialect
 // ---------------------------------------------------------------------------
@@ -515,12 +982,15 @@ async fn an_openai_stream_round_trips_over_the_wire() {
             },
             StreamEvent::TextDelta("Hei".to_owned()),
             StreamEvent::TextDelta(" der".to_owned()),
-            StreamEvent::UsageUpdate(Usage {
-                input_tokens: 5,
-                output_tokens: 3,
-                cached_input_tokens: 0,
-                reasoning_tokens: 0,
-            }),
+            StreamEvent::UsageReported {
+                usage: Usage {
+                    input_tokens: 5,
+                    output_tokens: 3,
+                    cached_input_tokens: 0,
+                    reasoning_tokens: 0,
+                },
+                reporting: claw_provider_sdk::model::UsageReporting::Complete,
+            },
             StreamEvent::Completed {
                 finish_reason: FinishReason::Stop,
                 usage: Usage {
@@ -541,6 +1011,10 @@ async fn an_openai_stream_round_trips_over_the_wire() {
         }
     );
     assert_eq!(accumulator.finish_reason(), Some(&FinishReason::Stop));
+    assert_eq!(
+        accumulator.usage_reporting(),
+        claw_provider_sdk::model::UsageReporting::Complete
+    );
 
     let requests = server.requests().await;
     let body = requests[0].json();
@@ -863,7 +1337,7 @@ async fn an_anthropic_completion_round_trips_over_the_wire() {
     assert_eq!(
         response.usage,
         Usage {
-            input_tokens: 18,
+            input_tokens: 21,
             output_tokens: 7,
             cached_input_tokens: 3,
             reasoning_tokens: 0,
@@ -914,8 +1388,11 @@ async fn an_anthropic_stream_round_trips_over_the_wire() {
         .await
         .expect("stream must open");
     let mut events = Vec::new();
+    let mut accumulator = StreamAccumulator::new();
     while let Some(event) = stream.next().await {
-        events.push(event.expect("no stream error"));
+        let event = event.expect("no stream error");
+        accumulator.accept(&event);
+        events.push(event);
     }
 
     assert_eq!(
@@ -925,19 +1402,25 @@ async fn an_anthropic_stream_round_trips_over_the_wire() {
                 id: "msg_1".to_owned(),
                 model: "claude-sonnet-4-5".to_owned(),
             },
-            StreamEvent::UsageUpdate(Usage {
-                input_tokens: 9,
-                output_tokens: 0,
-                cached_input_tokens: 0,
-                reasoning_tokens: 0,
-            }),
+            StreamEvent::UsageReported {
+                usage: Usage {
+                    input_tokens: 9,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                    reasoning_tokens: 0,
+                },
+                reporting: claw_provider_sdk::model::UsageReporting::Partial,
+            },
             StreamEvent::TextDelta("Hei".to_owned()),
-            StreamEvent::UsageUpdate(Usage {
-                input_tokens: 9,
-                output_tokens: 4,
-                cached_input_tokens: 0,
-                reasoning_tokens: 0,
-            }),
+            StreamEvent::UsageReported {
+                usage: Usage {
+                    input_tokens: 9,
+                    output_tokens: 4,
+                    cached_input_tokens: 0,
+                    reasoning_tokens: 0,
+                },
+                reporting: claw_provider_sdk::model::UsageReporting::Complete,
+            },
             StreamEvent::Completed {
                 finish_reason: FinishReason::Stop,
                 usage: Usage {
@@ -950,9 +1433,170 @@ async fn an_anthropic_stream_round_trips_over_the_wire() {
         ]
     );
 
+    assert_eq!(
+        accumulator.usage_reporting(),
+        claw_provider_sdk::model::UsageReporting::Complete
+    );
     let requests = server.requests().await;
     assert_eq!(requests[0].json()["stream"], json!(true));
     assert_eq!(requests[0].header("accept"), Some("text/event-stream"));
+}
+
+#[tokio::test]
+async fn anthropic_http_terminal_validates_blocks_usage_and_atomic_tool_completion() {
+    for mode in [
+        "complete",
+        "eof",
+        "unclosed",
+        "wrong-type",
+        "duplicate-id",
+        "usage-regression",
+        "duplicate-start",
+    ] {
+        let mut frames = vec![
+            json!({"type":"message_start","message":{"id":"owned-message","model":"owned-model","usage":{"input_tokens":20,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":1}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"partial "}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"owned-call","name":"lookup","input":{}}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"key\":\"one\"}"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":8}}),
+            json!({"type":"message_stop"}),
+        ];
+        match mode {
+            "eof" => frames.truncate(7),
+            "unclosed" => {
+                frames.remove(6);
+            }
+            "wrong-type" => {
+                frames[5]["delta"] =
+                    json!({"type":"thinking_delta","thinking":"incorrect block type"});
+            }
+            "duplicate-id" => {
+                frames.insert(7, json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"owned-call","name":"lookup","input":{}}}));
+            }
+            "usage-regression" => {
+                frames[7]["usage"]["output_tokens"] = json!(0);
+            }
+            "duplicate-start" => {
+                frames.insert(1, frames[0].clone());
+            }
+            "complete" => {}
+            _ => unreachable!("fixed modes"),
+        }
+        let encoded: Vec<_> = frames
+            .iter()
+            .map(|frame| {
+                format!(
+                    "event: {}\ndata: {frame}\n\n",
+                    frame["type"].as_str().expect("event type")
+                )
+            })
+            .collect();
+        let references: Vec<_> = encoded.iter().map(String::as_str).collect();
+        let mut replies = vec![if mode == "eof" {
+            Reply::sse(&references)
+        } else {
+            Reply::sse_hold(&references)
+        }];
+        if mode == "complete" {
+            replies.push(Reply::json(r#"{"id":"next-owned","model":"owned-model","content":[{"type":"text","text":"next answer"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#));
+        }
+        let server = TestServer::start(replies).await;
+        let runtime = ProviderRuntime::with_parts(
+            "anthropic",
+            HttpTransport::with_config(&TransportConfig {
+                tls_policy: TlsPolicy::AllowLoopbackPlaintext,
+                proxy_policy: claw_provider_sdk::http::ProxyPolicy::Disabled,
+                ..TransportConfig::default()
+            })
+            .expect("owned transport"),
+            ReliabilityConfig {
+                retry: RetryPolicy::never(),
+                max_concurrency: 1,
+                ..ReliabilityConfig::default()
+            },
+            Arc::new(ManualClock::new(0)),
+            Arc::new(FixedJitter::new(0.0)),
+        );
+        let client = anthropic_client(&server).with_runtime(runtime);
+        let request = CompletionRequest::new(
+            model("owned-model"),
+            vec![ChatMessage::user_text("owned request")],
+        );
+        let mut stream = client
+            .stream(&request, &RequestContext::new())
+            .await
+            .expect("stream opens");
+        let mut accumulator = StreamAccumulator::new();
+        let mut failed = false;
+        let mut completed_calls = 0;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(event) => {
+                        if matches!(event, StreamEvent::ToolCallCompleted { .. }) {
+                            completed_calls += 1;
+                        }
+                        if mode != "complete" {
+                            assert!(!matches!(
+                                event,
+                                StreamEvent::ToolCallCompleted { .. }
+                                    | StreamEvent::Completed { .. }
+                            ));
+                        }
+                        accumulator.accept(&event);
+                    }
+                    Err(error) => {
+                        assert_eq!(error.kind(), ErrorKind::Protocol);
+                        assert!(!error.to_string().contains(ANTHROPIC_KEY));
+                        failed = true;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("terminal or protocol failure does not wait for remote closure");
+        if mode == "complete" {
+            assert!(!failed);
+            assert_eq!(completed_calls, 1);
+            assert_eq!(accumulator.message().tool_calls[0].id, "owned-call");
+            assert_eq!(
+                accumulator.usage(),
+                Usage {
+                    input_tokens: 25,
+                    output_tokens: 8,
+                    cached_input_tokens: 3,
+                    reasoning_tokens: 0
+                }
+            );
+            assert_eq!(accumulator.finish_reason(), Some(&FinishReason::ToolCalls));
+            assert!(server.wait_for_peer_close(Duration::from_secs(2)).await);
+            let next = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.complete(&request, &RequestContext::new()),
+            )
+            .await
+            .expect("fused stream releases only slot")
+            .expect("second request");
+            assert_eq!(next.message.text(), "next answer");
+        } else {
+            assert!(failed);
+            assert_eq!(completed_calls, 0);
+            if mode != "duplicate-start" {
+                assert_eq!(accumulator.message().text(), "partial answer");
+            }
+        }
+        drop(stream);
+        if mode != "eof" {
+            assert!(server.wait_for_peer_close(Duration::from_secs(2)).await);
+        }
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), if mode == "complete" { 2 } else { 1 });
+        assert_eq!(requests[0].target, "/v1/messages");
+        assert_eq!(requests[0].header("x-api-key"), Some(ANTHROPIC_KEY));
+    }
 }
 
 #[tokio::test]
@@ -1632,8 +2276,11 @@ async fn copilot_streams_and_lists_models_over_the_wire() {
         .await
         .expect("stream must open");
     let mut events = Vec::new();
+    let mut accumulator = StreamAccumulator::new();
     while let Some(event) = stream.next().await {
-        events.push(event.expect("no stream error"));
+        let event = event.expect("no stream error");
+        accumulator.accept(&event);
+        events.push(event);
     }
     assert_eq!(
         events,
@@ -1650,6 +2297,10 @@ async fn copilot_streams_and_lists_models_over_the_wire() {
         ]
     );
 
+    assert_eq!(
+        accumulator.usage_reporting(),
+        claw_provider_sdk::model::UsageReporting::Unreported
+    );
     let models = client.list_models(&context).await.expect("model listing");
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id.as_str(), "gpt-4o");

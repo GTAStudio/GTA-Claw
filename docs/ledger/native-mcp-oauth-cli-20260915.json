@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-mcp-oauth-local-record-cli",
+  "capturedAtUtc": "2026-09-15T01:28:51.5637397Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-mcp/src/oauth.rs","sha256":"f671b7215ee82ad24f4a0995f313ae96101f5072863c55ea37a79789fc2296c6"},
+    {"path":"crates/claw-mcp/src/oauth/keyring.rs","sha256":"dba19c4bc471acec319db1508d31b03adc07b815a7574c32325e078223ae411f"},
+    {"path":"apps/gta-claw-cli/src/mcp_credential.rs","sha256":"a280b4c51523c12ea1820e58904bd9546befec6b4f662e81c0a5d20fe7a4f318"},
+    {"path":"apps/gta-claw-cli/src/lib.rs","sha256":"105a21223f5c1a98c41686500eb016ac9ebfb21dc15a1f860457c42453ac354f"},
+    {"path":"apps/gta-claw-cli/tests/foundation.rs","sha256":"ebd2d2b01eba3fca044ac493ced23d4af8289f5dd4ee8487ef172a421f90a472"}
+  ],
+  "cargoLockSha256": "5955c2233d8cad3f8d4c72b61bdfef396f609c5a2b90c50fb56c69e8ba262b1e",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p gta-claw-cli --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":175, "failed":0, "ignored":1, "testBinaries":11,
+      "log":"target/native-mcp-oauth-cli-tests-20260915T012752435Z.log",
+      "sha256":"9922776180ffe4c4b42d245b36713063f08d95519228ecc7e388f04e70931d01"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p gta-claw-cli --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-oauth-cli-clippy-20260915T012738981Z.log",
+      "sha256":"4614ab056549b72418e078b098654ae0c3b9ddf16e2e59799593b2f166322fca"
+    }
+  ],
+  "behaviorEvidence": [
+    "oauth_commands_use_a_separate_namespace_and_require_explicit_local_logout",
+    "mcp_oauth_cli_reports_local_states_and_only_logs_out_with_explicit_confirmation",
+    "native_token_records_preserve_authority_and_expiry_without_cross_binding_or_plain_output",
+    "native_token_store_roundtrip_reopens_only_an_owned_windows_entry"
+  ],
+  "notes": [
+    "NativeTokenStatus reuses the strict record parser and exposes only local availability metadata",
+    "CLI reference/status/logout uses a separate OAuth namespace, rejects raw token writes and requires confirm-logout",
+    "Native CLI I/O runs on awaited blocking workers; status never refreshes or contacts a service",
+    "Actual Windows child processes tested available/expired/pending/corrupt local fixtures, no mutation on status, explicit cleanup and zero TCP",
+    "Local state and deletion do not prove remote authentication or revocation; no dependency or lock changes"
+  ],
+  "unverified": [
+    "Product browser login and daemon consumption of native OAuth credentials",
+    "Cross-process lifecycle coordination, native I/O deadlines and interruption during CLI output",
+    "macOS runtime and real-account acceptance, remote token revocation and deployment",
+    "Complete frozen input manifests and whole-project completion"
+  ]
+}

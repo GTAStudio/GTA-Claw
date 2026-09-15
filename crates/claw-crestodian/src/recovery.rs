@@ -487,6 +487,10 @@ fn sync_directory(path: &Path) -> Result<(), CrestodianError> {
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), CrestodianError> {
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Portable directory commit hook; this platform has no supported directory flush here and no power-loss durability guarantee"
+)]
+const fn sync_directory(_path: &Path) -> Result<(), CrestodianError> {
     Ok(())
 }

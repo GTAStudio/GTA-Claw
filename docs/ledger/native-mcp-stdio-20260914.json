@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-windows-mcp-stdio-approved-pinned-launch",
+  "capturedAtUtc": "2026-09-14T23:07:15.2297011Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-daemon/src/adapters/native_mcp.rs","sha256":"c92d508bcf6ba94ac3507b079197547b1767a72bad426cf0646a28d501cb8a25"},
+    {"path":"apps/gta-claw-daemon/src/adapters/native_tools.rs","sha256":"2208c746e231868cc747ad67aecf780431f695c547382ec61f87ccd8da323fa4"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"1b13686e47ab63361e0410d7c356ce6bb2fb9d9c524d9a8af587b0485c19e7ec"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"97b6a7690ce053f702ac03ee78b214a3a42049ed11a5cbdbc4d2c4fadd43e5b5"},
+    {"path":"apps/gta-claw-daemon/Cargo.toml","sha256":"1e1723ff707a040d0236179de5ca3b9d5de723296804d574635f4834b15906eb"},
+    {"path":"crates/claw-mcp/src/client.rs","sha256":"7dd00d2a7dfb30a2afa449116b21316e869d01c5f086bf205c0680c7fd3ee279"},
+    {"path":"crates/claw-mcp/tests/fixtures/mcp_fixture.rs","sha256":"3e472be16fc64c4caf55ca1ca546ca783427d3d45c02530bd634255a1755a8a4"},
+    {"path":"crates/claw-mcp/tests/stdio_interop.rs","sha256":"3b07ccc33634b60c5c1f719952d61554163eaf17e4d571ba49ed6a69180850eb"}
+  ],
+  "cargoLockSha256": "35d6c486d9f786555694093b3131f1da1fbe4c95985d3d9d0909bd2d07c04254",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-tools -p claw-mcp -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":563, "failed":0, "ignored":6, "testBinaries":32,
+      "log":"target/native-mcp-stdio-tests-20260914T230426632Z.log",
+      "sha256":"8ddc63d626047dbe58329413311963b91a7b8d0935e227bf7b32130673953ac7"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-tools -p claw-mcp -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-stdio-clippy-20260914T230632173Z.log",
+      "sha256":"a3f26607dec090b0ede0b03c499c54cdfeb0a6202a1734cf01c82f4ba8c71692"
+    }
+  ],
+  "behaviorEvidence": [
+    "bound_native_mcp_stdio_requires_launch_approval_pins_program_and_isolates_environment",
+    "native_mcp_stdio_policy_requires_fixed_launch_and_excludes_writable_programs",
+    "isolated_stdio_requires_and_preserves_its_explicit_working_directory",
+    "isolated_stdio_only_receives_explicit_environment_without_changing_the_host",
+    "trusted_program_handle_prevents_write_delete_and_ancestor_replacement"
+  ],
+  "notes": [
+    "Windows-only stdio enrollment fixes executable SHA256, arguments, explicit environment and pinned working directory with host-permission consent",
+    "No child starts before human approval; actual daemon HTTP/MCP calls share existing authority, audit and review revocation",
+    "MCP session closure cancels an actually running child and returns nonretryable outcome; executable/directory pins remain held during execution",
+    "Same-length program tampering with restored mtime is refused before spawn and remains revoked after restoration and restart",
+    "The socket-using isolated Windows fixture explicitly supplies SystemRoot; host credentials are not inherited",
+    "One existing fixture source is reused by a daemon test-support binary; default daemon target and root lock witness remain unchanged"
+  ],
+  "unverified": [
+    "non-Windows product stdio launch, OS sandboxing and arbitrary third-party backends",
+    "protected stdio credentials, remote HTTPS/proxy/OAuth and full resources/prompts/ACP",
+    "physical power-loss acceptance, deployment and whole-project completion"
+  ]
+}

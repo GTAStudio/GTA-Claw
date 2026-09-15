@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "stage": "whatsapp-receipt-bound-provider-status-callbacks",
+  "capturedAtUtc": "2026-09-14T20:38:20.9461823Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-channels/src/whatsapp.rs","sha256":"0b12dd16d367454e714fc8ee1c6f8231d56d61f87b7ef11fe971acc9dc9f89eb"},
+    {"path":"crates/claw-channels/src/lib.rs","sha256":"dde7c7c097b9356b9316d86c644055d6541d1d477321575bc41ffa2ac228e5dd"},
+    {"path":"crates/claw-state/src/runs.rs","sha256":"425e2a881b82fada747ac88d7e4908263129054ab3c8d14b412d7aca689d8de1"},
+    {"path":"crates/claw-state/src/lib.rs","sha256":"67c3e16f7f25d5fca3b7029286d6f3580ac5cea0cc8aea292b78d1bbf215fa31"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"ed2d5bd5f8af1baa459a437905e79d9430ce43e197fcefb8b547b7213db66a67"},
+    {"path":"apps/gta-claw-daemon/src/adapters/legacy.rs","sha256":"9eaee9f4666b84d7f24177b06d5e96b91ee48cdb0ad2e9e0612c4208fe6aa0ef"},
+    {"path":"crates/claw-http-api/tests/legacy_http.rs","sha256":"70987ea832c3cb98531f401e107091c353d9c314dee05dc2516135456977c606"}
+  ],
+  "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p claw-channels -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":445, "failed":0, "ignored":4, "testBinaries":27,
+      "log":"target/native-whatsapp-status-tests-20260914T203633877Z.log",
+      "sha256":"bc2d4e0bee3c596e57e83e0f4c76bdbec6e602d3b3d1255c8bcf2c2cafc0513d"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p claw-channels -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-whatsapp-status-clippy-20260914T203744978Z.log",
+      "sha256":"592586e3687fc3a02121012c4d7e3befb16155350200693043eb764db438d74f"
+    }
+  ],
+  "behaviorEvidence": [
+    "whatsapp_delivery_updates_bind_phone_recipient_and_keep_only_bounded_status_metadata",
+    "cloud_delivery_statuses_are_receipt_bound_monotonic_and_never_resolve_unknown_claims",
+    "native_whatsapp_webhook_retains_confirmed_prefix_and_never_resends_after_restart",
+    "whatsapp_webhook_authenticates_bounded_raw_bytes_before_parse_and_scope"
+  ],
+  "notes": [
+    "New wamid receipts and their owner-bound lookup index commit atomically; callback writes only target known receipts",
+    "Independent latest sent/delivered/read/failed facts merge with CAS; duplicate and out-of-order callbacks do not lose progress",
+    "Failure text is discarded; conflicting delivery/failure reports are explicit and do not settle unknown local claims",
+    "Status-only webhooks do not enqueue or drain existing model input and cannot send replies",
+    "No new dependencies or changes to the existing Cargo.lock witness"
+  ],
+  "unverified": [
+    "live Cloud webhook subscription, signature and end-user delivery/read acceptance",
+    "pre-receipt callback recovery, old receipt index backfill and complete remote reconciliation",
+    "template and service-window rules, full account lifecycle, cross-platform/power-loss acceptance and whole-project completion"
+  ]
+}

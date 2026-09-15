@@ -30,8 +30,9 @@ pub use manifest::{
 pub use registry::{SkillDescriptor, SkillImplementation, descriptor, registry};
 pub use runtime::{
     CancellationToken, HttpBridge, HttpBridgeError, HttpRequest, HttpResponse, NativeRegistryError,
-    NativeSkillHandler, NativeSkillRegistry, SkillExecutionError, SkillRuntime, WasmHostError,
-    WasmHostErrorKind, WasmSkillHost, WasmSkillInvocation,
+    NativeSkillHandler, NativeSkillRegistry, PreparedSkillInvocation, SkillExecutionError,
+    SkillRuntime, WasmHostError, WasmHostErrorKind, WasmSkillHost, WasmSkillInvocation,
+    decode_http_response, prepare_skill_invocation,
 };
 pub use schema::{
     ParameterValidationError, ParameterViolation, ParameterViolationKind, SchemaError,

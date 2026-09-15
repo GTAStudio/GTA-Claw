@@ -9,8 +9,27 @@ use crate::model::ids::ApprovalId;
 /// Decisions travel back into the runtime through its approval broker, not through this port;
 /// the port only pushes state outward so a gateway, CLI, or GUI can render it.
 pub trait ApprovalPort: Send + Sync + 'static {
+    /// Mints an unpredictable one-use preview token in the host, outside the I/O-free runtime.
+    ///
+    /// The token must not be reused across requests or process restarts.
+    ///
+    /// # Errors
+    /// Refuses an unsupported adapter or an unavailable secure entropy source.
+    fn binding_token(&self) -> Result<String, PortError> {
+        Err(PortError::Unavailable("approval adapter cannot mint a secure preview binding".to_owned()))
+    }
+
     /// Announces a new outstanding request.
     fn present(&self, request: ApprovalRequest) -> PortFuture<'_, Result<(), PortError>>;
+
+    /// Presents an authenticated call without losing its caller claims.
+    ///
+    /// Adapters must opt in explicitly; falling back to anonymous presentation is forbidden.
+    fn present_authorized(&self, _request: ApprovalRequest, _authority: super::tool::InvocationAuthority) -> PortFuture<'_, Result<(), PortError>> {
+        Box::pin(std::future::ready(Err(PortError::Unavailable(
+            "approval adapter cannot preserve authenticated invocation authority".to_owned(),
+        ))))
+    }
 
     /// Announces that a request was answered and is no longer outstanding.
     fn settle(&self, approval_id: &ApprovalId) -> PortFuture<'_, Result<(), PortError>>;

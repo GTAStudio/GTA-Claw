@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "stage": "telegram-deferred-processing-and-credential-bound-durable-cursors",
+  "capturedAtUtc": "2026-09-14T18:35:48.0861280Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-state/src/runs.rs","sha256":"af775c634acac081af4571bb418b52e4adcb5651a0748e6a10f0eea01d772770"},
+    {"path":"crates/claw-channels/src/telegram.rs","sha256":"ac04d05f4bcebc5cc109f44bb7b6ce216ca45fa2a439233451c2bbc6dba10a67"},
+    {"path":"crates/claw-channels/tests/legacy_channel_compat.rs","sha256":"60b1f274111027d31847dd2c7a2d2c38e0357a1aa1eeaa959d60face64f1382f"},
+    {"path":"apps/gta-claw-daemon/src/adapters/channels.rs","sha256":"58e39fb12075abc3e1f6d6a4f01f8ac38d0dfb9f2e159e0cea85084bdb808758"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"3a1a7ba6a11f83be5dab8cb9c40b767d0211a29f66cfc6e03f3f0067f4e0d8d7"}
+  ],
+  "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p claw-channels -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":313, "failed":0, "ignored":4, "testBinaries":17,
+      "log":"target/native-telegram-cursor-tests-20260914T183442071Z.log",
+      "sha256":"13e9d55327aad89e7a46bb2f61d8840bb6b40b75bc0267b91f5d4c80ce1a4635"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p claw-channels -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-telegram-cursor-clippy-20260914T183540813Z.log",
+      "sha256":"6c63049e4474dc1e6b9761515bfa49fecbbd764e09c89e90720a93b8fca8177a"
+    }
+  ],
+  "behaviorEvidence": [
+    "telegram_provider_ack_waits_for_host_processing_and_replays_unsettled_batches",
+    "telegram_cursor_restore_is_startup_only_and_controls_the_first_poll",
+    "telegram_poll_cursors_are_bound_monotonic_atomic_and_persistent",
+    "telegram_poll_cursor_expiry_preserves_claims_and_allows_lower_new_update_ids",
+    "telegram_processing_loop_retains_failed_delivery_batch_without_resending"
+  ],
+  "notes": [
+    "Provider offset advances only after deferred host processing and a compared durable checkpoint",
+    "Cursor binding includes the exact credential/account/approved origin; token bytes are not persisted",
+    "One day without advancement or clock regression expires the cursor, not durable execution or delivery claims",
+    "Actual runtime shutdown/reopen and concurrent cursor scenarios each send the uncertain reply only once",
+    "Legacy Telegram polling API behavior is preserved; pending deferred batches cannot be bypassed",
+    "No new dependencies or changes to the existing Cargo.lock witness"
+  ],
+  "unverified": [
+    "real Telegram accounts, upstream retention and external exactly-once delivery",
+    "approved replay of dormant queued inputs outside provider retention and complete cross-bot account lifecycle",
+    "Discord persisted resume and complete remote per-segment receipt archives",
+    "physical power-loss guarantees, all-platform acceptance, deployment and whole-project completion"
+  ]
+}

@@ -35,6 +35,7 @@ members = [
   "crates/claw-runtime",
   "crates/claw-security",
   "crates/claw-skills",
+  "crates/claw-state",
   "crates/claw-tools",
   "crates/claw-worker",
 ]
@@ -70,6 +71,7 @@ claw-relay = { path = "crates/claw-relay", version = "0.1.0" }
 claw-runtime = { path = "crates/claw-runtime", version = "0.1.0" }
 claw-security = { path = "crates/claw-security", version = "0.1.0" }
 claw-skills = { path = "crates/claw-skills", version = "0.1.0" }
+claw-state = { path = "crates/claw-state", version = "0.1.0" }
 claw-tools = { path = "crates/claw-tools", version = "0.1.0" }
 serde = { version = "=1.0.229", features = ["derive"] }
 # `preserve_order` is not optional: `agent-client-protocol-schema` requires it,

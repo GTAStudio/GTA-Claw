@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use claw_conformance::{
     ClaimLevel, ConformanceError, Contract, Evidence, EvidenceGap, EvidenceState, EvidenceTotals,
-    FeatureClaim, ImplementationPointer, InventoryClaim, ParityStatus, Registry, ViolationCode,
-    discover_claim_files, generate_report,
+    FeatureClaim, ImplementationPointer, InventoryClaim, ParityStatus, Registry, ReleaseBaseline,
+    ViolationCode, discover_claim_files, generate_report,
 };
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -68,6 +68,122 @@ fn upstream_root() -> PathBuf {
 
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+}
+
+#[test]
+fn release_baseline_preserves_distinct_contract_and_acceptance_states() {
+    let frozen = Contract::load(upstream_root()).expect("load frozen contract");
+    let candidate = ReleaseBaseline::load(repository_root().join("compat/releases/v2026.9.4"))
+        .expect("load candidate release metadata");
+    assert_eq!(candidate.release_tag(), "v2026.9.4");
+    assert_eq!(candidate.gateway_version(), 4);
+    assert_ne!(candidate.commit_sha(), frozen.baseline_sha());
+    let report = serde_json::to_value(candidate).expect("serialize candidate");
+    assert_eq!(report["complete_contract"], false);
+    assert_eq!(report["locally_verified_signatures"], false);
+    assert_eq!(report["runtime_verified"], false);
+    assert_eq!(
+        report["normalized_artifact_sha256"]
+            .as_str()
+            .expect("digest")
+            .len(),
+        64
+    );
+}
+
+#[test]
+fn release_baseline_rejects_identity_protocol_and_evidence_drift() {
+    let original = fs::read(repository_root().join("compat/releases/v2026.9.4/baseline.json"))
+        .expect("read candidate metadata");
+    for (pointer, replacement) in [
+        ("/schema_version", serde_json::json!(2)),
+        ("/repository", serde_json::json!("other/openclaw")),
+        ("/package_version", serde_json::json!("2026.9.5")),
+        ("/release_tag", serde_json::json!("main")),
+        ("/commit_sha", serde_json::json!("0".repeat(40))),
+        ("/tree_sha", serde_json::json!("0".repeat(40))),
+        ("/tag_object_sha", serde_json::json!("0".repeat(40))),
+        ("/gateway/current", serde_json::json!(5)),
+        ("/gateway/minimum_general_client", serde_json::json!(3)),
+        ("/gateway/minimum_authenticated_node", serde_json::json!(2)),
+        ("/gateway/minimum_probe", serde_json::json!(2)),
+        (
+            "/evidence/commit_signature_verified",
+            serde_json::json!(false),
+        ),
+        ("/evidence/tag_signature_verified", serde_json::json!(false)),
+    ] {
+        let fixture = Fixture::empty();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&original).expect("parse metadata");
+        *value.pointer_mut(pointer).expect("existing field") = replacement;
+        fs::write(
+            fixture.root.join("baseline.json"),
+            serde_json::to_vec(&value).expect("encode"),
+        )
+        .expect("write mutation");
+        let error = ReleaseBaseline::load(&fixture.root).expect_err("reject release drift");
+        assert_eq!(error.code(), ViolationCode::ManifestDrift, "{pointer}");
+    }
+}
+
+#[test]
+fn release_baseline_rejects_fabricated_local_attestation_and_unknown_fields() {
+    let original = fs::read(repository_root().join("compat/releases/v2026.9.4/baseline.json"))
+        .expect("read candidate metadata");
+    for pointer in [
+        "/locally_verified_signatures",
+        "/runtime_verified",
+        "/evidence/method",
+    ] {
+        let fixture = Fixture::empty();
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&original).expect("parse metadata");
+        if pointer == "/evidence/method" {
+            value["evidence"]["method"] = serde_json::json!("local_crypto");
+        } else {
+            value[pointer.trim_start_matches('/')] = serde_json::json!(true);
+        }
+        fs::write(
+            fixture.root.join("baseline.json"),
+            serde_json::to_vec(&value).expect("encode"),
+        )
+        .expect("write mutation");
+        assert_eq!(
+            ReleaseBaseline::load(&fixture.root)
+                .expect_err("reject invented evidence")
+                .code(),
+            ViolationCode::JsonSchema
+        );
+    }
+}
+
+#[test]
+fn release_baseline_rejects_missing_oversized_and_duplicate_fields() {
+    let fixture = Fixture::empty();
+    assert_eq!(
+        ReleaseBaseline::load(&fixture.root)
+            .expect_err("missing metadata")
+            .code(),
+        ViolationCode::Io
+    );
+    fs::write(
+        fixture.root.join("baseline.json"),
+        vec![b' '; 1024 * 1024 + 1],
+    )
+    .expect("write oversized metadata");
+    assert!(ReleaseBaseline::load(&fixture.root).is_err());
+    let original =
+        fs::read_to_string(repository_root().join("compat/releases/v2026.9.4/baseline.json"))
+            .expect("read candidate metadata");
+    let duplicate = original.replacen('{', "{\"schema_version\":1,", 1);
+    fs::write(fixture.root.join("baseline.json"), duplicate).expect("write duplicate field");
+    assert_eq!(
+        ReleaseBaseline::load(&fixture.root)
+            .expect_err("duplicate field")
+            .code(),
+        ViolationCode::JsonSchema
+    );
 }
 
 fn copy_directory(source: &Path, destination: &Path) {

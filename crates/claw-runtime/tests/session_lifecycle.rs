@@ -349,15 +349,18 @@ async fn a_mutating_tool_turn_ends_in_completed_with_changes() {
 
     // The tool result reached the context engine, so the second round could see it.
     let items = harness.context.items();
-    assert!(items.contains(&ContextItem::ToolResult {
+    assert!(items.contains(&ContextItem::ToolCallResult {
+        call_id: support::call_id("call-1"),
         tool_name: "write_file".to_owned(),
         output: "written".to_owned(),
         failed: false,
     }));
     let second = &harness.provider.requests()[1];
     assert_eq!(second.round, 1);
+    assert!(second.messages.iter().any(|message| matches!(message, PromptMessage::Assistant { tool_calls, .. }
+        if tool_calls.len() == 1 && tool_calls[0].call_id == support::call_id("call-1") && tool_calls[0].arguments == "{\"path\":\"a\"}")));
     assert!(second.messages.contains(&PromptMessage::ToolResult {
-        call_id: support::call_id("result-write_file"),
+        call_id: support::call_id("call-1"),
         output: "written".to_owned(),
         failed: false,
     }));
@@ -503,6 +506,486 @@ async fn a_session_refuses_two_turns_at_once() {
     assert_eq!(outcome.state, SessionState::Cancelled);
 
     harness.runtime.shutdown().await.expect("shutdown is clean");
+}
+
+#[tokio::test]
+async fn observed_provider_budget_stops_new_rounds_and_never_estimates_missing_usage() {
+    use claw_application::ports::provider::{
+        ProviderResponseFinish, ProviderResponseReport, UsageReporting,
+    };
+
+    let report = ProviderResponseReport {
+        provider: "owned".to_owned(),
+        model: "owned".to_owned(),
+        response_id: None,
+        usage_reporting: UsageReporting::Complete,
+        input_tokens: 7,
+        output_tokens: 3,
+        cached_input_tokens: 2,
+        reasoning_tokens: 1,
+        finish_reason: ProviderResponseFinish::ToolCalls,
+    };
+    for (limit, expected_rounds) in [(0, 0), (9, 1), (10, 1), (11, 2)] {
+        let current = harness(
+            vec![
+                tool_round("owned-call", "read_file", "{}").reported(report.clone()),
+                text_round("final answer"),
+            ],
+            RuntimeConfig {
+                max_observed_provider_tokens: Some(limit),
+                ..RuntimeConfig::default()
+            },
+        );
+        let session_id = session("observed-budget");
+        let outcome = current
+            .runtime
+            .submit(&session_id, "owned")
+            .await
+            .expect("turn")
+            .join()
+            .await
+            .expect("bounded outcome");
+        assert_eq!(current.provider.requests().len(), expected_rounds);
+        assert_eq!(
+            current.tools.invoked().len(),
+            usize::from(expected_rounds > 0)
+        );
+        assert_eq!(
+            outcome.state,
+            if expected_rounds == 2 {
+                SessionState::Completed
+            } else {
+                SessionState::Blocked
+            }
+        );
+        assert_eq!(
+            current
+                .state
+                .turn(&session_id, outcome.turn)
+                .expect("terminal reports")
+                .provider_rounds
+                .len(),
+            expected_rounds
+        );
+        current.runtime.shutdown().await.expect("shutdown");
+    }
+    for reporting in [
+        None,
+        Some(UsageReporting::Unreported),
+        Some(UsageReporting::Partial),
+        Some(UsageReporting::Complete),
+    ] {
+        let mut first = tool_round("owned-call", "read_file", "{}");
+        if let Some(reporting) = reporting {
+            first = first.reported(ProviderResponseReport {
+                usage_reporting: reporting,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                reasoning_tokens: 0,
+                ..report.clone()
+            });
+        }
+        let current = harness(
+            vec![first, text_round("zero is explicitly reported")],
+            RuntimeConfig {
+                max_observed_provider_tokens: Some(1),
+                ..RuntimeConfig::default()
+            },
+        );
+        let outcome = current
+            .runtime
+            .submit(&session("unknown-budget"), "owned")
+            .await
+            .expect("turn")
+            .join()
+            .await;
+        let complete = reporting == Some(UsageReporting::Complete);
+        assert_eq!(outcome.is_ok(), complete);
+        assert_eq!(
+            current.provider.requests().len(),
+            if complete { 2 } else { 1 }
+        );
+        assert_eq!(current.tools.invoked().len(), 1);
+        current.runtime.shutdown().await.expect("shutdown");
+    }
+
+    for (second_tokens, limit, failed) in [(4, 14, false), (u64::MAX, u64::MAX, true)] {
+        let second = ProviderResponseReport {
+            input_tokens: second_tokens,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            reasoning_tokens: 0,
+            ..report.clone()
+        };
+        let current = harness(
+            vec![
+                tool_round("first-call", "read_file", "{}").reported(report.clone()),
+                tool_round("second-call", "read_file", "{}").reported(second),
+                text_round("must not request after accumulated threshold"),
+            ],
+            RuntimeConfig {
+                max_observed_provider_tokens: Some(limit),
+                ..RuntimeConfig::default()
+            },
+        );
+        let outcome = current
+            .runtime
+            .submit(&session("accumulated-budget"), "owned")
+            .await
+            .expect("turn")
+            .join()
+            .await;
+        assert_eq!(outcome.is_err(), failed);
+        if let Ok(outcome) = outcome {
+            assert_eq!(outcome.state, SessionState::Blocked);
+        }
+        assert_eq!(current.provider.requests().len(), 2);
+        assert_eq!(current.tools.invoked().len(), 2);
+        current.runtime.shutdown().await.expect("shutdown");
+    }
+}
+
+#[tokio::test]
+async fn provider_journal_failure_blocks_inference_or_tools_and_live_reports_precede_output() {
+    use claw_application::model::ids::TurnId;
+    use claw_application::ports::provider::{
+        ProviderResponseFinish, ProviderResponseReport, UsageReporting,
+    };
+    use claw_application::ports::state::StatePort as _;
+
+    let report = ProviderResponseReport {
+        provider: "owned-provider".to_owned(),
+        model: "owned-model".to_owned(),
+        response_id: Some("owned-response".to_owned()),
+        usage_reporting: UsageReporting::Complete,
+        input_tokens: 2,
+        output_tokens: 3,
+        cached_input_tokens: 0,
+        reasoning_tokens: 0,
+        finish_reason: ProviderResponseFinish::ToolCalls,
+    };
+    for rejected in [0, 1] {
+        let current = harness(
+            vec![tool_round("owned-call", "read_file", "{}").reported(report.clone())],
+            RuntimeConfig::default(),
+        );
+        current.state.reject_provider_journal_at(rejected);
+        let session_id = session("journal-refusal");
+        assert!(
+            current
+                .runtime
+                .submit(&session_id, "owned")
+                .await
+                .expect("turn")
+                .join()
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            current.provider.requests().len(),
+            usize::from(rejected == 1)
+        );
+        assert!(current.tools.invoked().is_empty());
+        let turn = current
+            .state
+            .turn(&session_id, TurnId::FIRST)
+            .expect("failure record");
+        assert!(turn.message.is_none());
+        assert!(
+            turn.provider_rounds
+                .iter()
+                .all(|round| round.response.is_none())
+        );
+        current.runtime.shutdown().await.expect("shutdown");
+    }
+
+    let current = harness(
+        vec![
+            Round::stalling(vec![ProviderChunk::TextDelta {
+                text: "owned partial".to_owned(),
+            }])
+            .reported(report.clone()),
+        ],
+        RuntimeConfig::default(),
+    );
+    let session_id = session("live-journal");
+    let mut turn = current
+        .runtime
+        .submit(&session_id, "owned")
+        .await
+        .expect("turn");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(event) = turn.next_event().await {
+            if matches!(event.kind, RuntimeEventKind::Stream(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("stream deadline");
+    let journal = current
+        .state
+        .load_provider_journal(&session_id, turn.turn())
+        .await
+        .expect("journal read")
+        .expect("live journal");
+    assert_eq!(journal.revision, 2);
+    assert!(!journal.closed);
+    assert_eq!(journal.rounds[0].response.as_ref(), Some(&report));
+    assert!(current.state.turn(&session_id, turn.turn()).is_none());
+    turn.cancel();
+    let outcome = turn.join().await.expect("cancelled outcome");
+    assert_eq!(outcome.state, SessionState::Cancelled);
+    assert!(
+        current
+            .state
+            .load_provider_journal(&session_id, outcome.turn)
+            .await
+            .expect("read")
+            .expect("journal")
+            .closed
+    );
+    current.runtime.shutdown().await.expect("shutdown");
+
+    let current = harness(
+        vec![text_round("must never be requested")],
+        RuntimeConfig::default(),
+    );
+    let (started, release) = current.state.gate_provider_journal();
+    let session_id = session("cancel-during-journal-write");
+    let turn = current
+        .runtime
+        .submit(&session_id, "owned")
+        .await
+        .expect("turn");
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("journal write started");
+    assert!(current.provider.requests().is_empty());
+    turn.cancel();
+    release.open();
+    let outcome = turn.join().await.expect("cancelled after durable intent");
+    assert_eq!(outcome.state, SessionState::Cancelled);
+    assert!(current.provider.requests().is_empty());
+    let journal = current
+        .state
+        .load_provider_journal(&session_id, outcome.turn)
+        .await
+        .expect("read")
+        .expect("intent");
+    assert!(journal.closed);
+    assert_eq!(journal.rounds.len(), 1);
+    assert!(journal.rounds[0].response.is_none());
+    current.runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn provider_round_accounting_survives_later_failure_without_inventing_missing_usage() {
+    use claw_application::ports::provider::{
+        ProviderResponseFinish, ProviderResponseReport, ProviderRoundRecord, UsageReporting,
+    };
+
+    let first = ProviderResponseReport {
+        provider: "owned-provider".to_owned(),
+        model: "actual-model".to_owned(),
+        response_id: Some("first-response".to_owned()),
+        usage_reporting: UsageReporting::Complete,
+        input_tokens: 11,
+        output_tokens: 3,
+        cached_input_tokens: 2,
+        reasoning_tokens: 1,
+        finish_reason: ProviderResponseFinish::ToolCalls,
+    };
+    let last = ProviderResponseReport {
+        response_id: Some("second-response".to_owned()),
+        input_tokens: 4,
+        output_tokens: 2,
+        cached_input_tokens: 0,
+        reasoning_tokens: 0,
+        finish_reason: ProviderResponseFinish::Length,
+        ..first.clone()
+    };
+    let harness = harness(
+        vec![
+            tool_round("owned-call", "read_file", "{}").reported(first.clone()),
+            Round::failing(
+                vec![ProviderChunk::TextDelta {
+                    text: "retained partial".to_owned(),
+                }],
+                PortError::Invalid("confirmed output limit".to_owned()),
+            )
+            .reported(last.clone()),
+        ],
+        RuntimeConfig::default(),
+    );
+    let session_id = session("provider-reports");
+    let turn = harness
+        .runtime
+        .submit(&session_id, "owned request")
+        .await
+        .expect("turn");
+    let turn_id = turn.turn();
+    assert!(turn.join().await.is_err());
+    let stored = harness
+        .state
+        .turn(&session_id, turn_id)
+        .expect("stored failed turn");
+    assert_eq!(
+        stored.provider_rounds,
+        vec![
+            ProviderRoundRecord {
+                round: 0,
+                response: Some(first)
+            },
+            ProviderRoundRecord {
+                round: 1,
+                response: Some(last)
+            }
+        ]
+    );
+    assert_eq!(stored.partial.expect("partial").text, "retained partial");
+    assert_eq!(harness.tools.invoked().len(), 1);
+    assert_eq!(harness.provider.requests().len(), 2);
+    harness.runtime.shutdown().await.expect("clean shutdown");
+
+    for reported in [false, true] {
+        let mut round = text_round("owned answer");
+        if reported {
+            round = round.reported(ProviderResponseReport {
+                provider: "owned-provider".to_owned(),
+                model: "actual-model".to_owned(),
+                response_id: None,
+                usage_reporting: UsageReporting::Complete,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                reasoning_tokens: 0,
+                finish_reason: ProviderResponseFinish::Stop,
+            });
+        }
+        let current = self::harness(vec![round], RuntimeConfig::default());
+        let session_id = session("reported-zero-or-missing");
+        let outcome = current
+            .runtime
+            .submit(&session_id, "owned")
+            .await
+            .expect("turn")
+            .join()
+            .await
+            .expect("complete");
+        let stored = current
+            .state
+            .turn(&session_id, outcome.turn)
+            .expect("durable record");
+        assert_eq!(stored.provider_rounds.len(), 1);
+        assert_eq!(stored.provider_rounds[0].response.is_some(), reported);
+        if let Some(report) = &stored.provider_rounds[0].response {
+            assert_eq!(report.usage_reporting, UsageReporting::Complete);
+            assert_eq!(report.input_tokens, 0);
+        }
+        current.runtime.shutdown().await.expect("clean shutdown");
+    }
+
+    let partial_report = ProviderResponseReport {
+        provider: "owned-provider".to_owned(),
+        model: "actual-model".to_owned(),
+        response_id: Some("partial-report".to_owned()),
+        usage_reporting: UsageReporting::Complete,
+        input_tokens: 1,
+        output_tokens: 1,
+        cached_input_tokens: 0,
+        reasoning_tokens: 0,
+        finish_reason: ProviderResponseFinish::Length,
+    };
+    let inconsistent = self::harness(
+        vec![text_round("cannot be complete").reported(partial_report.clone())],
+        RuntimeConfig::default(),
+    );
+    let session_id = session("inconsistent-response-terminal");
+    let turn = inconsistent
+        .runtime
+        .submit(&session_id, "owned request")
+        .await
+        .expect("admitted round");
+    let turn_id = turn.turn();
+    assert!(turn.join().await.is_err());
+    let stored = inconsistent
+        .state
+        .turn(&session_id, turn_id)
+        .expect("failed accounting record");
+    assert!(stored.message.is_none());
+    assert_eq!(
+        stored.partial.expect("partial preserved").text,
+        "cannot be complete"
+    );
+    assert_eq!(
+        stored.provider_rounds[0].response.as_ref(),
+        Some(&partial_report)
+    );
+    assert!(inconsistent.tools.invoked().is_empty());
+    inconsistent
+        .runtime
+        .shutdown()
+        .await
+        .expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn provider_failure_and_unmarked_eof_persist_partial_without_dispatching_tools() {
+    for terminal in ["provider", "eof", "invalid_chunk"] {
+        let mut chunks = vec![
+            ProviderChunk::TextDelta {
+                text: "owned partial response".to_owned(),
+            },
+            ProviderChunk::ToolCallBegin {
+                call_id: support::call_id("owned-call"),
+                name: "read_file".to_owned(),
+            },
+            ProviderChunk::ToolCallArgumentsDelta {
+                call_id: support::call_id("owned-call"),
+                fragment: "{\"path\":".to_owned(),
+            },
+        ];
+        if terminal == "invalid_chunk" {
+            chunks.push(ProviderChunk::MessageEnd);
+        }
+        let round = if terminal == "provider" {
+            Round::failing(
+                chunks,
+                claw_application::ports::PortError::Invalid("provider token limit".to_owned()),
+            )
+        } else {
+            Round::new(chunks)
+        };
+        let harness = harness(vec![round], RuntimeConfig::default());
+        let session_id = session(&format!("failed-partial-{terminal}"));
+        let handle = harness
+            .runtime
+            .submit(&session_id, "owned request")
+            .await
+            .expect("turn accepted");
+        let turn = handle.turn();
+        assert!(
+            handle.join().await.is_err(),
+            "failed stream must remain a failed turn"
+        );
+        let record = harness
+            .state
+            .turn(&session_id, turn)
+            .expect("failed turn receipt persisted");
+        assert!(record.message.is_none());
+        let partial = record.partial.expect("failed partial retained");
+        assert_eq!(partial.text, "owned partial response");
+        assert_eq!(partial.pending_tool_calls.len(), 1);
+        assert_eq!(
+            partial.pending_tool_calls[0].partial_arguments,
+            "{\"path\":"
+        );
+        assert!(harness.tools.invoked().is_empty());
+        assert_eq!(harness.provider.requests().len(), 1);
+        harness.runtime.shutdown().await.expect("clean shutdown");
+    }
 }
 
 #[tokio::test]

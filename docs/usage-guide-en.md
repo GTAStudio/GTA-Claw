@@ -43,9 +43,9 @@ real partial production composition. What works today is:
   configuration reload and a provable shutdown drain.
 - **Applying a signed update** with the standalone updater.
 
-The CLI still has no chat command, and the daemon is not parity-complete. In particular, session and
-turn state is not durable, interactive approvals and `claw-tools` are not composed, and skill
-execution is not dispatched. The legacy Node service in `src/` remains while those gaps and the
+The CLI now has native send/history/abort/approval commands, and the daemon persists session/turn
+state and context checkpoints in redb. Full recovery, caller binding, `claw-tools` and skill
+execution are still incomplete. The legacy Node service in `src/` remains while those gaps and the
 frozen compatibility-evidence obligations are closed; see
 [legacy-node-port-obligations.md](legacy-node-port-obligations.md).
 
@@ -55,7 +55,7 @@ frozen compatibility-evidence obligations are closed; see
 
 | Requirement | Detail |
 |---|---|
-| Rust toolchain | Pinned to `1.97.1` by `rust-toolchain.toml`; `rustup` picks it up automatically inside the repository. The minimum supported version is `1.94.0`. |
+| Rust toolchain | Development pin `1.98.1`; declared MSRV stays `1.94.0`, not freshly verified for this increment. Protected packaging policy still pins `1.97.1` and requires a reviewed upgrade before release. |
 | Platforms | The root workspace builds on Linux, macOS and Windows. The desktop shell builds on **Windows and macOS only** — a Linux desktop build is rejected on purpose. |
 | A Gateway | The CLI, TUI and desktop shell are clients. You need a reachable OpenClaw Gateway v4 endpoint (`ws://` or `wss://`) for them to do anything interesting. |
 
@@ -70,7 +70,7 @@ policy rejects it as a test failure.
 git clone https://github.com/GTAStudio/GTA-Claw.git
 cd GTA-Claw
 
-# Root workspace: all 31 library crates and 6 binaries
+# Root workspace: 32 library crates and 6 application members
 cargo build --workspace
 cargo test  --workspace
 ```
@@ -123,7 +123,7 @@ usage:
       [--allow-insecure-remote-ws] [--json]
 ```
 
-`--help` and `-h` print that usage text. There are no other commands and no other flags.
+`--help` and `-h` print the current usage text, including native business commands.
 
 ### 3.1 `health` — local runtime health
 
@@ -136,19 +136,22 @@ It contacts nothing. Exit code `0`.
 
 An unknown command exits `2` with `error: unknown command` on standard error.
 
-### 3.2 `send` — deliberately unsupported
+### 3.2 Native Gateway Commands
 
 ```sh
-gta-claw-cli send session-9 "hello"
+gta-claw-cli send session-9 "hello" --idempotency-key message-1 --endpoint ws://127.0.0.1:18789 --ephemeral-device
 ```
 
-This exits `8` with `error: unsupported operation: message transport is not configured`. That is the
-correct current behavior, not a bug: no message transport adapter is composed yet, and the CLI
-refuses to imply that a message was accepted.
+Use `--token-stdin` when required; shared credentials never bypass device pairing. Native commands
+also include `gateway sessions`, `history`, `abort`, `approvals`, `approval`, `approve` and `deny`.
+They request exact minimum scopes and return separate schema-v1 JSON. Send returns an admission
+receipt, not a completed answer; current daemon acceptance/dedupe is process-local and explicitly
+not durable. Persistent CLI identity and manual-pairing onboarding remain unfinished. See the
+[CLI guide](../apps/gta-claw-cli/README.md) for syntax, credential intake and output limits.
 
 ### 3.3 `gateway health` — the real Gateway diagnostic
 
-This is the one command that performs real network work. It opens one `ws://` or `wss://`
+This diagnostic opens one `ws://` or `wss://`
 connection, completes the authenticated Gateway v4 challenge/connect/hello flow, sends one
 `operator.read` `health` RPC, and shuts down cleanly within bounds.
 
@@ -297,6 +300,11 @@ Set GTA_CLAW_GATEWAY_TOKEN for authenticated Gateways.
 
 `--help` and `-h` print that text and exit `0`. An unknown argument exits `2`.
 
+For the native daemon, `--device-profile work` explicitly retains the same device identity in
+Windows/macOS protected storage. It never stores the shared token or falls back silently to an
+ephemeral identity. Without the option, identity is temporary and changes on connection recreation.
+Pair the requested device/scopes with an administrator; persisted identity is not automatic trust.
+
 ### 4.1 Launching
 
 ```sh
@@ -334,6 +342,9 @@ GTA_CLAW_GATEWAY_TOKEN='…' gta-claw-tui --gateway wss://gateway.example.test
 Tab / Shift-Tab   cycle screens
 Up/Down or j/k    select and scroll
 Enter             open session / submit answer
+c / i             new session / compose message
+Shift-Enter       newline while composing
+x                 cancel the exact observed native run
 y / n             approve / deny
 r                 refresh from Gateway
 Ctrl-P or :       command palette
@@ -347,7 +358,34 @@ q / Ctrl-C        quit safely
 
 Press `:` or `Ctrl-P`, type a command, press Enter. Recognized commands, case-insensitive:
 
-`sessions`, `workspace`, `runs`, `diff`, `artifacts`, `help`, `refresh`, `quit` (or `q`).
+`sessions`, `workspace`, `runs`, `diff`, `artifacts`, `help`, `refresh`, `quit` (or `q`),
+`new`, `message`, `send`, `run`, `partial`, `partial-next`, `cancel`, `retry-send`.
+
+`discard-draft` explicitly clears unsubmitted input. `discard-send` clears a retained submission
+only when every attempt is known not to have been sent; queued or possibly delivered input cannot
+be discarded through that command. The memory actions below preserve their structured type on retry.
+
+Native sends retain a random idempotency key until a durable receipt is received. Unknown delivery
+blocks another send; `retry-send` explicitly reuses the original session/text/key. Reconnection
+never automatically resends an old effectful command. Selecting a native session loads retained
+history and paged pending/active runs. Complete results are acknowledged at their exact revision
+after the workspace render pass. Outcome unknown is distinct from ordinary failure and must be
+reconciled before repeating effects. Diff/artifact availability still depends on the server.
+
+For a selected native terminal run, `partial` reads the first retained visible-text page and
+`partial-next` explicitly reads its continuation. Use `run` first when the terminal revision has not
+been observed. Each page is at most 2048 UTF-8 bytes from a retained result of at most 4 MiB. Requests
+are tied to the observed connection, session, run, turn, revision and terminal state; continuations
+also pin the original length and digest. Changing the selection or revision invalidates the cursor.
+
+Partial text is shown as unconfirmed data with its original byte range, never as a complete
+assistant answer. Viewing a page does not create an ACK or permit execution/replay; the established
+post-render ACK policy for complete terminal receipts is unchanged. Control text is sanitized for
+display after validating the original bytes. Empty retained text is valid; missing text is refused.
+A whole single-page result has its SHA256 checked. Later pages pin the whole-content digest but do
+not independently verify it, and the transcript remains a bounded view, not a complete archive.
+Use [CLI export-partial](../apps/gta-claw-cli/README.md#retained-partial-text) to collect and verify
+the entire retained text. See the [TUI record](ledger/native-tui-partial-20260915.json).
 
 Anything else reports `Unknown command: …` in the notice line. `Esc` closes the palette.
 
@@ -357,6 +395,55 @@ Anything else reports `Unknown command: …` in the notice line. `Esc` closes th
 instead of entering the full-screen loop: the TUI connects, waits up to five seconds for the session
 list, prints one rendered frame and exits. If the Gateway does not answer in time it prints
 `Gateway snapshot timed out` in the notice line. This is the mode to use in scripts and CI.
+
+### 4.6 Explicit Memory
+
+Start with `gta-claw-tui --device-profile work` against a native daemon whose explicit
+`GTA_CLAW_MEMORY_POLICY` is `{"schemaVersion":1,"enabled":true}`. A temporary device identity is
+refused for memory commands. The worker checks native model-free memory capabilities on the same
+ready connection before `chat.send`; unsupported peers receive no memory submission. Ordinary
+chat input containing a direct `!tool` line is refused, including uppercase spellings.
+
+Select a session, or let the first memory action create a draft session, then use the palette:
+
+```text
+memory list [limit [after-id notebook-revision]]
+memory get note-id [note-revision offset]
+memory search [limit]
+memory save note-id fact|preference|procedure expected-notebook-revision
+memory delete note-id expected-notebook-revision
+memory export notebook-revision [offset]
+memory import expected-notebook-revision [overwrite]
+```
+
+Action names are case-insensitive; note IDs and input retain their exact case. Kind values and
+`overwrite` are lowercase literals. Save opens a note editor, search opens query input, and import
+opens archive JSON input. Enter submits; Shift-Enter adds a newline. On terminals supporting
+bracketed paste, a multiline paste is a single data-only operation and never submits itself;
+an oversized paste or forbidden control character rejects the entire paste. Esc suspends the draft,
+and `i` reopens it in its original session. Switching sessions cannot redirect a memory draft.
+
+All actions, including reads, still require the existing complete bound approval preview and an
+explicit operator decision. Results appear in Workspace and use the same durable run/recovery/ACK
+path as native chat. A refused preflight is shown as not sent, but a refused retry cannot erase an
+earlier unknown attempt. `retry-send` retains the original command/session/key and never approves
+automatically. Unsubmitted drafts and unconfirmed keys are retained only within the running TUI
+process; there is no local crash-recovery journal for them yet.
+
+List defaults to 16 entries (maximum 32); a continuation ID needs its notebook revision. Get
+returns up to 2048 UTF-8 bytes and needs the note revision for nonzero offsets. Search accepts
+4096 UTF-8 bytes and returns at most eight matches. Save accepts 8192 UTF-8 bytes; every fully
+encoded direct command, including JSON escaping, must fit 16 KiB. Revision zero is valid for an
+initial notebook, and correction/deletion/import use the exact current notebook revision.
+
+Export returns one plaintext, revision-pinned archive page with its full digest; it does not write
+an encrypted local file or automatically collect pages. Import accepts the closed schema-version-1
+[portable note archive](../apps/gta-claw-cli/README.md#explicit-memory-commands), rejecting duplicate
+or unknown fields, invalid note/source/revision data and oversized envelopes before submission.
+Existing IDs conflict unless `overwrite` is explicit, which still requires revision matching and
+approval. Note/notebook revisions are not run-result ACK revisions. Contents and source labels are
+untrusted data, not instructions or authority; no semantic/automatic recall or full historical
+erasure is implied. Native notebooks have the existing 256-notebook/256-note allocation limits.
 
 ---
 
@@ -422,9 +509,10 @@ Copilot, starts configured channel transports, and binds four listener surfaces:
 - the Gateway v4 server;
 - a separate loopback-only listener for the `/mcp` route.
 
-That fourth listener is bound and supervised but currently inaccessible. Production leaves both MCP
-bearer-token authenticators empty and wires no JWT authenticator, while the route authenticates
-before dispatch. Every MCP caller is therefore rejected.
+The fourth listener requires dedicated `GTA_CLAW_MCP_OWNER_TOKEN` and/or `GTA_CLAW_MCP_TOKEN`
+configuration. Owner and read-only tokens must differ, contain 1..=4096 ASCII bearer bytes and no
+whitespace/control characters. Missing credentials fail closed. Main HTTP credentials do not
+authenticate MCP; the read-only MCP role cannot execute writes.
 
 The four channel paths are conditional: Teams and WhatsApp are wired into the legacy HTTP facade,
 while Telegram and Discord are supervised outbound clients. A configured GitHub token activates
@@ -440,7 +528,7 @@ The complete option surface is:
 | `--legacy-listen ADDRESS` | Legacy HTTP bind. Default: loopback on `core.server.port`. A routable bind requires both a trusted TLS frontend and proxy-level caller authentication plus a strict route allowlist; the daemon's TLS assertion alone is insufficient. |
 | `--gateway-listen ADDRESS` | Gateway bind. Default: `127.0.0.1:0`. |
 | `--mcp-listen ADDRESS` | MCP bind. Default: `127.0.0.1:0`; non-loopback addresses are always rejected. This changes only the bound socket: without a production MCP token/JWT authenticator, every request is rejected. |
-| `--state-dir PATH` | State root; otherwise `GTA_CLAW_STATE_DIR`, then `$HOME/.gta-claw`. Pairings, security audit and goals are durable there, but sessions and turns are not. |
+| `--state-dir PATH` | State root; otherwise `GTA_CLAW_STATE_DIR`, then `$HOME/.gta-claw`. Pairing, audit, goals and `runtime.redb` session/turn/context checkpoints live here; cross-object recovery remains incomplete. |
 | `--log-file PATH` | Writes ordinary telemetry to the file instead of standard error. |
 | `--tls-terminated-by-frontend` | Asserts that a trusted frontend terminates TLS. It does not enable TLS or add caller authentication; it only passes the daemon's bind policy for routable main HTTP, legacy HTTP or Gateway addresses. |
 | `--smoke` | Uses the deterministic local install-diagnostic provider. Every explicitly selected listener must remain loopback. |
@@ -520,17 +608,15 @@ printf 'shutdown\n' | gta-claw-daemon
 
 ### 5.4 Current limits
 
-- **Sessions and turns are process-memory only.** `RuntimeStateStore` keeps both in a
-  `Mutex<HashMap>`; restarting the daemon loses them. This does not apply to the separately durable
-  Gateway pairing, security-audit and goal stores.
-- **There is no interactive approval surface.** The runtime is constructed with
-  `SilentApprovalPort`, which drops presentation notifications. The currently composed plugin tool
-  descriptors are marked as not requiring approval.
-- **The production MCP listener is inaccessible.** The socket is bound, but no MCP bearer credential
-  or JWT authenticator is wired, so the route rejects every caller before dispatch.
+- **Recovery is partial.** `runtime.redb` persists session/turn state and retained context checkpoints,
+  and reload/LRU eviction preserve stored history. Run/context/goal/outbox are not one atomic
+  transaction; durable admission, full archives and cross-platform fault recovery remain open.
+- **Approval policy is partial.** Gateway, CLI and Slint support once-scoped approvals with complete
+  redacted previews. Plugin tools require approval, but full caller/resource/version binding remains.
+- **MCP needs separate credentials.** Configure the dedicated owner/read-only tokens explicitly.
 - **`claw-tools` is not composed.** Tool execution is not wholly absent: signed plugin registrations
   and the durable goal tool are executable through the runtime and authenticated main HTTP surface.
-  They are not currently executable through MCP. The missing part is the `claw-tools` catalogue and
+  MCP owner calls share the plugin approval executor. The missing part is the `claw-tools` catalogue and
   its schemas, authorization, path confinement and validated network destinations.
 - **Skill execution and migration-evidence ingestion are not dispatched.** Startup counts
   `claw_skills::registry()` for inventory, but the production path has no caller for its
@@ -562,37 +648,77 @@ cargo run --manifest-path desktop/Cargo.toml -p gta-claw-desktop --release
 The window opens on a three-step first-run sequence — **Welcome → Authorize → Trust** — followed by
 the Gateway connection surface.
 
-Be aware of what is real here: the welcome, device-authorization and workspace-trust steps are a
-**presentational** onboarding sequence. The device code and workspace path shown on those screens
-are placeholder content, and clicking through them does not perform an account authorization. The
-step that does real work is the Gateway connection panel.
+Device authorization and workspace trust remain uncomposed and do not confer access. The Gateway
+panel performs real authentication, then the native product surface supports chat/history and
+once-scoped approvals. It starts with empty production models, not demo conversations or files.
 
 ### 6.2 Connecting
 
-The connection panel states its own scope: *"Connect performs the real challenge, connect, hello,
-and safe health flow."* It asks for:
+The connection panel performs the challenge/connect/hello and health flow. Product mode requests
+exactly `operator.read`, `operator.write` and `operator.approvals`, never `operator.admin`. It asks for:
 
 | Field | Notes |
 |---|---|
 | Gateway endpoint | Same validation rules as the CLI. |
 | Token | Session-only. The field is cleared the moment it is submitted and is never persisted. |
-| Ephemeral identity consent | An explicit checkbox: *"I consent to a new ephemeral device identity for this diagnostic session."* |
+| Ephemeral identity consent | Explicit consent to a session-only identity and chat/approval access. |
+| Remember device identity | Optional Windows/macOS protected `desktop` profile for the exact endpoint; does not persist the token or grant trust. Required for memory commands. |
 
 Buttons: **Connect**, **Retry**, **Cancel**, **Disconnect**.
 
 After connecting, the summary panel shows only bounded non-secret fields — endpoint, negotiated
-protocol, role, effective scopes, health and identity mode. Pairing may be required; the identity
-and any issued device token stay in bounded memory and are discarded on disconnect or app exit.
+protocol, role, effective scopes, health and identity mode. Pairing may be required. Without explicit
+remember-device consent, identity is temporary; a remembered identity uses the OS-protected profile
+and fails closed if it cannot be loaded. Issued device tokens remain bounded and process-local.
 
-The UI states its own boundary: *"This diagnostic does not enroll a persistent device, store
-credentials, or enable chat and account features."*
+Pending approvals are queried after reconnect, and approval is disabled until a complete bounded
+preview is available. Commands and results are tied to a connection epoch. Full streaming,
+history/event reconciliation, workspace trust and full credential lifecycle remain unfinished.
 
-### 6.3 Why there is no Linux build, and no mobile UI
+### 6.3 Platform Boundaries
 
 The desktop shell is a separate Cargo workspace because the repository's trusted supply-chain policy
-refuses a Slint dependency anywhere reachable from a root workspace member. The same policy is why
-`gta-claw-android` and `gta-claw-ios` are UI-independent client cores with no user interface in this
-repository. CI asserts both boundaries, including that a Linux desktop build fails.
+refuses a Slint dependency anywhere reachable from a root workspace member. Root Android/iOS client
+cores are UI-independent; separate `android/` and `ios/` workspaces contain Slint connection shells.
+Their platform bridges and complete product workflows remain incomplete. Linux desktop rejection
+and root Slint exclusion remain policy.
+
+### 6.4 Explicit Memory
+
+Connect with the saved-device option to a native daemon with explicit memory enabled, then open a
+Session and select the Memory toolbar control. Choose List, Read, Search, Save, Delete, Export or
+Import. The form keeps note ID, kind, notebook/note revision, byte offset and content separate;
+only fields used by the selected action are enabled. List's optional ID is the `after` cursor;
+Read uses a note revision, while save/delete/import use the current notebook revision. Import
+conflicts with existing IDs unless the explicit overwrite checkbox is selected. These are not
+run-result ACK revisions. All actions still require the normal complete bound approval preview.
+
+The controller verifies native model-free capabilities on the exact ready epoch before submitting,
+and refuses memory on temporary identities or unsupported peers. A raw direct-tool chat message
+cannot bypass those checks. JSON archives use the existing strict Gateway codec, so duplicate keys,
+invalid fields/revisions, oversized/deep data and unsupported versions are rejected before submit.
+Pretty-printed valid archives are safely encoded as a single direct command. Content remains
+untrusted data, never an extra directive. Note/query and final-envelope limits match the TUI guide.
+
+The form is bound to the displayed session and connection; changes close it and discard its local
+unsubmitted fields. Confirmed memory results appear in a separate scrollable, selectable, read-only
+area, without transcript-summary truncation, and are cleared on connection loss. An unknown send
+retains its original key and enables explicit original-request retry after the current attempt
+finishes. A refused retry does not erase earlier uncertainty. Complete durable receipts bind the
+key to its run; an early result event cannot release unconfirmed input. Existing approvals, durable
+result queries and exact ACK remain in use, without automatic approval or replay.
+
+The desktop uses the endpoint's protected `desktop` profile. Other profile names are distinct
+device identities and their notebooks are not automatically merged. Drafts, retained unconfirmed
+keys and the latest memory-result view are process-local; no crash journal is implemented.
+Export still returns plaintext pages with a revision/digest, not an automatically collected or
+encrypted local archive. Large staged imports, full provenance/deletion workflows and actual
+Windows/macOS interactive acceptance remain open. Local software-renderer tests do not replace
+those platform checks.
+
+For the separate CLI encrypted-file export/import workflow, see
+[Encrypted Memory Files](../apps/gta-claw-cli/README.md#encrypted-memory-files). It does not add
+automatic file transfer to the desktop form or remove per-page approval requirements.
 
 ---
 
@@ -720,7 +846,8 @@ numbers equal.
 
 State this plainly so nobody hunts for a flag that does not exist:
 
-- **No Rust chat command.** `gta-claw-cli send` fails on purpose.
+- **No complete CLI conversation workflow.** Native send/history/abort/approvals exist, but persistent
+  identity, pairing onboarding, streaming and durable run queries are not complete.
 - **No parity-complete Rust production service.** The daemon serves real transports, providers and
   four configured channel paths, but has the limitations listed in section 5.4.
 - **No transport for the other registered channels.** Teams, Telegram, Discord and WhatsApp are
@@ -730,7 +857,8 @@ State this plainly so nobody hunts for a flag that does not exist:
 - **No JavaScript skills.** Skill execution is native Rust, a declarative HTTP port, or a WebAssembly
   component. An embedded JavaScript engine will never be added.
 - **No durable device identity** for CLI or desktop; both are ephemeral-only today.
-- **No Android or iOS application** in this repository, and no Linux desktop build.
+- **No complete mobile product.** Android/iOS Slint connection shells exist; platform bridges,
+  credential storage and full conversation workflows are unfinished. Linux GUI remains unsupported.
 
 Current status per crate and binary: [PROGRESS.md](PROGRESS.md). Architecture and the reasoning
 behind these boundaries: [PROJECT_PLAN.md](PROJECT_PLAN.md).

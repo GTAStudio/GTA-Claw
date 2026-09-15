@@ -34,6 +34,7 @@ pub mod descriptor;
 pub mod github_copilot;
 pub mod openai_compatible;
 pub mod registry;
+pub mod responses;
 pub mod routing;
 pub mod runtime;
 

@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "stage": "model-free-memory-client-and-portable-notes",
+  "capturedAtUtc": "2026-09-14T16:23:18.0882776Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceWitness": {
+    "count": 664,
+    "sha256": "54a222a60addc19abc38b3a6ac70af813df370386354a6c84bddef342eb84884",
+    "inventory": "git ls-files --cached --others --exclude-standard -- *.rs *.toml *.lock; unique ordinal path order",
+    "encoding": "UTF-8 concatenated relative path + NUL + lowercase file SHA256 + LF",
+    "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+    "capturedAfterChecks": true
+  },
+  "checks": [
+    {
+      "command": "cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p claw-runtime -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result": "passed", "passed": 535, "failed": 0, "ignored": 5, "testBinaries": 25,
+      "log": "target/native-memory-client-tests-20260914T162040095Z.log",
+      "sha256": "26ce6515ed79e60e65a1f36f4ea6f2f77f941ab5d44e5b640f8e5e6da547493b"
+    },
+    {
+      "command": "cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p claw-runtime -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result": "passed",
+      "log": "target/native-memory-client-clippy-20260914T161827117Z.log",
+      "sha256": "5800f43aa9fc2f4f5f2d01628bcae1bc4a642342e6382d89366dd9ac1e0ab24a"
+    },
+    {
+      "command": "cargo +stable check --manifest-path D:/GTA-Claw/Cargo.toml --workspace --all-targets --locked --offline",
+      "result": "passed",
+      "log": "target/native-memory-client-workspace-check-20260914T161852928Z.log",
+      "sha256": "1904d66677cda80ba18611637180f591c8347a397ec633050477a326b4e4b70a"
+    }
+  ],
+  "behaviorEvidence": [
+    "direct_tool_turns_use_bound_approval_without_model_rounds",
+    "direct_tool_turns_refuse_anonymous_and_readonly_before_state_writes",
+    "direct_tool_write_cancellation_keeps_unknown_without_model_retry",
+    "explicit_tool_directive_is_bounded_redacted_and_not_mixed_with_chat",
+    "native_memory_commands_verify_capabilities_before_sending_once",
+    "memory_request_stdin_separates_credentials_and_rejects_ambiguous_frames",
+    "explicit_memory_archive_import_is_atomic_revisioned_and_destination_scoped",
+    "native_memory_export_pages_roundtrip_and_import_without_identity_grants",
+    "bound_direct_memory_runs_are_model_free_approved_and_durable"
+  ],
+  "notes": [
+    "Gateway core method inventory, protected policy, legacy fixtures and Cargo.lock were not changed by this increment",
+    "Health preserves its original handler and scope checks, with a native capability extension",
+    "Actual CLI fixtures use separately named OS profiles and clean them up",
+    "Actual daemon direct-memory workflow has two restarts and zero model generation requests",
+    "Known runtime Blocked outcomes map to the existing durable failed status instead of false outcome_unknown",
+    "Expected CLI async-runtime-initialization fault diagnostic is from its passing negative test",
+    "Source witness is post-check and does not freeze concurrently changing inputs"
+  ],
+  "unverified": [
+    "automatic client-side archive page assembly and encrypted output",
+    "large multi-stage memory imports above the 16 KiB command envelope",
+    "dedicated TUI/Slint memory-management views and complete onboarding",
+    "semantic memory, automatic recall and global notebook quotas",
+    "deletion propagation across old history, backups and external model disclosures",
+    "independent UI workspaces, real accounts and device acceptance",
+    "complete OpenClaw interoperability, release policy upgrade and whole-project completion"
+  ]
+}

@@ -21,13 +21,36 @@ use crate::http_support::rejected_response;
 use crate::ports::{AuditPort, PortError};
 
 /// Authenticated HTTP principal.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Principal {
     /// Closed Gateway role.
     pub role: Role,
     /// Closed granted operator scopes.
     pub scopes: ScopeSet,
     pub(crate) subject: [u8; 32],
+}
+
+impl Debug for Principal {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Principal").field("role", &self.role)
+            .field("scopes", &self.scopes).finish_non_exhaustive()
+    }
+}
+
+impl Principal {
+    pub(crate) fn tool_authority(self, source: claw_application::ports::tool::InvocationSource) -> claw_application::ports::tool::InvocationAuthority {
+        use claw_application::ports::tool::{InvocationAccess, InvocationAuthority};
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut hash = Sha256::new();
+        hash.update(b"gta-claw.authenticated-tool-subject.v1\0");
+        hash.update(self.subject);
+        let subject: String = hash.finalize().iter().flat_map(|byte| [HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 15)]]).map(char::from).collect();
+        let access = if self.role != Role::Operator { InvocationAccess::ReadOnly }
+            else if self.scopes.contains(Scope::OperatorAdmin) { InvocationAccess::Owner }
+            else if self.scopes.contains(Scope::OperatorWrite) { InvocationAccess::Execute }
+            else { InvocationAccess::ReadOnly };
+        InvocationAuthority::new(source, &subject, None, access, 0).expect("fixed bounded authenticated subject")
+    }
 }
 
 /// One pre-hashed bearer credential.

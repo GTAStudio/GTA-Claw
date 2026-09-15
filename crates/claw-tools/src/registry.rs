@@ -85,6 +85,23 @@ impl ToolRegistry {
         })
     }
 
+    /// Validates arguments and derives their resource without minting authorization or executing.
+    ///
+    /// # Errors
+    /// Refuses unknown tools, invalid arguments and resources outside the sandbox contract.
+    pub fn prepare(
+        &self,
+        name: &str,
+        arguments: &Value,
+        context: &ToolContext<'_>,
+    ) -> Result<(ToolDescriptor, Resource), ToolError> {
+        let tool = self.tools.get(name).ok_or(ToolError::UnknownTool)?;
+        let descriptor = tool.descriptor();
+        let validated = descriptor.schema.validate(arguments)?;
+        let resource = tool.resource(&validated, context)?;
+        Ok((descriptor, resource))
+    }
+
     /// Validates, authorizes, audits, and runs exactly one tool invocation.
     ///
     /// Failure at any gate is terminal: no partial execution occurs, and the

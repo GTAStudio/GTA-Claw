@@ -568,18 +568,26 @@ impl ProviderPort for ScriptedRuntime {
                 .push(request);
             match self.script.generate.as_ref() {
                 None => Ok(GenerationOutput {
+                    usage_reporting: claw_http_api::UsageReporting::Complete,
                     text: "deterministic response".to_owned(),
                     tool_calls: Vec::new(),
                     usage: UsageSpec::default().usage(),
+                    finish_reason: claw_http_api::GenerationFinishReason::Stop,
                 }),
                 Some(GenerateScript::Output {
                     text,
                     tool_calls,
                     usage,
                 }) => Ok(GenerationOutput {
+                    usage_reporting: claw_http_api::UsageReporting::Complete,
                     text: text.clone(),
                     tool_calls: tool_calls.iter().map(ToolCallSpec::tool_call).collect(),
                     usage: usage.usage(),
+                    finish_reason: if tool_calls.is_empty() {
+                        claw_http_api::GenerationFinishReason::Stop
+                    } else {
+                        claw_http_api::GenerationFinishReason::ToolCalls
+                    },
                 }),
                 Some(GenerateScript::Error { error }) => Err(error.port_error()),
             }
@@ -591,7 +599,7 @@ impl ProviderPort for ScriptedRuntime {
         request: GenerationRequest,
         events: mpsc::Sender<GenerationEvent>,
         _cancellation: CancellationToken,
-    ) -> PortFuture<'_, Result<Usage, PortError>> {
+    ) -> PortFuture<'_, Result<claw_http_api::GenerationSummary, PortError>> {
         Box::pin(async move {
             self.generation_requests
                 .lock()
@@ -626,7 +634,18 @@ impl ProviderPort for ScriptedRuntime {
                 }
                 self.stream_events_delivered.fetch_add(1, Ordering::AcqRel);
             }
-            outcome
+            outcome.map(|usage| claw_http_api::GenerationSummary {
+                usage,
+                usage_reporting: claw_http_api::UsageReporting::Complete,
+                finish_reason: if scripted
+                    .iter()
+                    .any(|event| matches!(event, StreamEventSpec::ToolCall(_)))
+                {
+                    claw_http_api::GenerationFinishReason::ToolCalls
+                } else {
+                    claw_http_api::GenerationFinishReason::Stop
+                },
+            })
         })
     }
 

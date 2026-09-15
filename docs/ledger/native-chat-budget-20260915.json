@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-chat-usage-and-output-budgets",
+  "capturedAtUtc": "2026-09-15T04:22:00.1721774Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-providers/src/openai_compatible.rs","sha256":"630d46bd76dedfe213a0572e7ed25bd8f02d2699443d5f3efc627725068987ea"},
+    {"path":"crates/claw-providers/tests/wire.rs","sha256":"0dcbef8cb4edebb9907acf7198aa7f369106d4a84dcd0510ca2a71f19a546d27"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-provider-sdk -p claw-providers -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":707, "failed":0, "ignored":5, "testBinaries":17,
+      "log":"target/native-chat-budget-tests-20260915T041942507Z.log",
+      "sha256":"021cdd464430713b20cb655faa6571d215fbf409709f6d172379f1500d9187db"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-providers -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-chat-budget-clippy-20260915T041912051Z.log",
+      "sha256":"3ce10c4a4a70391d71fe674cc4ece1f3479721f187709071c07109d6507625f0"
+    }
+  ],
+  "behaviorEvidence": [
+    "chat_usage_totals_details_and_cumulative_updates_are_validated",
+    "chat_output_budget_counts_utf8_and_shared_text_reasoning_and_arguments",
+    "chat_usage_error_preserves_preceding_events_in_the_same_chunk",
+    "chat_http_done_usage_and_output_limits_close_and_release_capacity"
+  ],
+  "localFailureObservation": {
+    "test":"chat_http_done_usage_and_output_limits_close_and_release_capacity",
+    "initialResult":"failed: owned stream terminates within bounded fixture deadline: Elapsed(())",
+    "causeAndCorrection":"The fixture sleeps after each HTTP frame. The initial 512 separately delayed frames exhausted the 5-second deadline on Windows. Combining the same SSE events into one HTTP reply frame removed those unrelated per-frame delays; the 5-second deadline and actual 4-MiB decoded-output assertion were unchanged. The same narrow test then passed in 0.14 seconds."
+  },
+  "notes": [
+    "Chat usage validates total=input+output, cache/reasoning subset bounds, checked integer sums and cumulative nondecrease; omitted fields preserve previous counters",
+    "The same wire usage validation applies to embeddings and Copilot uses the shared Chat decoder; all remain in the regression scope",
+    "Buffered Chat body is limited to 8 MiB; decoded text/reasoning/arguments total 4 MiB, with 1024 functions and 1 MiB per argument document",
+    "Streaming counts accepted UTF-8 output bytes across events and fields, preserving partial output but refusing success when the bound is exceeded",
+    "DONE fuses the stream and releases its transport without waiting for remote EOF; valid earlier events in the same chunk precede a later error",
+    "The real HTTP fixture reaches the actual aggregate decoded-output budget, not an unrelated framing limit, and verifies no retry plus retained-stream single-slot release",
+    "Missing usage remains compatible and is not represented as proof of free or completely accounted inference",
+    "No dependencies, production services, real accounts, browser execution, deployment or Git writes changed"
+  ],
+  "unverified": [
+    "Complete usage-known provenance and monetary cost computation in application/runtime/persistence",
+    "Durable paid-request unknown receipts, provider/account generation switching and full model capability configuration",
+    "Reasoning continuation, real-provider/platform acceptance and the two unresolved prior native-credential anomalies",
+    "Complete build manifests, MSRV/release and whole-project acceptance"
+  ]
+}

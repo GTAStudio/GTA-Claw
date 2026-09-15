@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-http-wasm-skills-and-device-scoped-run-events",
+  "capturedAtUtc": "2026-09-14T14:11:18.6079897Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceWitness": {
+    "count": 662,
+    "sha256": "1175ae78364cbd4509d3ac7d3b4c91f221348d9a40010327a0c9269d29348660",
+    "inventory": "git ls-files --cached --others --exclude-standard -- *.rs *.toml *.lock; unique ordinal path order",
+    "encoding": "UTF-8 concatenated relative path + NUL + lowercase file SHA256 + LF",
+    "cargoLockSha256": "dc07f894a6d396750ae57a7abbbfda97e65012bff5447a8de97375cdf0425308"
+  },
+  "checks": [
+    {
+      "command": "cargo +stable test -p claw-gateway -p claw-skills -p claw-plugin-host -p gta-claw-daemon --all-targets --locked --quiet",
+      "result": "passed", "passed": 606, "failed": 0, "ignored": 4, "testBinaries": 39,
+      "log": "target/native-skills-device-events-tests-20260914T220936193.log",
+      "sha256": "4917256bb6c8a50ebae6c7095bae22703dcb8a8ce465a83f3b6d20a0dade5f54"
+    },
+    {
+      "command": "cargo +stable clippy -p claw-gateway -p claw-skills -p claw-plugin-host -p gta-claw-daemon --all-targets --locked -- -D warnings",
+      "result": "passed", "log": "target/native-skills-device-events-clippy-20260914T221056788.log",
+      "sha256": "d52d7e00a5c6467f3982f354679153250f226ed2e636e9b894e70d1f24aa4a13"
+    }
+  ],
+  "notes": ["Existing uncomposed NativeSkills code and concurrent local lifecycle fixes were retained and integrated", "The Wasm positive test uses a locally signed derivative of the existing probe component, not an upstream plugin port"],
+  "unverified": ["all bundled or upstream skills ported", "arbitrary HTTP skill methods and proxy modes", "production public network endpoints", "real model/channel accounts", "whole-project completion", "cross-platform execution", "complete upstream interoperability"]
+}

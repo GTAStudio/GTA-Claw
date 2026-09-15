@@ -87,6 +87,93 @@ pub enum HttpClientError {
     /// A buffered response exceeded the configured bound.
     #[error("HTTP response body exceeded {0} bytes")]
     BodyTooLarge(usize),
+    /// A request or route differs from the explicitly enrolled transport policy.
+    #[error("HTTP route is outside its approved endpoint or proxy policy")]
+    RoutePolicy,
+}
+
+/// One exact MCP endpoint and an explicit route, independent of proxy environment variables.
+#[derive(Clone, Debug)]
+pub struct HttpRoutePolicy {
+    endpoint: Url,
+    proxy: Option<Url>,
+}
+
+impl HttpRoutePolicy {
+    /// Enrolls direct HTTP access to a literal loopback endpoint only.
+    ///
+    /// # Errors
+    /// Rejects non-loopback hosts, URL credentials, fragments, queries or unsupported schemes.
+    pub fn direct_loopback(endpoint: Url) -> Result<Self, HttpClientError> {
+        if endpoint.scheme() != "http" || !endpoint.host_str().is_some_and(is_literal_loopback_host)
+        {
+            return Err(HttpClientError::RoutePolicy);
+        }
+        validate_route_url(&endpoint)?;
+        Ok(Self {
+            endpoint,
+            proxy: None,
+        })
+    }
+
+    /// Enrolls an HTTPS endpoint reached only through a literal loopback HTTP CONNECT proxy.
+    ///
+    /// The proxy is trusted to resolve the remote host; no direct fallback is permitted.
+    ///
+    /// # Errors
+    /// Rejects insecure targets, ambiguous URLs, URL credentials and non-loopback proxies.
+    pub fn https_via_proxy(endpoint: Url, proxy: Url) -> Result<Self, HttpClientError> {
+        validate_route_url(&endpoint)?;
+        validate_route_url(&proxy)?;
+        if endpoint.scheme() != "https"
+            || endpoint.host_str().is_some_and(is_literal_loopback_host)
+            || proxy.scheme() != "http"
+            || !proxy.host_str().is_some_and(is_literal_loopback_host)
+            || proxy.port().is_none()
+            || proxy.path() != "/"
+        {
+            return Err(HttpClientError::RoutePolicy);
+        }
+        Ok(Self {
+            endpoint,
+            proxy: Some(proxy),
+        })
+    }
+
+    /// Returns the only URL to which this policy permits MCP requests.
+    #[must_use]
+    pub const fn endpoint(&self) -> &Url {
+        &self.endpoint
+    }
+
+    fn matcher(&self) -> Result<Arc<Matcher>, HttpClientError> {
+        let matcher = self.proxy.as_ref().map_or_else(
+            || Matcher::builder().build(),
+            |proxy| Matcher::builder().https(proxy.as_str()).build(),
+        );
+        let uri: Uri = self
+            .endpoint
+            .as_str()
+            .parse()
+            .map_err(|_| HttpClientError::RoutePolicy)?;
+        if self.proxy.is_some() != matcher.intercept(&uri).is_some() {
+            return Err(HttpClientError::RoutePolicy);
+        }
+        Ok(Arc::new(matcher))
+    }
+}
+
+fn validate_route_url(url: &Url) -> Result<(), HttpClientError> {
+    if url.as_str().len() > 2048
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(HttpClientError::RoutePolicy);
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -94,6 +181,7 @@ pub(crate) struct HttpClient {
     inner: HyperClient,
     proxy_matcher: Arc<Matcher>,
     request_timeout: Duration,
+    route: Option<HttpRoutePolicy>,
 }
 
 impl HttpClient {
@@ -105,6 +193,17 @@ impl HttpClient {
             connector,
             proxy_matcher,
         ))
+    }
+
+    pub(crate) fn with_route(
+        request_timeout: Duration,
+        route: HttpRoutePolicy,
+    ) -> Result<Self, HttpClientError> {
+        let proxy_matcher = route.matcher()?;
+        let connector = HttpsConnector::new(request_timeout, Arc::clone(&proxy_matcher))?;
+        let mut client = Self::with_connector(request_timeout, connector, proxy_matcher);
+        client.route = Some(route);
+        Ok(client)
     }
 
     fn with_connector(
@@ -120,6 +219,7 @@ impl HttpClient {
             inner,
             proxy_matcher,
             request_timeout,
+            route: None,
         }
     }
 
@@ -154,6 +254,13 @@ impl HttpClient {
         mut headers: HeaderMap,
         body: Vec<u8>,
     ) -> Result<HttpResponse, HttpClientError> {
+        if self
+            .route
+            .as_ref()
+            .is_some_and(|route| route.endpoint != *url)
+        {
+            return Err(HttpClientError::RoutePolicy);
+        }
         if !matches!(url.scheme(), "http" | "https") {
             return Err(HttpClientError::InvalidUri);
         }
@@ -1315,6 +1422,91 @@ mod tests {
     }
 
     #[test]
+    fn explicit_mcp_routes_are_exact_and_never_use_proxy_environment_fallback() {
+        let endpoint = Url::parse("https://mcp.example/rpc").expect("endpoint");
+        let proxy = Url::parse("http://127.0.0.1:32081").expect("proxy");
+        let route = HttpRoutePolicy::https_via_proxy(endpoint.clone(), proxy.clone())
+            .expect("explicit route");
+        let matcher = route.matcher().expect("proxy matcher");
+        let intercept = matcher
+            .intercept(&endpoint.as_str().parse().expect("URI"))
+            .expect("mandatory proxy");
+        assert_eq!(
+            intercept
+                .uri()
+                .authority()
+                .expect("proxy authority")
+                .as_str(),
+            "127.0.0.1:32081"
+        );
+        let loopback = HttpRoutePolicy::direct_loopback(
+            Url::parse("http://127.0.0.1:32082/mcp").expect("loopback"),
+        )
+        .expect("direct local route");
+        assert!(
+            loopback
+                .matcher()
+                .expect("empty matcher")
+                .intercept(&"http://remote.example/rpc".parse().expect("URI"))
+                .is_none()
+        );
+        for invalid in [
+            "http://remote.example/rpc",
+            "https://secret@remote.example/rpc",
+            "https://mcp.example/rpc?token=secret",
+            "https://127.0.0.1/rpc",
+        ] {
+            assert!(
+                HttpRoutePolicy::https_via_proxy(Url::parse(invalid).expect("URL"), proxy.clone())
+                    .is_err()
+            );
+        }
+        for invalid in [
+            "http://localhost:32081",
+            "http://remote.example:32081",
+            "https://127.0.0.1:32081",
+            "http://127.0.0.1",
+            "http://127.0.0.1:32081/path",
+            "http://secret@127.0.0.1:32081",
+        ] {
+            assert!(
+                HttpRoutePolicy::https_via_proxy(
+                    endpoint.clone(),
+                    Url::parse(invalid).expect("URL")
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_mcp_route_refuses_endpoint_changes_before_connecting() {
+        let endpoint = Url::parse("http://127.0.0.1:32082/mcp").expect("endpoint");
+        let client = HttpClient::with_route(
+            Duration::from_millis(100),
+            HttpRoutePolicy::direct_loopback(endpoint).expect("policy"),
+        )
+        .expect("client");
+        for target in [
+            "http://127.0.0.1:32082/other",
+            "http://127.0.0.1:32083/mcp",
+            "http://remote.example/mcp",
+        ] {
+            assert!(matches!(
+                client
+                    .request(
+                        Method::POST,
+                        &Url::parse(target).expect("target"),
+                        HeaderMap::new(),
+                        Vec::new()
+                    )
+                    .await,
+                Err(HttpClientError::RoutePolicy)
+            ));
+        }
+    }
+
+    #[test]
     fn tls_fixture_remains_valid_for_at_least_thirty_days() {
         let (certificate, _) = tls_fixture();
         let mut roots = RootCertStore::empty();
@@ -1414,100 +1606,154 @@ mod tests {
 
     #[tokio::test]
     async fn configured_http_proxy_tunnels_https_with_connect() {
-        let (certificate, private_key) = tls_fixture();
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let server_config = ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .expect("server protocol versions")
-            .with_no_client_auth()
-            .with_single_cert(vec![certificate.clone()], private_key)
-            .expect("test server certificate");
-        let target_listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("bind HTTPS target fixture");
-        let target_address = target_listener.local_addr().expect("HTTPS target address");
-        let target = tokio::spawn(async move {
-            let (tcp, _) = target_listener.accept().await.expect("accept HTTPS client");
-            let mut stream = TlsAcceptor::from(Arc::new(server_config))
-                .accept(tcp)
+        for explicit in [false, true] {
+            let (certificate, private_key) = tls_fixture();
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let server_config = ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("server protocol versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![certificate.clone()], private_key)
+                .expect("test server certificate");
+            let target_listener = TcpListener::bind(("127.0.0.1", 0))
                 .await
-                .expect("accept TLS");
-            let mut request = Vec::new();
-            loop {
-                let mut chunk = [0_u8; 512];
-                let count = stream.read(&mut chunk).await.expect("read request");
-                assert_ne!(count, 0, "request ended before its headers");
-                request.extend_from_slice(&chunk[..count]);
-                assert!(request.len() <= 8 * 1024, "request headers exceeded bound");
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
+                .expect("bind HTTPS target fixture");
+            let target_address = target_listener.local_addr().expect("HTTPS target address");
+            let target = tokio::spawn(async move {
+                let (tcp, _) = target_listener.accept().await.expect("accept HTTPS client");
+                let mut stream = TlsAcceptor::from(Arc::new(server_config))
+                    .accept(tcp)
+                    .await
+                    .expect("accept TLS");
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 512];
+                    let count = stream.read(&mut chunk).await.expect("read request");
+                    assert_ne!(count, 0, "request ended before its headers");
+                    request.extend_from_slice(&chunk[..count]);
+                    assert!(request.len() <= 8 * 1024, "request headers exceeded bound");
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
                 }
-            }
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .expect("write HTTPS response");
+                stream.flush().await.expect("flush HTTPS response");
+            });
+            let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
                 .await
-                .expect("write HTTPS response");
-            stream.flush().await.expect("flush HTTPS response");
-        });
-        let proxy_listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("bind CONNECT proxy fixture");
-        let proxy_address = proxy_listener.local_addr().expect("CONNECT proxy address");
-        let proxy = tokio::spawn(async move {
-            let (mut client, _) = proxy_listener.accept().await.expect("accept proxy client");
-            let mut request = Vec::new();
-            loop {
-                let mut chunk = [0_u8; 512];
-                let count = client.read(&mut chunk).await.expect("read CONNECT request");
-                assert_ne!(count, 0, "CONNECT request ended before headers");
-                request.extend_from_slice(&chunk[..count]);
-                assert!(request.len() <= 8 * 1024, "CONNECT request exceeded bound");
-                if request.windows(4).any(|part| part == b"\r\n\r\n") {
-                    break;
+                .expect("bind CONNECT proxy fixture");
+            let proxy_address = proxy_listener.local_addr().expect("CONNECT proxy address");
+            let proxy = tokio::spawn(async move {
+                let (mut client, _) = proxy_listener.accept().await.expect("accept proxy client");
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 512];
+                    let count = client.read(&mut chunk).await.expect("read CONNECT request");
+                    assert_ne!(count, 0, "CONNECT request ended before headers");
+                    request.extend_from_slice(&chunk[..count]);
+                    assert!(request.len() <= 8 * 1024, "CONNECT request exceeded bound");
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
                 }
-            }
-            let mut target = TcpStream::connect(target_address)
-                .await
-                .expect("connect HTTPS target");
-            client
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await
-                .expect("write CONNECT response");
-            client.flush().await.expect("flush CONNECT response");
-            copy_bidirectional(&mut client, &mut target)
-                .await
-                .expect("relay CONNECT tunnel");
-            request
-        });
+                let mut target = TcpStream::connect(target_address)
+                    .await
+                    .expect("connect HTTPS target");
+                client
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .expect("write CONNECT response");
+                client.flush().await.expect("flush CONNECT response");
+                copy_bidirectional(&mut client, &mut target)
+                    .await
+                    .expect("relay CONNECT tunnel");
+                request
+            });
 
-        let matcher = Arc::new(
-            Matcher::builder()
-                .https(format!("http://Aladdin:opensesame@{proxy_address}"))
-                .build(),
-        );
-        let mut roots = RootCertStore::empty();
-        roots.add(certificate).expect("add fixture trust anchor");
-        let client = HttpClient::with_roots_and_proxy(Duration::from_secs(5), roots, matcher)
-            .expect("proxied HTTPS client");
-        let endpoint = Url::parse(&format!(
-            "https://localhost:{}/resource",
-            target_address.port()
-        ))
-        .expect("HTTPS target URL");
-        let response = client
-            .request(Method::GET, &endpoint, HeaderMap::new(), Vec::new())
+            let endpoint = Url::parse(&format!(
+                "https://localhost:{}/resource",
+                target_address.port()
+            ))
+            .expect("HTTPS target URL");
+            let route = explicit.then(|| {
+                HttpRoutePolicy::https_via_proxy(
+                    endpoint.clone(),
+                    Url::parse(&format!("http://{proxy_address}")).expect("owned proxy"),
+                )
+                .expect("approved HTTPS proxy route")
+            });
+            let matcher = route.as_ref().map_or_else(
+                || {
+                    Arc::new(
+                        Matcher::builder()
+                            .https(format!("http://Aladdin:opensesame@{proxy_address}"))
+                            .build(),
+                    )
+                },
+                |route| route.matcher().expect("fixed proxy matcher"),
+            );
+            let mut roots = RootCertStore::empty();
+            roots.add(certificate).expect("add fixture trust anchor");
+            let mut client =
+                HttpClient::with_roots_and_proxy(Duration::from_secs(5), roots, matcher)
+                    .expect("proxied HTTPS client");
+            client.route = route;
+            let response = client
+                .request(Method::GET, &endpoint, HeaderMap::new(), Vec::new())
+                .await
+                .expect("proxied HTTPS request");
+            assert_eq!(response.bytes(8).await.expect("HTTPS response body"), b"ok");
+            let request = String::from_utf8(proxy.await.expect("proxy fixture task"))
+                .expect("ASCII CONNECT request");
+            let mut lines = request.lines();
+            assert_eq!(
+                lines.next(),
+                Some(format!("CONNECT localhost:{} HTTP/1.1", target_address.port()).as_str())
+            );
+            assert_eq!(
+                lines.any(|line| line == "Proxy-Authorization: Basic QWxhZGRpbjpvcGVuc2VzYW1l"),
+                !explicit
+            );
+            target.await.expect("HTTPS target task");
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_https_proxy_failure_cannot_fall_back_to_the_direct_destination() {
+        let target = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("proxied HTTPS request");
-        assert_eq!(response.bytes(8).await.expect("HTTPS response body"), b"ok");
-        let request = String::from_utf8(proxy.await.expect("proxy fixture task"))
-            .expect("ASCII CONNECT request");
-        let mut lines = request.lines();
-        assert_eq!(
-            lines.next(),
-            Some(format!("CONNECT localhost:{} HTTP/1.1", target_address.port()).as_str())
+            .expect("owned target");
+        let target_address = target.local_addr().expect("target address");
+        let proxy = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("owned proxy address reservation");
+        let proxy_address = proxy.local_addr().expect("proxy address");
+        drop(proxy);
+        let endpoint = Url::parse(&format!("https://localhost:{}/rpc", target_address.port()))
+            .expect("target");
+        let route = HttpRoutePolicy::https_via_proxy(
+            endpoint.clone(),
+            Url::parse(&format!("http://{proxy_address}")).expect("proxy"),
+        )
+        .expect("approved route");
+        let client = HttpClient::with_route(Duration::from_millis(100), route).expect("client");
+        assert!(
+            client
+                .request(Method::POST, &endpoint, HeaderMap::new(), Vec::new())
+                .await
+                .is_err()
         );
-        assert!(lines.any(|line| line == "Proxy-Authorization: Basic QWxhZGRpbjpvcGVuc2VzYW1l"));
-        target.await.expect("HTTPS target task");
+        assert!(
+            timeout(Duration::from_millis(50), target.accept())
+                .await
+                .is_err(),
+            "failed proxy must not contact the direct TLS target"
+        );
     }
 
     #[tokio::test]

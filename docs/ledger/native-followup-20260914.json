@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-provider-process-migration-preview-and-terminal-recovery",
+  "capturedAtUtc": "2026-09-14T11:33:32.6384163Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceWitness": {
+    "count": 658,
+    "sha256": "1ebff30efbec4b081e89e220aa68c531f81b99d36f9d854ba4bbcd8f63dfb0eb",
+    "inventory": "git ls-files --cached --others --exclude-standard -- *.rs *.toml *.lock; unique ordinal path order",
+    "encoding": "UTF-8 concatenated relative path + NUL + lowercase file SHA256 + LF",
+    "cargoLockSha256": "f33d45655dff7ce0fb11ad8593641f529efae18415d1b10c30f3e038c4712286"
+  },
+  "checks": [
+    {
+      "command": "cargo +stable test -p gta-claw-daemon -p gta-claw-cli -p gta-claw-tui -p claw-tools -p claw-migrate -p claw-state -p claw-runtime -p claw-repo-policy --all-targets --locked --quiet",
+      "result": "passed",
+      "passed": 777,
+      "failed": 0,
+      "ignored": 7,
+      "testBinaries": 46,
+      "log": "target/native-followup-tests-20260914T193022058.log",
+      "sha256": "539d2e225385df31f75af2faf483bfe82f3d0425badd67fe62d88380e9773200"
+    },
+    {
+      "command": "cargo +stable clippy -p gta-claw-daemon -p gta-claw-cli -p gta-claw-tui -p claw-tools -p claw-migrate -p claw-state -p claw-runtime --all-targets --locked -- -D warnings",
+      "result": "passed",
+      "log": "target/native-followup-clippy-20260914T193003425.log",
+      "sha256": "ed5f9ea4d8c621aec1e731b59d4710b62914256c671a7fc314cb843052d90d77"
+    },
+    {
+      "command": "cargo +stable metadata --locked --offline --format-version 1",
+      "result": "passed",
+      "workspaceMembers": 38,
+      "resolvedPackages": 428,
+      "rootSlintOrCheckedJavaScriptRuntimePackages": 0
+    }
+  ],
+  "retainedEarlierLogs": [
+    "target/native-followup-tests-20260914T190836706.log",
+    "target/native-followup-clippy-20260914T192929340.log"
+  ],
+  "unverified": [
+    "whole-project completion", "complete upstream interoperability", "local upstream cryptographic verification",
+    "MSRV 1.94", "physical power loss", "Linux/macOS runtime and executable race guarantees",
+    "real model or channel accounts", "positive signed-plugin effect execution in this increment",
+    "visible GUI usability", "mobile devices", "full transcript streaming and snapshot reconciliation",
+    "OpenClaw SQLite/WAL snapshot or import", "user-state migration", "production cutover",
+    "signed release", "cross-platform packaging", "soak"
+  ]
+}

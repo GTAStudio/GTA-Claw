@@ -420,6 +420,20 @@ impl PinnedHttpTransport {
         request: OutboundRequest,
         control: &HostCallControl,
     ) -> Result<InboundResponse, PinnedHttpError> {
+        self.send_request_with_peer(request, control)
+            .map(|(response, _)| response)
+    }
+
+    /// Sends one fixed-address request and reports the actual socket peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, cancellation, TLS and response failures as [`Self::send_request`].
+    pub fn send_request_with_peer(
+        &self,
+        request: OutboundRequest,
+        control: &HostCallControl,
+    ) -> Result<(InboundResponse, IpAddr), PinnedHttpError> {
         let budget = RequestBudget::new(control, self.config.overall_timeout);
         budget.check()?;
         let prepared = PreparedRequest::new(request, &self.config)?;
@@ -429,6 +443,10 @@ impl PinnedHttpTransport {
             &budget,
             self.config.connect_timeout,
         )?;
+        let peer = socket
+            .peer_addr()
+            .map_err(|_| PinnedHttpError::ConnectFailed)?
+            .ip();
         socket
             .set_nodelay(true)
             .map_err(|_| PinnedHttpError::ConnectFailed)?;
@@ -452,7 +470,7 @@ impl PinnedHttpTransport {
         )?;
         let response = read_response(&mut wire, &budget, &self.config, prepared.is_head)?;
         budget.check()?;
-        Ok(response)
+        Ok((response, peer))
     }
 }
 

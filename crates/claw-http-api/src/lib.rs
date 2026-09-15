@@ -55,10 +55,11 @@ pub use lifecycle::{
 };
 pub use ports::{
     AdminFailure, AdminPort, AdminSuccess, ApiServices, AuditPort, ClientTool, EmbeddingRequest,
-    GenerationEvent, GenerationOutput, GenerationRequest, InputMedia, InputMediaKind,
-    InputMediaSource, Model, PortError, PortErrorKind, PortFuture, ProviderPort, ReadinessPort,
-    ReadinessSnapshot, ToolCall, ToolChoice, ToolDefinition, ToolInvocation, ToolInvocationContext,
-    ToolOutcome, ToolPort, Usage, WatchAuthPort, WatchIdentity, WatchResultPort, WebhookOutcome,
+    GenerationEvent, GenerationFinishReason, GenerationOutput, GenerationRequest,
+    GenerationSummary, InputMedia, InputMediaKind, InputMediaSource, Model, PortError,
+    PortErrorKind, PortFuture, ProviderPort, ReadinessPort, ReadinessSnapshot, ToolCall,
+    ToolChoice, ToolDefinition, ToolInvocation, ToolInvocationContext, ToolOutcome, ToolPort,
+    Usage, UsageReporting, WatchAuthPort, WatchIdentity, WatchResultPort, WebhookOutcome,
     WebhookPort,
 };
 pub use watch::WatchNodeHandle;
@@ -156,6 +157,7 @@ pub struct HttpApi {
     router: Router,
     mcp_router: Router,
     watch: WatchNodeHandle,
+    mcp_shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl HttpApi {
@@ -232,6 +234,10 @@ impl HttpApi {
             .layer(cors)
             .with_state(state.clone());
         let mcp_router = mcp_router
+            .route(
+                "/mcp",
+                axum::routing::get(mcp::session_transport).delete(mcp::session_transport),
+            )
             .layer(SetResponseHeaderLayer::if_not_present(
                 HeaderName::from_static("x-content-type-options"),
                 HeaderValue::from_static("nosniff"),
@@ -249,6 +255,7 @@ impl HttpApi {
             router,
             mcp_router,
             watch: WatchNodeHandle::new(state.inner.watch.clone()),
+            mcp_shutdown: state.inner.mcp_shutdown.clone(),
         }
     }
 
@@ -260,6 +267,14 @@ impl HttpApi {
     /// Returns the MCP-only router, which must be served with loopback peer metadata.
     pub fn mcp_router(&self) -> Router {
         self.mcp_router.clone()
+    }
+
+    /// Returns the host-owned shutdown signal for all MCP calls, sessions and streams.
+    ///
+    /// Cancelling it permanently refuses new MCP work and revokes in-flight tokens, not effects.
+    #[must_use]
+    pub fn mcp_shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+        self.mcp_shutdown.clone()
     }
 
     /// Returns the bounded watch-node event transport.

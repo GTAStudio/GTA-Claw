@@ -10,6 +10,7 @@ use crate::cancel::CancelToken;
 use crate::error::{ErrorKind, Operation, ProviderError};
 use crate::model::{
     AssistantMessage, ContentPart, FinishReason, ModelError, ToolArguments, ToolCall, Usage,
+    UsageReporting,
 };
 
 /// One incremental event produced by a streaming completion.
@@ -51,6 +52,13 @@ pub enum StreamEvent {
     },
     /// Updated token accounting.
     UsageUpdate(Usage),
+    /// A validated counter snapshot with explicit primary-field reporting coverage.
+    UsageReported {
+        /// Observed cumulative token counters.
+        usage: Usage,
+        /// Whether neither, some, or both primary counters have been reported.
+        reporting: UsageReporting,
+    },
     /// The stream finished.
     Completed {
         /// Why generation stopped.
@@ -272,6 +280,7 @@ pub struct StreamAccumulator {
     reasoning: String,
     tool_calls: Vec<ToolCall>,
     usage: Usage,
+    usage_reporting: UsageReporting,
     finish_reason: Option<FinishReason>,
 }
 
@@ -288,13 +297,23 @@ impl StreamAccumulator {
             StreamEvent::TextDelta(delta) => self.text.push_str(delta),
             StreamEvent::ReasoningDelta(delta) => self.reasoning.push_str(delta),
             StreamEvent::ToolCallCompleted { call, .. } => self.tool_calls.push(call.clone()),
-            StreamEvent::UsageUpdate(usage) => self.usage = *usage,
+            StreamEvent::UsageUpdate(usage) => {
+                self.usage = *usage;
+                self.usage_reporting = UsageReporting::Partial;
+            }
+            StreamEvent::UsageReported { usage, reporting } => {
+                self.usage = *usage;
+                self.usage_reporting = *reporting;
+            }
             StreamEvent::Completed {
                 finish_reason,
                 usage,
             } => {
                 self.finish_reason = Some(finish_reason.clone());
                 if usage.total_tokens() > 0 {
+                    if self.usage != *usage || self.usage_reporting == UsageReporting::Unreported {
+                        self.usage_reporting = UsageReporting::Partial;
+                    }
                     self.usage = *usage;
                 }
             }
@@ -308,6 +327,12 @@ impl StreamAccumulator {
     #[must_use]
     pub const fn usage(&self) -> Usage {
         self.usage
+    }
+
+    /// Returns the coverage of the currently retained token counters.
+    #[must_use]
+    pub const fn usage_reporting(&self) -> UsageReporting {
+        self.usage_reporting
     }
 
     /// Returns the finish reason, when the stream reported one.
@@ -699,6 +724,75 @@ mod tests {
         });
         assert_eq!(accumulator.usage(), usage);
         assert_eq!(accumulator.usage().total_tokens(), 10);
+    }
+
+    #[test]
+    fn accumulator_usage_reporting_distinguishes_missing_partial_and_explicit_zero() {
+        let mut missing = StreamAccumulator::new();
+        missing.accept(&StreamEvent::Completed {
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        });
+        assert_eq!(missing.usage_reporting(), UsageReporting::Unreported);
+
+        for (event, expected) in [
+            (
+                StreamEvent::UsageUpdate(Usage::default()),
+                UsageReporting::Partial,
+            ),
+            (
+                StreamEvent::UsageReported {
+                    usage: Usage::default(),
+                    reporting: UsageReporting::Partial,
+                },
+                UsageReporting::Partial,
+            ),
+            (
+                StreamEvent::UsageReported {
+                    usage: Usage::default(),
+                    reporting: UsageReporting::Complete,
+                },
+                UsageReporting::Complete,
+            ),
+        ] {
+            let mut accumulator = StreamAccumulator::new();
+            accumulator.accept(&event);
+            accumulator.accept(&StreamEvent::Completed {
+                finish_reason: FinishReason::Stop,
+                usage: Usage::default(),
+            });
+            assert_eq!(accumulator.usage(), Usage::default());
+            assert_eq!(accumulator.usage_reporting(), expected);
+        }
+    }
+
+    #[test]
+    fn accumulator_usage_reporting_does_not_certify_changed_legacy_terminal_counters() {
+        let usage = Usage {
+            input_tokens: 7,
+            output_tokens: 3,
+            ..Usage::default()
+        };
+        let mut accumulator = StreamAccumulator::new();
+        accumulator.accept(&StreamEvent::UsageReported {
+            usage,
+            reporting: UsageReporting::Complete,
+        });
+        accumulator.accept(&StreamEvent::Completed {
+            finish_reason: FinishReason::Stop,
+            usage,
+        });
+        assert_eq!(accumulator.usage_reporting(), UsageReporting::Complete);
+        let changed = Usage {
+            input_tokens: 8,
+            ..usage
+        };
+        accumulator.accept(&StreamEvent::Completed {
+            finish_reason: FinishReason::Stop,
+            usage: changed,
+        });
+        assert_eq!(accumulator.usage(), changed);
+        assert_eq!(accumulator.usage_reporting(), UsageReporting::Partial);
     }
 
     fn event_stream(

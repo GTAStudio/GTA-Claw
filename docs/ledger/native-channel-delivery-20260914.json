@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "stage": "durable-channel-admission-and-no-automatic-redelivery",
+  "capturedAtUtc": "2026-09-14T12:53:31.0421444Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceWitness": {
+    "count": 659,
+    "sha256": "df149db8e9c4427d69ef3d87e56f29b218052afc49bf354a370240111dda2b37",
+    "inventory": "git ls-files --cached --others --exclude-standard -- *.rs *.toml *.lock; unique ordinal path order",
+    "encoding": "UTF-8 concatenated relative path + NUL + lowercase file SHA256 + LF"
+  },
+  "checks": [
+    {
+      "command":"cargo +stable test -p claw-state -p claw-channels -p gta-claw-daemon -p gta-claw-tui --all-targets --locked --quiet",
+      "result":"passed", "passed":336, "failed":0, "ignored":4, "testBinaries":22,
+      "log":"target/native-channel-delivery-tests-20260914T205226186.log",
+      "sha256":"e1949233580d8fe97427bb8e02fc182d8187017055d781bc1117144855fe1a4d"
+    },
+    {
+      "command":"cargo +stable clippy -p claw-state -p claw-channels -p gta-claw-daemon -p gta-claw-tui --all-targets --locked -- -D warnings",
+      "result":"passed", "log":"target/native-channel-delivery-clippy-20260914T205201662.log",
+      "sha256":"d06d76b1afd77da96635f18ead86420dea7ccc81ab5dc68977491a55136961d1"
+    }
+  ],
+  "unverified":["real Telegram/Discord accounts", "durable provider cursor or Discord resume session", "operator-approved replay workflow for dormant queued inputs", "complete per-segment receipt export", "external exactly-once delivery", "physical power loss", "Teams/WhatsApp parity", "whole-project acceptance"]
+}

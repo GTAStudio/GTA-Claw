@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-terminal-provider-round-accounting",
+  "capturedAtUtc": "2026-09-15T07:27:53.4860959Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-provider-sdk/src/model.rs","sha256":"3ff56933938cd5ddd5a17a83bd37f7385ddf172b58c705bc6868a54f192e609c"},
+    {"path":"crates/claw-providers/src/openai_compatible.rs","sha256":"a4baaebd2c74604a865fd0a3fa43d87572e6cc5a70eaee41d8a0785e85847b11"},
+    {"path":"crates/claw-providers/src/anthropic.rs","sha256":"b8c867197cec0439ee761d5d55ecfd3cb1653215f06ff89bbfe58e420df3c245"},
+    {"path":"crates/claw-providers/src/responses.rs","sha256":"a187a9a4734131a52fccc2fcef9a34c1ef0c1d5c1a29ba31d6efe6217853ab31"},
+    {"path":"crates/claw-application/src/ports/provider.rs","sha256":"cc5b897a1afc81c65de0907645b79f401a623b1accd304eb0b0222047c1bb3c1"},
+    {"path":"crates/claw-application/src/ports/state.rs","sha256":"955616e12471d7bed9dccdaf5e66ff2ec8ec91bdb68ce22267c2276cec087f2a"},
+    {"path":"crates/claw-http-api/src/ports.rs","sha256":"11f8682240c611b1f6c1421e0218e686f0e4d436795b8f8e69247428f714a53d"},
+    {"path":"crates/claw-http-api/src/lib.rs","sha256":"f4a331be7b020a65529910dcdea4617c462b44f658e791697e9159191839ff48"},
+    {"path":"crates/claw-http-api/src/deterministic.rs","sha256":"c5e775338b396e0406bfd767a510e9967756e292820845486c4b89b1e100b4cf"},
+    {"path":"crates/claw-http-api/src/openai.rs","sha256":"1f89b8bc7b11ca404812e4fa9eb504a3e8d04dd9a7c09c9099894f625e82fa8d"},
+    {"path":"crates/claw-http-api/tests/e2e.rs","sha256":"0966cd3b3cbf248e3eb04c1e1395a5dc3037ca43912517335760e94af7777116"},
+    {"path":"crates/claw-http-api/tests/openai_support/mod.rs","sha256":"990360b0247a6fe5a74d82da76d14946c7e2251c5e5aafecaf94c73d9430c10b"},
+    {"path":"crates/claw-runtime/src/runtime.rs","sha256":"d465131e3abdd99ff46a1c25aee1a30cbdafa4e159d3c27412b0ac8b656c27e7"},
+    {"path":"crates/claw-runtime/tests/support/mod.rs","sha256":"7116c9b1cf6a3682d87c6b9a1cf0e5e69280c5b4307bac7af941b35e4964b020"},
+    {"path":"crates/claw-runtime/tests/session_lifecycle.rs","sha256":"46a09bcaf9ed23c60bfefd2985a836b17c021fc6cd5b0cb6f2f9a17e5c26db57"},
+    {"path":"crates/claw-state/src/runtime.rs","sha256":"a41fecdd4ef76210083eb6057dc18659bab21e5db8666bf222872db724299e2b"},
+    {"path":"apps/gta-claw-daemon/src/adapters/http_api.rs","sha256":"e373d9d97249b5a29fb1120e80186a0796a18454a610d6a898d6a0b097a04e63"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"7acdf51d2e7fb891d0d98f805c229aea3694e32a3cd77c2056743304b1d1f210"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"118a4e346afc6cc31d1b51900c2814cb1670bd88923dca8dd617d93b022105f4"},
+    {"path":"apps/gta-claw-daemon/src/adapters/native_mcp.rs","sha256":"f603642fec69b53a8ba3cb64efbb7eb29289ef7c45541d4906ceb84f1730d2f2"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-provider-sdk -p claw-providers -p claw-application -p claw-runtime -p claw-state -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":1283, "failed":0, "ignored":5, "testBinaries":40,
+      "log":"target/native-provider-accounting-tests-20260915T072424683Z.log",
+      "sha256":"4afaa026910b65dabfcd9da04eed61dbe2f73847f513c3c1eb8b408c591fc5ea"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-provider-sdk -p claw-providers -p claw-application -p claw-runtime -p claw-state -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-provider-accounting-clippy-20260915T072719441Z.log",
+      "sha256":"923120aa80a214f4214a700a50087103fbc0a0669d3530217e86fb45331b066a"
+    },
+    {
+      "command":"cargo +stable check --manifest-path D:/GTA-Claw/Cargo.toml --workspace --all-targets --locked --offline",
+      "result":"passed",
+      "log":"target/native-provider-accounting-workspace-check-20260915T070517990Z.log",
+      "sha256":"72d1c2a689464ec068795027fb0acdb904e5b43391cd84fab2a563e0b53669a6",
+      "scopeNote":"Before final behavior-neutral const/test move/formatting fixes and test-only MCP diagnostics; final seven-package tests and lint cover current listed witnesses"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --test production_composition bound_native_mcp_stdio_requires_launch_approval_pins_program_and_isolates_environment --locked --offline -- --exact --nocapture",
+      "result":"passed", "passed":1, "failed":0, "ignored":0, "testBinaries":1,
+      "log":"target/native-provider-accounting-stdio-recheck-20260915T072025958Z.log",
+      "sha256":"20ff314da1b5e508627ed0f07a804e2a173d0ae10ddc30b0d5200185c77d315b",
+      "scopeNote":"Unmodified isolated test rerun, not root-cause resolution"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-provider-sdk -p claw-providers -p claw-application -p claw-runtime -p claw-state -p claw-http-api -p gta-claw-daemon --lib native_mcp_keyring_rotation_and_deletion_revoke_before_connecting --locked --offline -- --nocapture",
+      "result":"passed", "passed":1, "failed":0, "ignored":0, "testBinaries":7,
+      "log":"target/native-provider-accounting-credential-diagnostic-20260915T072306103Z.log",
+      "sha256":"7a84ed72ea0f8a77cf3f3ff3f1a2182658a57a6f084811932cfe9d393f2a9689",
+      "scopeNote":"Six filtered-out summaries and one passing native credential test; diagnostics only, not a production fix"
+    }
+  ],
+  "retainedFailures": [
+    {"log":"target/native-provider-accounting-clippy-20260915T071221223Z.log","sha256":"5f6a787ed8d94b53859db4df8447ec45c9009537115a475b11eea5fc933eda9b","reason":"Const-compatible usage mapping and redundant test clone; repaired locally"},
+    {"log":"target/native-provider-accounting-clippy-20260915T071349162Z.log","sha256":"bdfd99b7035a19522a0d202a81661444f134c4bb1ea81afcba2475d03c2c8451","reason":"Test module preceded a public trait; reordered without API or assertion changes"},
+    {"log":"target/native-provider-accounting-tests-20260915T071538534Z.log","sha256":"567319885e501d11b804a83f579a558bfabe4a132487af1707a7fb672357229f","passed":1268,"failed":1,"ignored":5,"testBinaries":39,"reason":"Owned stdio executable remained locked during a later pending-approval mutation; unmodified isolated and final joint reruns passed, root cause unresolved"},
+    {"log":"target/native-provider-accounting-tests-20260915T072141839Z.log","sha256":"0e3d83527d65e992e66468fe04f7847f32226379103ffc88d5791bd0fc58db21","passed":1222,"failed":1,"ignored":4,"testBinaries":32,"reason":"Native keyring test saw OutcomeUnknown without expected durable revocation; added only case/error/remote-count diagnostics, root cause unresolved"}
+  ],
+  "behaviorEvidence": [
+    "chat_usage_reporting_distinguishes_explicit_zero_from_missing_counters",
+    "anthropic_usage_reporting_preserves_unknown_and_explicit_zero",
+    "response_reporting_preserves_unknown_zero_and_refuses_inconsistent_counters",
+    "provider_response_report_keeps_actual_identity_and_usage_coverage",
+    "gateway_accounting_summary_distinguishes_missing_partial_zero_and_overflow",
+    "provider_round_accounting_survives_later_failure_without_inventing_missing_usage",
+    "bound_explicit_memory_model_calls_keep_notes_scoped_to_the_gateway_device"
+  ],
+  "notes": [
+    "Native report identity comes from the same active provider instance and actual response, never a later swapped provider; empty response IDs are absent",
+    "A bounded 1024-round sequence records unknown starts, immutable confirmed identities/counters/terminal reasons and earlier rounds on later failure",
+    "Terminal TurnRecord persistence and closed redb DTO validation preserve missing, partial and explicit-zero reporting across reopen; old absent fields remain unknown",
+    "Owner-bound providerAccounting uses checked aggregation, exposes no prompt or tool arguments, and does not ACK, retry or clear unknown outcomes",
+    "Complete means both primary token counters were explicitly reported, not all pricing dimensions or invoices; costCalculated and billingReconciled remain false",
+    "Native HTTP streaming conservatively reports Partial after an observed UsageUpdate and Unreported otherwise; it does not infer complete source coverage",
+    "Actual three-dialect daemon fixtures verify two-round 14-token summaries, partial 7-token summaries and identity/terminal fields after redb reopen; the owned interrupted Chat process has no turn report rather than known zero",
+    "Only MCP test diagnostics were changed after joint failures; no retry, timeout relaxation, forced test serialization or production credential/process policy change was added",
+    "The initial local disk/link failure led only to a daemon-package Cargo build-cache clean; no source/state/other-project cleanup or dependency download occurred",
+    "No real account, browser, user device migration, deployment, Git write or production/proxy operation occurred"
+  ],
+  "unverified": [
+    "Incremental crash-safe per-round journaling before requests and after terminal responses; current records are saved only with terminal turns",
+    "Exact streaming counter provenance and retention for every cancelled/failed external response",
+    "Pre-request monetary budgets, cache-write pricing, invoices and unknown paid-request reconciliation",
+    "Root causes of both prior native-credential anomalies and the new joint stdio lock/durable-revocation failures",
+    "Real provider accounts, other platforms, full frozen build manifests, release and whole-project acceptance"
+  ]
+}

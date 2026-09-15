@@ -162,14 +162,15 @@ fn fixed_address_https_uses_the_canonical_host_for_host_and_sni() {
         PinnedHttpTransportConfig::new().with_root_certificate_der(certificate.as_ref().to_vec()),
     );
 
-    let response = transport
-        .send_request(
+    let (response, peer) = transport
+        .send_request_with_peer(
             request("https", "fixed.test", address),
             &control(Duration::from_secs(2)),
         )
         .expect("HTTPS response");
     server.join().expect("TLS server");
 
+    assert_eq!(peer, address.ip());
     assert_eq!(response.status, 200);
     assert_eq!(response.body, b"ok");
     let request = capture.request();

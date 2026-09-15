@@ -8,6 +8,12 @@ this repository.
 [legacy-node-port-obligations.md](legacy-node-port-obligations.md).** Where this document
 summarizes that file, the obligations file wins.
 
+The 2026-09-14 development redesign is in [PROJECT_PLAN.md](PROJECT_PLAN.md), with executable-work
+acceptance items in [DEVELOPMENT_CHECKLIST.md](DEVELOPMENT_CHECKLIST.md). It targets OpenClaw
+`v2026.9.4`; the sealed local baseline remains `2026.7.2`. Development has now begun on Rust 1.98.1
+and Slint 1.17.1. The [current native follow-up record](ledger/native-followup-20260914.md) separates
+implemented and locally tested behavior from still-open compatibility, migration and release gates.
+
 ## How to read this
 
 Two different questions get confused constantly, so they are tracked separately:
@@ -34,19 +40,20 @@ without trusting it.
 ## Composition status — read this before anything else
 
 `gta-claw-daemon` is the composition root of the product, and it now composes a real service.
-`apps/gta-claw-daemon/src/main.rs` runs `production.rs`, whose manifest depends on **20 `claw-*`
+`apps/gta-claw-daemon/src/main.rs` runs `production.rs`, whose manifest depends on **22 `claw-*`
 crates** — `claw-application`, `claw-channel-sdk`, `claw-channels`, `claw-config`,
 `claw-crestodian`, `claw-domain`, `claw-gateway`, `claw-goals`, `claw-http-api`, `claw-memory`,
 `claw-observability`, `claw-platform`, `claw-plugin-api`, `claw-plugin-host`, `claw-protocol`,
-`claw-provider-sdk`, `claw-providers`, `claw-runtime`, `claw-security`, `claw-skills` — plus
+`claw-provider-sdk`, `claw-providers`, `claw-runtime`, `claw-security`, `claw-skills`, `claw-state`, `claw-tools` — plus
 `gta-claw-updater`.
 
 What a `gta-claw-daemon` serve actually does, in order: resolves layered configuration (or migrates
 the legacy environment when no file is given), reports `claw-crestodian` recovery guidance, installs
 `claw-observability`'s redacting subscriber, derives one shared `claw-provider-sdk` proxy policy,
 fetches the role document over it, activates signed plugins on the real `claw-plugin-host` under a
-bounded candidate limit and deadline, brings up `claw-providers::GitHubCopilot` or leaves the
-provider pending Device Flow, starts supervised Telegram and Discord transports, opens a durable
+bounded candidate limit and deadline, brings up `claw-providers::GitHubCopilot`, explicitly configured
+OpenAI-compatible/Anthropic clients, or leaves the Copilot provider pending Device Flow,
+starts supervised Telegram and Discord transports, opens a durable
 JSON-lines audit log and a durable Gateway pairing store, binds a `claw-gateway` server and three
 `TcpListener`s (main HTTP, legacy HTTP, loopback-only MCP), announces the bound addresses, serves a
 transactional reload, and drains into an accounted stop summary. A routable bind is refused unless
@@ -56,17 +63,38 @@ Consequently:
 
 - **A Rust binary now serves real traffic for most of the agent product.** `gta-claw-daemon` accepts
   connections on four listeners and answers them from the shipped crates, not from fixtures.
-- It does **not** yet serve all of it. Behind those listeners, these ports are uncomposed and a
-  reader should expect exactly this if they run it: **durable session and turn state** does not exist
-  (`claw-state` is absent; the daemon's `RuntimeStateStore` is a process `Mutex<HashMap>`, so a
-  restart loses every session and turn); **`claw-tools` is a dependency of no binary**, so the model's
-  tool surface is signed plugin registrations plus the durable goal tool and none of `claw-tools`'
-  closed schemas, path confinement or validated destinations; **skill execution is not dispatched**
-  (the daemon counts `claw_skills::registry()` and the `WasmSkillHost` bridge has no production
-  caller); **approvals are `claw_runtime::approval::SilentApprovalPort`**, which approves everything
-  without asking; **watch pairing and task-flow webhooks are wired to `DisabledExternalPorts`** and
-  fail closed; and **plugin/skill HTTP bypasses the shared proxy policy** by going through
-  `claw-plugin-host`'s `PinnedHttpTransport`.
+- Sessions, turns, high-water ordinals and context checkpoints now use **`claw-state` / redb**.
+  Reload preserves stored context; an LRU context cache rehydrates from disk. Reset removes the
+  current pointer/checkpoint, not historical turns. Gateway run admission, idempotency, cancellation
+  intents and terminal result/outbox/ACK are durable, with `durable: true` only after commit.
+  Claimed incomplete work is recovered as unknown without automatic replay. Cross-object atomic
+  recovery and full archive remain incomplete. Telegram/Discord now persist incoming message IDs,
+  exact envelopes, execution claims/results and separate no-replay reply-delivery claims. Provider
+  cursor/resume persistence and explicit recovery of dormant queued work remain incomplete.
+  Unknown storage commits now retain a non-retryable port class and fence new state writes until
+  explicit reopen/reconciliation. Worker failure remains visible after a dropped caller; operator
+  status and shutdown report recovery required.
+- Plugin tools now conservatively require approval and declare potential workspace mutation.
+  Gateway presentation, pending-list/complete-preview queries and once-scoped decisions share the
+  runtime broker. HTTP/MCP plugin execution uses that executor with verified caller claims,
+  publication revisions and permission generation. Per-device leases revoke pending work.
+  Plugin schemas are validated offline and effects have durable authorization/completion audit.
+  Telegram/Discord now bind source/account/sender authority and isolated durable session ownership,
+  including scoped reset. Legacy Teams/WhatsApp identity, complete channel cursor/recovery workflows, full capability
+  consent and positive signed-plugin effect acceptance remain open.
+- MCP owner/read-only credentials are separately configured and bounded; ordinary HTTP credentials
+  do not authenticate MCP. `claw-mcp` itself is still not the composed MCP implementation.
+- **`claw-tools` filesystem and fixed-program process operations are composed under explicit trusted workspace policy**,
+  through bound approval, pinned roots, hard-link refusal and durable authorization audit.
+  Runtime-owned goal writes and owner goal directives also require bound approval and audit.
+  Process calls additionally require owner authority, trusted SHA-256 and exact full argv, and
+  retain host OS permissions. Opt-in `net_fetch` uses explicit origins/static IPs, rustls, owner
+  approval, no redirects and bounded cancellable responses; unsupported proxy routes are refused.
+  No-policy startup exposes no native tools. Explicit native/GET/signed-Wasm skill manifests now
+  reuse configured native tools or signed plugin publications with parameter/resource/revision-bound
+  approval and correlated audit. General DNS/proxy networking and bundled skill ports remain open.
+  Watch pairing and task-flow webhooks fail closed. Skill GET uses the native fixed-address policy
+  and rejects unsupported proxy selection; plugin HTTP still uses its separate pinned transport.
 - The deterministic stand-ins still in the tree — `adapters/model.rs`, `state.rs`, `support.rs`,
   `plugins.rs`, `ingress.rs`, `engine.rs`, driven by `compose.rs` — are **no longer the serving
   path**. `main.rs` calls `control::serve_production`, not `control::serve`; the stand-in graph is now
@@ -79,9 +107,9 @@ Consequently:
   as **composed — evidence outstanding**, because no test under `apps/` reads `compat/legacy`. The
   composition is unproven against the frozen contract.
 
-Across all of `apps/`, the complete set of `claw-*` dependencies is now 22 crates: the daemon's 20
-plus `claw-clients` and `claw-gateway-client`. The crates below that are still depended on by no
-shipped binary are `claw-tools`, `claw-mcp`, `claw-acp`, `claw-relay`, `claw-worker`, `claw-migrate`,
+Across all of `apps/`, the complete set of `claw-*` dependencies is now 25 crates: the daemon's 22
+plus `claw-clients`, `claw-gateway-client` and the CLI's `claw-migrate`. The crates below that are still depended on by no
+shipped binary are `claw-mcp`, `claw-acp`, `claw-relay`, `claw-worker`,
 `claw-discovery` and `claw-conformance`. The daemon's MCP listener serves `claw-http-api`'s
 `mcp_router`, not `claw-mcp`.
 
@@ -101,7 +129,8 @@ Everything below should be read against that.
 | `claw-domain` | Implemented | Types and invariants; no workspace dependencies. |
 | `claw-protocol` | Implemented | Headless command/event vocabulary at `PROTOCOL_VERSION = 1`, plus the Gateway v4 wire contract, negotiation, catalogs and authorization. |
 | `claw-application` | Implemented | Use cases, port traits and composition machinery. `ClientCommand::Submit` deliberately returns `Unsupported("message transport is not configured")` until a transport adapter is composed. |
-| `claw-runtime` | Implemented | Session/turn machine, stream assembly, approval-gated tools, goals, suspension, workers, context-engine harness — all over ports, no I/O. `gta-claw-daemon` composes `Runtime` over a `claw-memory` context engine, a durable `claw-goals` store and an in-memory state port; the approval gate is composed with `approval::SilentApprovalPort`, which approves every request without asking, so the gate exists in the running service but nothing interactive sits behind it. |
+| `claw-runtime` | Implemented core / Recovery partial | Port-only session/turn engine. Daemon now supplies redb state, persistent context and Gateway approval presentation. Redemption checks cancellation/expiry, and cancelled or dropped waiters dismiss accepted-but-unconsumed approvals. Unified run/context/goal/outbox transactions are not implemented. |
+| `claw-state` | Partial / Composed | redb 4.2.0 schema-v1 database, bounded CAS batches/pages, strict session/turn DTOs, revision checks, reset-safe high-water mark, tracked blocking work and checkpoints. Windows reopen, corrupt/future/empty database, lock and abrupt process-exit tests pass. Backup, encryption, full migration and three-platform crash/power-loss guarantees remain open. |
 
 ### Model providers
 
@@ -145,7 +174,7 @@ Everything below should be read against that.
 | `claw-crestodian` | Implemented / Composed | Guided setup, backup/restore, recovery classification, closed `/crestodian` rescue grammar, ring-zero single-tool restriction, typed configuration writes. `gta-claw-daemon` calls `Crestodian::inspect` on file-backed startup and reports the resulting `RecoveryGuidance`; the rescue grammar itself is not exposed by any binary. |
 | `claw-security` | Implemented (primitives) | Identity, roles, scopes. Deliberately contains no network client, TLS terminator, database, keyring or private-key persistence — those are platform adapters. |
 | `claw-observability` | Implemented (primitives) / Composed | Telemetry, metrics, audit and redaction exist, and the crate re-exports the `tracing` facade so no caller opens a second logging path. `gta-claw-daemon` now depends on it and installs the redacting subscriber unconditionally on the serve path: level from `core.logging.level`, overridable by `GTA_CLAW_LOG`, human or JSON via `GTA_CLAW_LOG_FORMAT`, to standard error or `--log-file`, with startup stages, subsystem faults and the drain all logged through it, and the handle shut down and checked for late writer failures before exit. `gta-claw-cli` and `gta-claw-tui` also depend on it but install the subscriber only when verbosity is raised explicitly; at the default level neither emits anything. The obligations file now records `src/utils/logger.ts` as **Composed — evidence outstanding**. |
-| `claw-migrate` | Implemented | Side-effect-free plans, verified backups, apply and rollback for Claude, Codex, Hermes and legacy state. |
+| `claw-migrate` | Implemented existing formats / OpenClaw partial | Existing plan/backup/apply/rollback adapters plus a bounded read-only OpenClaw inventory exposed through CLI. OpenClaw SQLite/WAL snapshot, exact schemas and import/restore remain unimplemented. |
 | `claw-discovery` | Implemented (oracles) | Wire codecs and fail-closed policy oracles. Contains no network runtime, process spawning or container client, on purpose. |
 | `claw-conformance` | Implemented | The parity harness and its evidence verifier. It reports parity; it does not create it. |
 | `claw-repo-policy` | Implemented | The JS/TS ratchet, container check and index scan, with planted-violation tests proving the checks actually fire. |
@@ -154,13 +183,16 @@ Everything below should be read against that.
 
 | Binary | Status | What actually works |
 |---|---|---|
-| `gta-claw-cli` | Partial | `--version`, `--help`/`-h`, `health` (prints `healthy runtime=…`), and `gateway health` — one real authenticated Gateway v4 connection, one `operator.read` `health` RPC, bounded shutdown, eight typed exit categories and a deterministic `--json` schema-version-2 report. `-v`/`-vv` and `--log-file` install `claw-observability`'s redacting subscriber on standard error or a file; at the default level output is byte-identical to an uninstrumented run. `send` **fails on purpose**: `unsupported operation: message transport is not configured`. `--token-file` is parsed but always fails closed. Identity is one-shot `--ephemeral-device` only; durable secure-storage identity is deferred. |
-| `gta-claw-daemon` | Partial | `--probe` prints one health line and `--check-config` validates configuration without serving. Serving composes the shipped crates and **binds real listeners**: a `claw-gateway` server, the frozen 18-route HTTP API, `claw-http-api`'s legacy `src/server.ts` facade on the configured server port, and a loopback-only MCP router. It announces `ready protocol=1`, health and a `service http=… legacy=… gateway=… mcp=… provider=… config_generation=…` line, answers `status` and `reload` control lines, handles `SIGTERM`/`SIGINT` (Windows: Ctrl-C/Break/Close/Shutdown) and a `shutdown` control line, and reports a provable drain summary. A routable bind is refused unless `--tls-terminated-by-frontend` is passed, and `--smoke` swaps in a local diagnostic provider restricted to loopback. **What is behind those listeners is not all real**: sessions and turns are in-memory only, tool authorization is the plugin surface rather than `claw-tools`, no skill executes, approvals are auto-granted, and the watch and webhook routes fail closed. The deterministic stand-in adapters remain in the crate but are a contract harness — `main.rs` does not run them. |
-| `gta-claw-tui` | Partial | Connects to a Gateway, renders Sessions / Workspace / Runs / Diff / Artifacts / Help, supports the command palette, approve/deny prompts and refresh, and falls back to a single `--plain` snapshot when standard output is not an interactive terminal. `-v`/`-vv` and `--log-file` install `claw-observability`'s redacting subscriber away from the drawn terminal. Its capability is bounded by what the Gateway it talks to actually implements. |
+| `gta-claw-cli` | Partial | Schema-v2 health plus native sessions/history/send/run/results/ACK/precise abort/approval, minimum scopes, stdin-only credentials and epoch fencing. Windows/macOS OS-protected profiles are explicit; health remains ephemeral-only. OpenClaw read-only preview is paginated and fingerprint-checked. Guided onboarding, full streaming and complete migration remain open. |
+| `gta-claw-daemon` | Partial | Four real listeners, redb state/checkpoints, bounded context LRU, native Gateway chat/history/abort and approval methods, separately configured MCP credentials, plugin approval gating, reload and tracked shutdown. All live-provider/channel validation, complete recovery, native tools/skills and legacy replay are still open. Smoke tests use an explicitly selected local provider. |
+| `gta-claw-tui` | Partial | Native message composer, retained-key reconciliation, optional native profile, session-scoped history/events, run-bound cancel, independent recovery cursors, render-gated ACK queue, complete approval preview and effectful connection fencing. Wide text wraps; outcome unknown is distinct. Full streaming/snapshot reconciliation, onboarding and platform/manual usability remain open; unsupported Gateway diff/artifact methods report errors. |
 | `gta-claw-updater` | Implemented / Composed conditionally | Signed, resumable, rollback-safe update with staged installs and a restart-required outcome; `Updater::check` reports installed-versus-latest against a signature-verified manifest. On Linux it refuses and defers to the system package manager. It is still a standalone executable, but it is no longer uninvoked: `gta-claw-daemon` runs one supervised nonblocking `Updater::check` at startup when `core.updates.enabled` is set, joined within a budget at shutdown. That check requires `GTA_CLAW_UPDATE_MANIFEST` and `GTA_CLAW_UPDATE_TARGET` and refuses to run under an explicit proxy policy, so a default deployment performs no check. |
 | `gta-claw-android` | Partial | Client core: endpoint and credential intake, Gateway identity, transport assembly, connection lifecycle. A native Slint shell over that core lives in the separate `android/` workspace and is built as an arm64 APK by `android-packaging.yml`. It is a connect-and-status surface for the client core, **not the product UI**; nothing beyond the client core's own scope is rendered, and the upstream mobile app is not ported here. |
 | `gta-claw-ios` | Partial | Same scope and same constraint, with its shell in the separate `ios/` workspace. |
-| `gta-claw-desktop` | Partial | A native Slint shell for Windows and macOS. The wired path performs a real bounded `claw-gateway-client` connection, authentication, protocol negotiation and health probe. First-run screens explicitly report that desktop device authorization and workspace trust are not composed; they issue no fake code or path. The product shell is preview state, in-app update orchestration is not connected, and desktop diagnostics expose only the live Gateway summary. Linux is rejected by design and CI asserts the rejection. |
+| `gta-claw-desktop` | Partial | Slint 1.17.1 production starts with empty native models and sends real chat/history and once-scoped approval RPCs. Complete redacted previews, reconnect queries, bounded queues and generation/epoch fencing are implemented and locally tested. No durable platform identity, complete settings/workspace/tool workflow or visible-window acceptance is claimed. Linux GUI remains rejected by policy. |
+
+Desktop device authorization and workspace trust are not composed; diagnostics expose only the live Gateway summary.
+The native chat/approval path is separate from that diagnostics view and does not confer workspace trust.
 
 ## Legacy replacement obligations
 
@@ -173,7 +205,7 @@ row, whether the missing piece is an **owner**, an **implementation**, a **compo
 | **Composed — evidence outstanding.** A running service uses it; no test replays `compat/legacy` against that service | `src/auth/deviceFlow.ts`, `src/bot/teamsBot.ts` (its Teams JWT implementation gap is now closed), `src/channels/discordGateway.ts`, `src/channels/messageProcessor.ts`, `src/channels/telegramPolling.ts`, `src/channels/whatsappWebhook.ts`, `src/config.ts`, `src/index.ts` (with named gaps), `src/loader/roleLoader.ts`, `src/server.ts`, `src/utils/logger.ts` |
 | **Composed conditionally — evidence outstanding** | `src/updater/sdkUpdater.ts` — the daemon runs one signed startup check, but only when updates are enabled and a manifest and target are configured |
 | **Composed for four channels — evidence outstanding** | `src/utils/splitMessage.ts` — the four channels with a ledger-proven limit segment on the live path; 25 have no proven limit and no transport |
-| **Partial — implementation and composition.** `claw-state` does not exist in this repository | `src/engine/copilotEngine.ts`, `src/engine/sessionManager.ts` |
+| **Partial — recovery semantics and legacy evidence.** `claw-state` is now composed, but not the complete transaction/recovery system | `src/engine/copilotEngine.ts`, `src/engine/sessionManager.ts` |
 | **Partial — composition** | `src/utils/proxy.ts` → one shared policy now covers provider, role, Teams, WhatsApp, Telegram and Discord; plugin and skill HTTP is still outside it |
 | **Partial by deliberate break — composition** | `src/engine/toolExecutor.ts` — JavaScript evaluation is **removed, not ported**; the composed tool surface is signed plugins plus the goal tool, and `claw-tools` is in no binary |
 | **Partial — owner required for the fetch half** | `src/loader/skillLoader.ts` → `claw-skills` owns discovery and validation; nothing owns the concurrent bounded remote fetch |
@@ -194,7 +226,8 @@ entry goes stale, or if a container definition reintroduces a Node base image.
 
 ## Continuous verification
 
-These run in CI and are the evidence behind every "Implemented" above.
+These are repository CI commands, not a claim that every gate was freshly executed locally.
+The native development record lists exact local commands, results and exclusions.
 
 | Check | Command |
 |---|---|
@@ -216,16 +249,17 @@ Packaging prototypes run from `linux-packaging.yml`, `macos-packaging.yml`, `win
 `android-packaging.yml` and `ios-packaging.yml`. `docker-publish.yml` still builds the **legacy Node
 image**; switching it to the native service is step 5 of the deletion checklist.
 
+The development toolchain is now Rust 1.98.1. Protected packaging policy, builders and fixtures still
+pin 1.97.1 and were not edited to pass. Their reviewed upgrade, fresh MSRV 1.94 and cross-platform
+gates remain blockers to native release packaging.
+
 ## What would change this document
 
-The composition landed. `gta-claw-daemon` binds real listeners over the shipped crates, and the
-section above is the record of that. The next status change worth recording is therefore neither
-another crate nor another adapter: it is **evidence**. When a test under `apps/` replays
+The composition is partial and ongoing implementation is still required. When a test under `apps/` replays
 `compat/legacy` — behaviors, HTTP shapes, negative, timeout, reload-race, channel, persistence and
 shutdown cases — against the bound daemon, obligations start being discharged and legacy files start
 leaving the inventory in the same change that deletes them.
 
-Two things would also change this document before that, because they are the named gaps that make
-"composed" fall short of "complete": a `claw-state` owner that gives sessions and turns durability
-across a restart, and composition of `claw-tools` and skill-execution dispatch so that the running
-tool surface is the authorized one rather than whatever signed plugins happen to be installed.
+Next implementation gaps include unified durable run/turn/context/outbox recovery, complete caller
+and permission binding, native tools/skills, reliable client history reconciliation, persistent
+client identity, and an OpenClaw-specific importer. Do not relabel these as merely missing tests.

@@ -89,13 +89,13 @@ pub struct StopSignals {
     #[cfg(unix)]
     reload: tokio::signal::unix::Signal,
     #[cfg(windows)]
-    ctrl_c: tokio::signal::windows::CtrlC,
+    console_interrupt: tokio::signal::windows::CtrlC,
     #[cfg(windows)]
-    ctrl_break: tokio::signal::windows::CtrlBreak,
+    break_signal: tokio::signal::windows::CtrlBreak,
     #[cfg(windows)]
-    ctrl_close: tokio::signal::windows::CtrlClose,
+    console_close: tokio::signal::windows::CtrlClose,
     #[cfg(windows)]
-    ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
+    system_shutdown: tokio::signal::windows::CtrlShutdown,
 }
 
 impl StopSignals {
@@ -132,10 +132,10 @@ impl StopSignals {
         use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
 
         Ok(Self {
-            ctrl_c: ctrl_c()?,
-            ctrl_break: ctrl_break()?,
-            ctrl_close: ctrl_close()?,
-            ctrl_shutdown: ctrl_shutdown()?,
+            console_interrupt: ctrl_c()?,
+            break_signal: ctrl_break()?,
+            console_close: ctrl_close()?,
+            system_shutdown: ctrl_shutdown()?,
         })
     }
 
@@ -159,10 +159,10 @@ impl StopSignals {
     #[cfg(windows)]
     pub async fn recv(&mut self) -> StopTrigger {
         tokio::select! {
-            Some(()) = self.ctrl_close.recv() => StopTrigger::Terminate,
-            Some(()) = self.ctrl_shutdown.recv() => StopTrigger::Terminate,
-            Some(()) = self.ctrl_c.recv() => StopTrigger::Interrupt,
-            Some(()) = self.ctrl_break.recv() => StopTrigger::Interrupt,
+            Some(()) = self.console_close.recv() => StopTrigger::Terminate,
+            Some(()) = self.system_shutdown.recv() => StopTrigger::Terminate,
+            Some(()) = self.console_interrupt.recv() => StopTrigger::Interrupt,
+            Some(()) = self.break_signal.recv() => StopTrigger::Interrupt,
             else => std::future::pending().await,
         }
     }

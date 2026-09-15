@@ -24,9 +24,9 @@ use crate::http_support::{
     CancelOnDrop, json_response, read_json, read_json_value, rejected_response,
 };
 use crate::ports::{
-    ClientTool, EmbeddingRequest, EmbeddingsBody, GenerationEvent, GenerationOutput,
-    GenerationRequest, InputMedia, InputMediaKind, InputMediaSource, PortError, PortErrorKind,
-    ToolCall, ToolChoice, Usage,
+    ClientTool, EmbeddingRequest, EmbeddingsBody, GenerationEvent, GenerationFinishReason,
+    GenerationOutput, GenerationRequest, InputMedia, InputMediaKind, InputMediaSource, PortError,
+    PortErrorKind, ToolCall, ToolChoice, Usage,
 };
 use crate::state::{ApiState, unix_seconds};
 
@@ -403,7 +403,12 @@ pub(crate) async fn chat(
     .await
     .map_err(|_| provider_api_error(PortError::new(PortErrorKind::Timeout, "request timed out")))?
     .map_err(provider_api_error)?;
-    enforce_tool_choice(&tool_choice, &generation.tools, &output.tool_calls)?;
+    enforce_generation_tool_choice(
+        &tool_choice,
+        &generation.tools,
+        &output.tool_calls,
+        output.finish_reason,
+    )?;
     enforce_output_constraints(&generation, &mut output)?;
     Ok(json_response(
         StatusCode::OK,
@@ -534,7 +539,12 @@ pub(crate) async fn responses(
             ));
         }
     };
-    if let Err(error) = enforce_tool_choice(&tool_choice, &generation.tools, &output.tool_calls) {
+    if let Err(error) = enforce_generation_tool_choice(
+        &tool_choice,
+        &generation.tools,
+        &output.tool_calls,
+        output.finish_reason,
+    ) {
         return Ok(constrained_response_failure(
             &response_id,
             &generation.model,
@@ -558,14 +568,17 @@ pub(crate) async fn responses(
     };
     Ok(json_response(
         StatusCode::OK,
-        &response_resource(
-            &response_id,
-            &generation.model,
-            status,
-            &items,
-            output.usage,
-            None,
-            unix_seconds(),
+        &annotate_response_finish(
+            response_resource(
+                &response_id,
+                &generation.model,
+                status,
+                &items,
+                output.usage,
+                None,
+                unix_seconds(),
+            ),
+            output.finish_reason,
         ),
     ))
 }
@@ -637,16 +650,7 @@ fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool
                         }
                         return;
                     }
-                    let index = tool_calls.len();
-                    tool_calls.push(call.clone());
-                    if buffer_until_validation {
-                        continue;
-                    }
-                    if !send_chat_tool_call(&sse_tx, &request, created, index, &call, &cancellation)
-                        .await
-                    {
-                        return;
-                    }
+                    tool_calls.push(call);
                     continue;
                 }
             };
@@ -661,10 +665,14 @@ fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool
             Err(_) => Err(PortError::new(PortErrorKind::Internal, "internal error")),
         };
         match provider_result {
-            Ok(usage) => {
-                if let Err(error) =
-                    enforce_tool_choice(&request.tool_choice, &request.tools, &tool_calls)
-                {
+            Ok(summary) => {
+                let usage = summary.usage;
+                if let Err(error) = enforce_generation_tool_choice(
+                    &request.tool_choice,
+                    &request.tools,
+                    &tool_calls,
+                    summary.finish_reason,
+                ) {
                     if send_event(&sse_tx, json_event(error.body), &cancellation).await {
                         let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
                     }
@@ -674,6 +682,8 @@ fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool
                     text: buffered_text,
                     tool_calls,
                     usage,
+                    usage_reporting: summary.usage_reporting,
+                    finish_reason: summary.finish_reason,
                 };
                 if let Err(error) = enforce_output_constraints(&request, &mut output) {
                     if send_event(&sse_tx, json_event(error.body), &cancellation).await {
@@ -681,42 +691,30 @@ fn chat_stream(state: &ApiState, request: GenerationRequest, include_usage: bool
                     }
                     return;
                 }
-                if buffer_until_validation {
-                    if !output.text.is_empty()
-                        && !send_event(
-                            &sse_tx,
-                            json_event(chat_chunk(
-                                &request,
-                                created,
-                                &json!({"content":output.text}),
-                                &Value::Null,
-                            )),
-                            &cancellation,
-                        )
+                if buffer_until_validation
+                    && !output.text.is_empty()
+                    && !send_event(
+                        &sse_tx,
+                        json_event(chat_chunk(
+                            &request,
+                            created,
+                            &json!({"content":output.text}),
+                            &Value::Null,
+                        )),
+                        &cancellation,
+                    )
+                    .await
+                {
+                    return;
+                }
+                for (index, call) in output.tool_calls.iter().enumerate() {
+                    if !send_chat_tool_call(&sse_tx, &request, created, index, call, &cancellation)
                         .await
                     {
                         return;
                     }
-                    for (index, call) in output.tool_calls.iter().enumerate() {
-                        if !send_chat_tool_call(
-                            &sse_tx,
-                            &request,
-                            created,
-                            index,
-                            call,
-                            &cancellation,
-                        )
-                        .await
-                        {
-                            return;
-                        }
-                    }
                 }
-                let finish = if output.tool_calls.is_empty() {
-                    "stop"
-                } else {
-                    "tool_calls"
-                };
+                let finish = chat_finish_reason(&output);
                 if !send_event(
                     &sse_tx,
                     json_event(chat_chunk(&request, created, &json!({}), &json!(finish))),
@@ -921,8 +919,8 @@ fn responses_stream(
             Ok(Err(_)) => Err(PortError::new(PortErrorKind::Timeout, "request timed out")),
             Err(_) => Err(PortError::new(PortErrorKind::Internal, "internal error")),
         };
-        let usage = match provider_result {
-            Ok(usage) => usage,
+        let summary = match provider_result {
+            Ok(summary) => summary,
             Err(error) => {
                 cancellation.cancel();
                 send_response_failure(
@@ -937,7 +935,13 @@ fn responses_stream(
                 return;
             }
         };
-        if let Err(error) = enforce_tool_choice(&request.tool_choice, &request.tools, &calls) {
+        let usage = summary.usage;
+        if let Err(error) = enforce_generation_tool_choice(
+            &request.tool_choice,
+            &request.tools,
+            &calls,
+            summary.finish_reason,
+        ) {
             send_response_failure(
                 &sse_tx,
                 &response_id,
@@ -958,6 +962,8 @@ fn responses_stream(
             text,
             tool_calls: calls,
             usage,
+            usage_reporting: summary.usage_reporting,
+            finish_reason: summary.finish_reason,
         };
         if let Err(error) = enforce_output_constraints(&request, &mut output) {
             send_response_failure(
@@ -978,6 +984,8 @@ fn responses_stream(
             text,
             tool_calls: calls,
             usage,
+            usage_reporting: _,
+            finish_reason,
         } = output;
         if buffer_until_validation
             && !text.is_empty()
@@ -1007,7 +1015,11 @@ fn responses_stream(
             } else {
                 "commentary"
             }),
-            Some("completed"),
+            Some(if finish_reason.is_complete() {
+                "completed"
+            } else {
+                "incomplete"
+            }),
         );
         for event in [
             named_event(
@@ -1058,19 +1070,27 @@ fn responses_stream(
         } else {
             "incomplete"
         };
-        let final_response = response_resource(
-            &response_id,
-            &request.model,
-            status,
-            &output,
-            usage,
-            None,
-            created,
+        let final_response = annotate_response_finish(
+            response_resource(
+                &response_id,
+                &request.model,
+                status,
+                &output,
+                usage,
+                None,
+                created,
+            ),
+            finish_reason,
         );
+        let event_type = if finish_reason.is_complete() {
+            "response.completed"
+        } else {
+            "response.incomplete"
+        };
         let _ = sse_tx
             .send(Ok(named_event(
-                "response.completed",
-                json!({"type":"response.completed","response":final_response}),
+                event_type,
+                json!({"type":event_type,"response":final_response}),
             )))
             .await;
         let _ = sse_tx.send(Ok(Event::default().data("[DONE]"))).await;
@@ -1256,22 +1276,20 @@ fn named_event(name: &'static str, value: Value) -> Event {
 }
 
 fn chat_completion(request: &GenerationRequest, output: &GenerationOutput, created: u64) -> Value {
-    let (message, finish_reason) = if output.tool_calls.is_empty() {
-        (json!({"role": "assistant", "content": output.text}), "stop")
+    let message = if output.tool_calls.is_empty() {
+        json!({"role": "assistant", "content": output.text})
     } else {
-        (
-            json!({
-                "role": "assistant",
-                "content": output.text,
-                "tool_calls": output.tool_calls.iter().map(|call| json!({
-                    "id": call.id,
-                    "type": "function",
-                    "function": {"name": call.name, "arguments": call.arguments}
-                })).collect::<Vec<_>>()
-            }),
-            "tool_calls",
-        )
+        json!({
+            "role": "assistant",
+            "content": output.text,
+            "tool_calls": output.tool_calls.iter().map(|call| json!({
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": call.arguments}
+            })).collect::<Vec<_>>()
+        })
     };
+    let finish_reason = chat_finish_reason(output);
     json!({
         "id": request.request_id,
         "object": "chat.completion",
@@ -1280,6 +1298,27 @@ fn chat_completion(request: &GenerationRequest, output: &GenerationOutput, creat
         "choices": [{"index":0,"message":message,"finish_reason":finish_reason}],
         "usage": chat_usage(output.usage)
     })
+}
+
+const fn chat_finish_reason(output: &GenerationOutput) -> &'static str {
+    match output.finish_reason {
+        GenerationFinishReason::Length => "length",
+        GenerationFinishReason::ContentFilter => "content_filter",
+        GenerationFinishReason::ToolCalls => "tool_calls",
+        GenerationFinishReason::Stop if !output.tool_calls.is_empty() => "tool_calls",
+        GenerationFinishReason::Stop => "stop",
+    }
+}
+
+fn annotate_response_finish(mut response: Value, finish: GenerationFinishReason) -> Value {
+    let reason = match finish {
+        GenerationFinishReason::Length => "max_output_tokens",
+        GenerationFinishReason::ContentFilter => "content_filter",
+        GenerationFinishReason::Stop | GenerationFinishReason::ToolCalls => return response,
+    };
+    response["status"] = json!("incomplete");
+    response["incomplete_details"] = json!({"reason":reason});
+    response
 }
 
 fn chat_usage(usage: Usage) -> Value {
@@ -1330,7 +1369,7 @@ fn response_items(state: &ApiState, item_id: &str, output: &GenerationOutput) ->
     if !output.text.is_empty() || output.tool_calls.is_empty() {
         items.push(assistant_item(
             item_id,
-            if output.text.is_empty() {
+            if output.text.is_empty() && output.finish_reason.is_complete() {
                 "No response from OpenClaw."
             } else {
                 &output.text
@@ -1340,7 +1379,11 @@ fn response_items(state: &ApiState, item_id: &str, output: &GenerationOutput) ->
             } else {
                 "commentary"
             }),
-            Some("completed"),
+            Some(if output.finish_reason.is_complete() {
+                "completed"
+            } else {
+                "incomplete"
+            }),
         ));
     }
     items.extend(
@@ -2360,6 +2403,29 @@ fn oversized_stream_error() -> ApiError {
     output_constraint_error("The provider exceeded the maximum buffered response size.")
 }
 
+fn enforce_generation_tool_choice(
+    choice: &ToolChoice,
+    tools: &[ClientTool],
+    calls: &[ToolCall],
+    finish: GenerationFinishReason,
+) -> Result<(), ApiError> {
+    if !finish.is_complete() {
+        return if calls.is_empty() {
+            Ok(())
+        } else {
+            Err(output_constraint_error(
+                "A partial provider result cannot include completed tool calls.",
+            ))
+        };
+    }
+    if finish == GenerationFinishReason::ToolCalls && calls.is_empty() {
+        return Err(output_constraint_error(
+            "The provider ended for tool calls but returned no calls.",
+        ));
+    }
+    enforce_tool_choice(choice, tools, calls)
+}
+
 fn enforce_output_constraints(
     request: &GenerationRequest,
     output: &mut GenerationOutput,
@@ -2388,7 +2454,8 @@ fn enforce_output_constraints(
     {
         output.text.truncate(index);
     }
-    if output.tool_calls.is_empty()
+    if output.finish_reason.is_complete()
+        && output.tool_calls.is_empty()
         && request
             .response_format
             .as_ref()
@@ -2543,6 +2610,9 @@ fn provider_api_error(error: PortError) -> ApiError {
             error.message,
             "committed_but_not_durable",
         ),
+        PortErrorKind::OutcomeUnknown => {
+            ApiError::recovery_required("outcome_unknown", error.message)
+        }
         PortErrorKind::Internal => ApiError::openai(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal error",
@@ -2578,6 +2648,74 @@ mod tests {
             response_format: None,
             request_id: String::new(),
             session_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn partial_generation_serializers_preserve_finish_text_and_usage_without_tools() {
+        use super::{GenerationFinishReason, GenerationOutput, Usage};
+        use serde_json::json;
+
+        for (finish_reason, chat_reason, response_reason) in [
+            (
+                GenerationFinishReason::Length,
+                "length",
+                "max_output_tokens",
+            ),
+            (
+                GenerationFinishReason::ContentFilter,
+                "content_filter",
+                "content_filter",
+            ),
+        ] {
+            let mut output = GenerationOutput {
+                usage_reporting: crate::UsageReporting::Complete,
+                text: "partial answer".to_owned(),
+                tool_calls: Vec::new(),
+                usage: Usage {
+                    input_tokens: 4,
+                    output_tokens: 3,
+                    total_tokens: 7,
+                },
+                finish_reason,
+            };
+            let mut request = request(None);
+            request.response_format = Some(json!({"type":"json_object"}));
+            assert!(super::enforce_output_constraints(&request, &mut output).is_ok());
+            assert!(
+                super::enforce_generation_tool_choice(
+                    &ToolChoice::Required,
+                    &[],
+                    &[],
+                    finish_reason
+                )
+                .is_ok()
+            );
+            let chat = super::chat_completion(&request, &output, 0);
+            assert_eq!(chat["choices"][0]["finish_reason"], chat_reason);
+            assert_eq!(chat["choices"][0]["message"]["content"], "partial answer");
+            assert_eq!(chat["usage"]["total_tokens"], 7);
+            let response = super::annotate_response_finish(
+                super::response_resource("owned", "owned", "completed", &[], output.usage, None, 0),
+                finish_reason,
+            );
+            assert_eq!(response["status"], "incomplete");
+            assert_eq!(response["incomplete_details"]["reason"], response_reason);
+            assert_eq!(response["usage"]["total_tokens"], 7);
+            let call = super::ToolCall {
+                id: "owned".to_owned(),
+                name: "lookup".to_owned(),
+                arguments: "{}".to_owned(),
+            };
+            assert!(
+                super::enforce_generation_tool_choice(
+                    &ToolChoice::Auto,
+                    &[],
+                    &[call],
+                    finish_reason
+                )
+                .is_err()
+            );
         }
     }
 

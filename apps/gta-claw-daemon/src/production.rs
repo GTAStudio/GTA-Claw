@@ -1,8 +1,12 @@
 //! Production service composition over the shipped crate APIs.
 
+mod native_provider;
+
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
-use std::io::{self, Read};
+use std::io;
+#[cfg(unix)]
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -550,6 +554,7 @@ struct DaemonLegacyReload {
     proxy: ProxyPolicy,
     diagnostics: Arc<Diagnostics>,
     skill_count: usize,
+    native_model: Option<String>,
 }
 
 impl LegacyReloadPort for DaemonLegacyReload {
@@ -578,6 +583,7 @@ impl LegacyReloadPort for DaemonLegacyReload {
             let model = role
                 .model
                 .as_deref()
+                .or(self.native_model.as_deref())
                 .unwrap_or_else(|| snapshot.core().copilot().default_model());
             self.provider.set_default_model(model).map_err(|error| {
                 self.diagnostics
@@ -615,6 +621,7 @@ pub struct ProductionService {
     diagnostics: Arc<Diagnostics>,
     requests: RequestAccounting,
     http_shutdown: CancellationToken,
+    mcp_shutdown: CancellationToken,
     http_tasks: JoinSet<(&'static str, io::Result<()>)>,
     gateway: Option<ServerHandle>,
     device_flow: Option<Arc<LegacyDeviceFlowAdapter>>,
@@ -834,13 +841,35 @@ impl ProductionService {
             }
         };
         let plugin_tools = plugins.tools();
+        let workspace_tools = crate::adapters::native_tools::WorkspaceTools::from_environment(
+            Arc::clone(&audit),
+            &proxy,
+        )
+        .map_err(|error| ProductionError::message("workspace-tools", error))?;
         let model_tools = RuntimeModelTools::new(Arc::clone(&plugin_tools));
-        let active_skill_count = plugins.summary().activated();
+        if let Some(workspace) = workspace_tools.as_ref() {
+            model_tools
+                .attach_workspace(Arc::clone(workspace))
+                .map_err(|error| ProductionError::message("workspace-tools", error))?;
+        }
+        let native_skills = crate::adapters::native_skills::NativeSkills::from_environment(
+            workspace_tools.clone(),
+            Arc::clone(&plugin_tools),
+        )
+        .map_err(|error| ProductionError::message("native-skills", error))?;
+        let active_skill_count = native_skills.definitions().len();
+        diagnostics.record(format!(
+            "native skill execution report: {}",
+            native_skills.summary()
+        ));
+        model_tools
+            .attach_skills(Arc::clone(&native_skills))
+            .map_err(|error| ProductionError::message("native-skills", error))?;
         let plugin_activation = plugins.summary().as_json();
         diagnostics.record(format!("plugin activation report: {plugin_activation}"));
         info!(
             stage = "plugins",
-            activated = active_skill_count,
+            activated = plugins.summary().activated(),
             report = %plugin_activation,
             "signed plugin discovery completed"
         );
@@ -849,10 +878,32 @@ impl ProductionService {
         let mut legacy_settings = legacy_settings(&loaded.snapshot)?;
         let channels = channel_statuses(&legacy_settings)?;
 
-        let configured_model = role
-            .model
-            .clone()
-            .unwrap_or_else(|| loaded.snapshot.core().copilot().default_model().to_owned());
+        let native_provider = native_provider::NativeProviderPolicy::from_environment()
+            .map_err(|error| ProductionError::message("native-provider-policy", error))?;
+        if native_provider.is_some() && options.smoke {
+            return Err(ProductionError::message(
+                "native-provider-policy",
+                "explicit native provider cannot be replaced by smoke mode",
+            ));
+        }
+        let configured_model = if let Some(policy) = &native_provider {
+            if role
+                .model
+                .as_ref()
+                .is_some_and(|model| model != &policy.model)
+            {
+                return Err(ProductionError::message(
+                    "native-provider-policy",
+                    "role model conflicts with the explicitly selected native provider model",
+                ));
+            }
+            legacy_settings.device_flow_enabled = false;
+            policy.model.clone()
+        } else {
+            role.model
+                .clone()
+                .unwrap_or_else(|| loaded.snapshot.core().copilot().default_model().to_owned())
+        };
         let provider = Arc::new(SwappableProvider::new(
             configured_model.clone(),
             role.prompt,
@@ -860,10 +911,32 @@ impl ProductionService {
                 max_conversations: legacy_settings.session_max_entries,
                 idle_timeout: legacy_settings.session_idle_timeout,
             },
-            model_tools as Arc<dyn ModelToolCatalog>,
+            Arc::clone(&model_tools) as Arc<dyn ModelToolCatalog>,
             Arc::clone(&readiness),
         ));
-        let provider_to_activate: Option<Arc<dyn Provider>> = if options.smoke {
+        let native_model = native_provider.as_ref().map(|policy| policy.model.clone());
+        let max_observed_provider_tokens = native_provider
+            .as_ref()
+            .and_then(|policy| policy.max_observed_turn_tokens);
+        if native_model.is_some() {
+            provider
+                .pin_default_model()
+                .map_err(|error| ProductionError::message("native-provider-policy", error))?;
+        }
+        let provider_to_activate: Option<Arc<dyn Provider>> = if let Some(policy) = native_provider
+        {
+            let origins = native_provider::enrolled_origins_from_environment()
+                .map_err(|error| ProductionError::message("native-provider-origins", error))?;
+            Some(
+                policy
+                    .build(proxy.clone(), &origins, |reference| {
+                        resolve_secret(reference).map_err(|_| {
+                            "native provider credential could not be resolved".to_owned()
+                        })
+                    })
+                    .map_err(|error| ProductionError::message("native-provider", error))?,
+            )
+        } else if options.smoke {
             warn!(stage = "provider", "explicit smoke provider enabled");
             Some(Arc::new(
                 SmokeProvider::new().map_err(|error| ProductionError::new("provider", error))?,
@@ -911,7 +984,7 @@ impl ProductionService {
             Arc::clone(&diagnostics),
         ));
         let reload_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let agent_runtime = AgentRuntime::new(
+        let agent_runtime = AgentRuntime::new_with_provider_budget(
             Arc::clone(&provider),
             Arc::clone(&plugin_tools),
             &state_dir,
@@ -920,8 +993,30 @@ impl ProductionService {
             legacy_settings.session_max_entries,
             legacy_settings.session_idle_timeout,
             Arc::clone(&diagnostics),
+            max_observed_provider_tokens,
         )
         .map_err(|error| ProductionError::message("runtime", error))?;
+        agent_runtime
+            .attach_skills(native_skills)
+            .map_err(|error| ProductionError::message("native-skills", error))?;
+        agent_runtime
+            .attach_tool_audit(Arc::clone(&audit))
+            .map_err(|error| ProductionError::message("tool-audit", error))?;
+        agent_runtime
+            .attach_gateway_authorization(Arc::new(gateway_pairing.devices()))
+            .map_err(|error| ProductionError::message("gateway-authorization", error))?;
+        if let Some(workspace) = workspace_tools {
+            agent_runtime
+                .attach_workspace(workspace)
+                .map_err(|error| ProductionError::message("workspace-tools", error))?;
+        }
+        agent_runtime
+            .configure_native_mcp(&model_tools)
+            .await
+            .map_err(|error| ProductionError::message("native-mcp-tools", error))?;
+        agent_runtime
+            .configure_explicit_memory(&model_tools)
+            .map_err(|error| ProductionError::message("native-memory", error))?;
         let http_tools = agent_runtime.http_tools(Arc::clone(&plugin_tools));
         readiness.set("runtime", true);
 
@@ -960,6 +1055,7 @@ impl ProductionService {
                 &whatsapp.access_token,
                 &whatsapp.app_secret,
                 Arc::clone(&diagnostics),
+                Arc::clone(&agent_runtime),
             )
             .map_err(|error| ProductionError::new("whatsapp", error))?;
             Some((
@@ -1049,6 +1145,7 @@ impl ProductionService {
             proxy: proxy.clone(),
             diagnostics: Arc::clone(&diagnostics),
             skill_count: active_skill_count,
+            native_model,
         });
         let updates_enabled = updates_enabled(&loaded.snapshot)
             .map_err(|error| ProductionError::message("updates", error))?;
@@ -1097,7 +1194,7 @@ impl ProductionService {
             );
         }
         let api = HttpApi::with_serving_state(
-            api_config(admin_token.clone()),
+            api_config(admin_token.clone())?,
             services,
             Arc::new(serving.clone()),
         );
@@ -1184,10 +1281,13 @@ impl ProductionService {
             Arc::new(gateway_authenticator),
             Arc::new(gateway_authorization),
         )
-        .map_err(|error| ProductionError::new("gateway-build", error))?
-        .bind(gateway_requested)
-        .await
-        .map_err(|error| ProductionError::new("gateway-bind", error))?;
+        .map_err(|error| ProductionError::new("gateway-build", error))?;
+        let gateway = agent_runtime
+            .bind_gateway(gateway)
+            .map_err(|error| ProductionError::message("gateway-runtime", error))?
+            .bind(gateway_requested)
+            .await
+            .map_err(|error| ProductionError::new("gateway-bind", error))?;
 
         let http_listener = TcpListener::bind(http_requested)
             .await
@@ -1304,6 +1404,7 @@ impl ProductionService {
             diagnostics,
             requests,
             http_shutdown,
+            mcp_shutdown: api.mcp_shutdown_token(),
             http_tasks,
             gateway: Some(gateway),
             device_flow,
@@ -1407,6 +1508,7 @@ impl ProductionService {
         let started = Instant::now();
         let completed_before_drain = self.requests.completed();
         self.serving.begin_draining();
+        self.mcp_shutdown.cancel();
         self.readiness.set("http", false);
         self.readiness.set("legacy-http", false);
         self.readiness.set("mcp", false);
@@ -1830,14 +1932,88 @@ fn channel_statuses(settings: &LegacySettings) -> Result<Vec<Value>, ProductionE
     Ok(statuses)
 }
 
-fn api_config(admin_token: Option<String>) -> ApiConfig {
+fn api_config(admin_token: Option<String>) -> Result<ApiConfig, ProductionError> {
+    api_config_from_tokens(
+        admin_token,
+        mcp_token("GTA_CLAW_MCP_OWNER_TOKEN")?,
+        mcp_token("GTA_CLAW_MCP_TOKEN")?,
+    )
+}
+
+fn api_config_from_tokens(
+    admin_token: Option<String>,
+    owner: Option<String>,
+    reader: Option<String>,
+) -> Result<ApiConfig, ProductionError> {
     let credentials = admin_token
         .map(|token| {
             BearerCredential::new(&token, Role::Operator, ScopeSet::from_scopes(Scope::ALL))
         })
         .into_iter()
         .collect();
-    ApiConfig::new(BearerAuthenticator::new(credentials))
+    let mut config = ApiConfig::new(BearerAuthenticator::new(credentials));
+    if owner.is_some() && owner == reader {
+        return Err(ProductionError::message(
+            "mcp-auth",
+            "MCP owner and non-owner credentials must be distinct",
+        ));
+    }
+    config.mcp_owner_authenticator = BearerAuthenticator::new(
+        owner
+            .into_iter()
+            .map(|token| {
+                BearerCredential::new(&token, Role::Operator, ScopeSet::from_scopes(Scope::ALL))
+            })
+            .collect(),
+    );
+    config.mcp_authenticator = BearerAuthenticator::new(
+        reader
+            .into_iter()
+            .map(|token| {
+                BearerCredential::new(
+                    &token,
+                    Role::Operator,
+                    ScopeSet::from_scopes([Scope::OperatorRead]),
+                )
+            })
+            .collect(),
+    );
+    Ok(config)
+}
+
+fn mcp_token(name: &str) -> Result<Option<String>, ProductionError> {
+    parse_mcp_token(name, std::env::var(name))
+}
+
+const MAX_MCP_TOKEN_BYTES: usize = 4096;
+
+fn parse_mcp_token(
+    name: &str,
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<String>, ProductionError> {
+    match value {
+        Ok(token)
+            if token.is_empty()
+                || token.len() > MAX_MCP_TOKEN_BYTES
+                || !token.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric()
+                        || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
+                }) =>
+        {
+            Err(ProductionError::message(
+                "mcp-auth",
+                format!(
+                    "{name} must contain 1..={MAX_MCP_TOKEN_BYTES} ASCII bearer-token bytes without whitespace"
+                ),
+            ))
+        }
+        Ok(token) => Ok(Some(token)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ProductionError::message(
+            "mcp-auth",
+            format!("{name} is not valid Unicode"),
+        )),
+    }
 }
 
 fn admin_token(snapshot: &ConfigSnapshot) -> Result<Option<String>, ProductionError> {
@@ -2370,13 +2546,30 @@ pub fn check_configuration(
 ) -> Result<(), ProductionError> {
     validate_exposure(options)?;
     let _ = options.state_dir()?;
-    let _ = proxy_policy(&loaded.snapshot)?;
+    let proxy = proxy_policy(&loaded.snapshot)?;
     let _ = admin_token(&loaded.snapshot)?;
     let _ = updates_enabled(&loaded.snapshot)
         .map_err(|error| ProductionError::message("updates", error))?;
     let legacy_settings = legacy_settings(&loaded.snapshot)?;
     let _ = channel_statuses(&legacy_settings)?;
-    if !options.smoke {
+    if let Some(policy) = native_provider::NativeProviderPolicy::from_environment()
+        .map_err(|error| ProductionError::message("native-provider-policy", error))?
+    {
+        if options.smoke {
+            return Err(ProductionError::message(
+                "native-provider-policy",
+                "explicit native provider cannot be replaced by smoke mode",
+            ));
+        }
+        let origins = native_provider::enrolled_origins_from_environment()
+            .map_err(|error| ProductionError::message("native-provider-origins", error))?;
+        policy
+            .build(proxy, &origins, |reference| {
+                resolve_secret(reference)
+                    .map_err(|_| "native provider credential could not be resolved".to_owned())
+            })
+            .map_err(|error| ProductionError::message("native-provider", error))?;
+    } else if !options.smoke {
         let auth = loaded.snapshot.core().auth();
         if let Some(reference) = auth.github_pat() {
             let _ = resolve_secret(reference)?;
@@ -2403,6 +2596,73 @@ mod tests {
     use super::{CommandLine, CommandMode, ProductionOptions, resolve_file_config};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn mcp_tokens_are_bounded_and_errors_never_contain_credentials() {
+        let name = "GTA_CLAW_MCP_TOKEN";
+        for token in [
+            String::new(),
+            " fixture-private".to_owned(),
+            "fixture-private\tvalue".to_owned(),
+            "fixture-private\n".to_owned(),
+            "fixture-private\u{e9}".to_owned(),
+            "fixture-private\"value".to_owned(),
+            "fixture-private".repeat(super::MAX_MCP_TOKEN_BYTES),
+        ] {
+            let error = super::parse_mcp_token(name, Ok(token))
+                .expect_err("unsafe credential")
+                .to_string();
+            assert!(error.contains(name));
+            assert!(!error.contains("fixture-private"));
+        }
+        for token in [
+            "native_credential-1+/=".to_owned(),
+            "x".repeat(super::MAX_MCP_TOKEN_BYTES),
+        ] {
+            assert_eq!(
+                super::parse_mcp_token(name, Ok(token.clone())).expect("valid token"),
+                Some(token)
+            );
+        }
+        assert!(
+            super::parse_mcp_token(name, Err(std::env::VarError::NotPresent))
+                .expect("optional token")
+                .is_none()
+        );
+        let error = super::parse_mcp_token(
+            name,
+            Err(std::env::VarError::NotUnicode(OsString::from(
+                "fixture-private",
+            ))),
+        )
+        .expect_err("non-Unicode environment")
+        .to_string();
+        assert!(!error.contains("fixture-private"));
+    }
+
+    #[test]
+    fn mcp_owner_and_reader_cannot_share_a_credential() {
+        let result = super::api_config_from_tokens(
+            Some("http-fixture".to_owned()),
+            Some("shared-private-fixture".to_owned()),
+            Some("shared-private-fixture".to_owned()),
+        );
+        let Err(error) = result else {
+            panic!("same owner/reader token must be rejected");
+        };
+        let error = error.to_string();
+        assert!(error.contains("must be distinct"));
+        assert!(!error.contains("shared-private-fixture"));
+        assert!(super::api_config_from_tokens(None, None, None).is_ok());
+        assert!(
+            super::api_config_from_tokens(
+                None,
+                Some("owner-fixture".to_owned()),
+                Some("reader-fixture".to_owned())
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn the_full_command_line_is_parsed_without_a_framework() {

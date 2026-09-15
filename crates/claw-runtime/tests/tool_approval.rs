@@ -2,7 +2,9 @@
 
 mod support;
 
+use std::future::Future as _;
 use std::sync::{Arc, Mutex, mpsc};
+use std::task::{Context, Waker};
 use std::time::Duration;
 
 use claw_application::model::approval::{
@@ -13,7 +15,10 @@ use claw_application::model::ids::{ApprovalId, TurnId};
 use claw_application::model::message::ToolCall;
 use claw_application::model::session::SessionState;
 use claw_application::ports::approval::ApprovalPort;
-use claw_application::ports::tool::{ToolInvocation, ToolStatus};
+use claw_application::ports::tool::{
+    InvocationAccess, InvocationAuthority, InvocationSource, ToolDescriptor, ToolInvocation,
+    ToolOutcome, ToolPort, ToolStatus,
+};
 use claw_application::ports::{PortError, PortFuture};
 use claw_runtime::approval::{ApprovalBroker, ApprovalError, ApprovalTicket};
 use claw_runtime::command::{CommandError, OperatorScope, ScopeSet};
@@ -47,6 +52,754 @@ fn ticket(tool: &str) -> ApprovalTicket {
         tool_name: tool.to_owned(),
         arguments: "{}".to_owned(),
     }
+}
+
+struct AuthorityTools(Mutex<Vec<InvocationAuthority>>);
+
+struct AuthorityRevocation(CancellationToken);
+
+impl claw_application::ports::tool::InvocationRevocation for AuthorityRevocation {
+    fn is_revoked(&self) -> bool {
+        self.0.is_cancelled()
+    }
+    fn revoked(&self) -> PortFuture<'_, ()> {
+        Box::pin(self.0.cancelled())
+    }
+}
+
+struct ScopedCallTools {
+    calls: Mutex<Vec<claw_application::model::ids::ToolCallId>>,
+    cancelled: Mutex<Vec<claw_application::model::ids::ToolCallId>>,
+    mutates: bool,
+}
+
+impl ToolPort for ScopedCallTools {
+    fn describe(&self) -> Vec<ToolDescriptor> {
+        let mut descriptor = readonly_tool("write_file");
+        descriptor.mutates_workspace = self.mutates;
+        vec![descriptor]
+    }
+    fn invoke(
+        &self,
+        _invocation: ToolInvocation,
+    ) -> PortFuture<'_, Result<ToolOutcome, PortError>> {
+        panic!("anonymous path");
+    }
+    fn bind_authorized(
+        &self,
+        _invocation: &ToolInvocation,
+        _authority: &InvocationAuthority,
+    ) -> Result<claw_application::ports::tool::ToolBinding, PortError> {
+        claw_application::ports::tool::ToolBinding::new("write_file", 1)
+    }
+    fn invoke_bound(
+        &self,
+        invocation: ToolInvocation,
+        _authority: InvocationAuthority,
+        _binding: claw_application::ports::tool::ToolBinding,
+    ) -> PortFuture<'_, Result<ToolOutcome, PortError>> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(invocation.call.call_id);
+        Box::pin(std::future::pending())
+    }
+    fn cancel(
+        &self,
+        id: &claw_application::model::ids::ToolCallId,
+    ) -> PortFuture<'_, Result<(), PortError>> {
+        self.cancelled.lock().expect("cancelled").push(id.clone());
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+#[tokio::test]
+async fn authorized_calls_with_repeated_model_ids_have_distinct_host_cancellation_ids() {
+    let clock = FakeClock::new(0);
+    let approvals = RecordingApprovals::new();
+    let broker = broker_over(&clock, &approvals, Duration::from_secs(30));
+    let tools = Arc::new(ScopedCallTools {
+        calls: Mutex::new(Vec::new()),
+        cancelled: Mutex::new(Vec::new()),
+        mutates: false,
+    });
+    let executor = ToolExecutor::new(tools.clone(), broker, clock, ToolExecutorConfig::default());
+    let authority = InvocationAuthority::new(
+        InvocationSource::Gateway,
+        "device",
+        None,
+        InvocationAccess::Execute,
+        0,
+    )
+    .expect("authority");
+    let first_cancel = CancellationToken::new();
+    let second_cancel = CancellationToken::new();
+    let first_call = authorized_invocation();
+    let original_id = first_call.call.call_id.clone();
+    let mut second_call = first_call.clone();
+    second_call.session_id = session("other-session");
+    let mut first =
+        Box::pin(executor.execute_authorized(first_call, Some(authority.clone()), &first_cancel));
+    let mut second =
+        Box::pin(executor.execute_authorized(second_call, Some(authority), &second_cancel));
+    assert!(support::poll_once(&mut first).is_pending());
+    assert!(support::poll_once(&mut second).is_pending());
+    let ids = tools.calls.lock().expect("host calls").clone();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    first_cancel.cancel();
+    assert_eq!(
+        first.await.expect("first cancellation").call_id,
+        original_id
+    );
+    assert_eq!(
+        *tools.cancelled.lock().expect("cancelled"),
+        vec![ids[0].clone()]
+    );
+    assert!(support::poll_once(&mut second).is_pending());
+    second_cancel.cancel();
+    assert_eq!(
+        second.await.expect("second cancellation").status,
+        ToolStatus::Cancelled
+    );
+}
+
+impl ToolPort for AuthorityTools {
+    fn describe(&self) -> Vec<ToolDescriptor> {
+        vec![guarded_tool("write_file")]
+    }
+
+    fn bind_authorized(
+        &self,
+        _invocation: &ToolInvocation,
+        _authority: &InvocationAuthority,
+    ) -> Result<claw_application::ports::tool::ToolBinding, PortError> {
+        claw_application::ports::tool::ToolBinding::new("write_file", 1)
+    }
+
+    fn invoke_bound(
+        &self,
+        invocation: ToolInvocation,
+        authority: InvocationAuthority,
+        binding: claw_application::ports::tool::ToolBinding,
+    ) -> PortFuture<'_, Result<ToolOutcome, PortError>> {
+        assert_eq!(binding.revision(), 1);
+        self.invoke_authorized(invocation, authority)
+    }
+
+    fn invoke(
+        &self,
+        _invocation: ToolInvocation,
+    ) -> PortFuture<'_, Result<ToolOutcome, PortError>> {
+        panic!("authenticated execution must never enter the anonymous adapter");
+    }
+
+    fn invoke_authorized(
+        &self,
+        invocation: ToolInvocation,
+        authority: InvocationAuthority,
+    ) -> PortFuture<'_, Result<ToolOutcome, PortError>> {
+        self.0.lock().expect("recorded authority").push(authority);
+        Box::pin(async move {
+            Ok(ToolOutcome {
+                call_id: invocation.call.call_id,
+                status: ToolStatus::Ok,
+                output: "verified".to_owned(),
+                changed_workspace: true,
+            })
+        })
+    }
+
+    fn cancel(
+        &self,
+        _id: &claw_application::model::ids::ToolCallId,
+    ) -> PortFuture<'_, Result<(), PortError>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+#[tokio::test]
+async fn direct_tool_turns_use_bound_approval_without_model_rounds() {
+    for decision in ["approve", "deny", "cancel"] {
+        let clock = FakeClock::new(0);
+        let approvals = RecordingApprovals::new();
+        let state = MemoryState::new();
+        let provider = ScriptedProvider::new(Vec::new());
+        let tools = Arc::new(AuthorityTools(Mutex::new(Vec::new())));
+        let runtime = Runtime::new(
+            RuntimePorts {
+                clock,
+                provider: provider.clone(),
+                state: state.clone(),
+                tools: tools.clone(),
+                approvals: approvals.clone(),
+                goals: MemoryGoals::new(),
+                context: SimpleContext::new(),
+            },
+            RuntimeConfig {
+                require_tool_authority: true,
+                ..RuntimeConfig::default()
+            },
+        );
+        let identity = InvocationAuthority::new(
+            InvocationSource::Gateway,
+            "direct-device",
+            None,
+            InvocationAccess::Execute,
+            0,
+        )
+        .expect("authority");
+        let session_id = session(&format!("direct-{decision}"));
+        let turn = runtime
+            .submit_authorized(
+                &session_id,
+                r#"!tool {"name":"write_file","arguments":{"path":"reviewed.txt"}}"#,
+                identity.clone(),
+            )
+            .await
+            .expect("direct turn admitted");
+        support::eventually("direct approval presented", || {
+            !runtime.approvals().outstanding().is_empty()
+        })
+        .await;
+        assert!(provider.requests().is_empty());
+        assert!(tools.0.lock().expect("calls").is_empty());
+        assert_eq!(approvals.authorities(), vec![identity.clone()]);
+        if decision == "cancel" {
+            runtime
+                .dispatch_command(&session_id, "/cancel", ScopeSet::all())
+                .await
+                .expect("cancel pending direct command");
+        } else {
+            let pending = runtime.approvals().outstanding()[0].approval_id.clone();
+            let (_, token) = runtime
+                .approvals()
+                .binding(&pending)
+                .expect("bound preview");
+            runtime
+                .approvals()
+                .resolve_bound(
+                    &pending,
+                    if decision == "approve" {
+                        ApprovalDecision::approve_once()
+                    } else {
+                        ApprovalDecision::deny_once()
+                    },
+                    &token,
+                )
+                .expect("explicit decision");
+        }
+        let outcome = turn.join().await.expect("direct turn settled");
+        assert_eq!(outcome.rounds, 0);
+        assert_eq!(outcome.tool_outcomes.len(), 1);
+        assert!(provider.requests().is_empty());
+        assert_eq!(
+            state
+                .turn(&session_id, outcome.turn)
+                .expect("persisted direct turn")
+                .state,
+            outcome.state
+        );
+        let called = tools.0.lock().expect("calls").clone();
+        match decision {
+            "approve" => {
+                assert_eq!(called, vec![identity]);
+                assert_eq!(outcome.tool_outcomes[0].status, ToolStatus::Ok);
+                assert_eq!(outcome.message.expect("direct result").text, "verified");
+            }
+            "deny" => {
+                assert!(called.is_empty());
+                assert_eq!(outcome.tool_outcomes[0].status, ToolStatus::Denied);
+                assert_eq!(outcome.state, SessionState::Blocked);
+            }
+            _ => {
+                assert!(called.is_empty());
+                assert_eq!(outcome.tool_outcomes[0].status, ToolStatus::Cancelled);
+                assert_eq!(outcome.state, SessionState::Cancelled);
+            }
+        }
+        runtime.shutdown().await.expect("runtime shutdown");
+        assert_eq!(runtime.tracked_tasks(), 0);
+    }
+}
+
+#[tokio::test]
+async fn direct_tool_turns_refuse_anonymous_and_readonly_before_state_writes() {
+    let state = MemoryState::new();
+    let provider = ScriptedProvider::new(Vec::new());
+    let tools = Arc::new(AuthorityTools(Mutex::new(Vec::new())));
+    let runtime = Runtime::new(
+        RuntimePorts {
+            clock: FakeClock::new(0),
+            provider: provider.clone(),
+            state: state.clone(),
+            tools: tools.clone(),
+            approvals: RecordingApprovals::new(),
+            goals: MemoryGoals::new(),
+            context: SimpleContext::new(),
+        },
+        RuntimeConfig::default(),
+    );
+    let input = r#"!tool {"name":"write_file","arguments":{}}"#;
+    assert!(runtime.submit(&session("anonymous"), input).await.is_err());
+    let readonly = InvocationAuthority::new(
+        InvocationSource::Gateway,
+        "read-device",
+        None,
+        InvocationAccess::ReadOnly,
+        0,
+    )
+    .expect("readonly authority");
+    assert!(
+        runtime
+            .submit_authorized(&session("readonly"), input, readonly)
+            .await
+            .is_err()
+    );
+    assert!(state.history().is_empty());
+    assert!(provider.requests().is_empty());
+    assert!(tools.0.lock().expect("calls").is_empty());
+    assert!(runtime.approvals().outstanding().is_empty());
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn direct_tool_write_cancellation_keeps_unknown_without_model_retry() {
+    let state = MemoryState::new();
+    let provider = ScriptedProvider::new(Vec::new());
+    let tools = Arc::new(ScopedCallTools {
+        calls: Mutex::new(Vec::new()),
+        cancelled: Mutex::new(Vec::new()),
+        mutates: true,
+    });
+    let runtime = Runtime::new(
+        RuntimePorts {
+            clock: FakeClock::new(0),
+            provider: provider.clone(),
+            state: state.clone(),
+            tools: tools.clone(),
+            approvals: RecordingApprovals::new(),
+            goals: MemoryGoals::new(),
+            context: SimpleContext::new(),
+        },
+        RuntimeConfig {
+            require_tool_authority: true,
+            ..RuntimeConfig::default()
+        },
+    );
+    let session_id = session("cancel-direct-write");
+    let authority = InvocationAuthority::new(
+        InvocationSource::Gateway,
+        "direct-device",
+        None,
+        InvocationAccess::Execute,
+        0,
+    )
+    .expect("authority");
+    let turn = runtime
+        .submit_authorized(
+            &session_id,
+            r#"!tool {"name":"write_file","arguments":{}}"#,
+            authority,
+        )
+        .await
+        .expect("direct write");
+    support::eventually("direct write started", || {
+        !tools.calls.lock().expect("calls").is_empty()
+    })
+    .await;
+    runtime
+        .dispatch_command(&session_id, "/cancel", ScopeSet::all())
+        .await
+        .expect("cancel direct write");
+    assert!(matches!(
+        turn.join().await,
+        Err(RuntimeError::Tool(
+            claw_runtime::ToolExecutionError::OutcomeUnknown(_)
+        ))
+    ));
+    assert_eq!(tools.calls.lock().expect("calls").len(), 1);
+    assert_eq!(tools.cancelled.lock().expect("cancelled").len(), 1);
+    assert!(provider.requests().is_empty());
+    runtime.shutdown().await.expect("shutdown");
+}
+
+fn authorized_invocation() -> ToolInvocation {
+    ToolInvocation {
+        session_id: session("approvals"),
+        turn: TurnId::FIRST,
+        call: ToolCall {
+            call_id: call_id("authorized-call"),
+            name: "write_file".to_owned(),
+            arguments: "{}".to_owned(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn authorized_mutating_call_interruption_is_unknown_and_not_a_retryable_tool_result() {
+    let clock = FakeClock::new(0);
+    let approvals = RecordingApprovals::new();
+    let broker = broker_over(&clock, &approvals, Duration::from_secs(30));
+    let tools = Arc::new(ScopedCallTools {
+        calls: Mutex::new(Vec::new()),
+        cancelled: Mutex::new(Vec::new()),
+        mutates: true,
+    });
+    let executor = ToolExecutor::new(tools.clone(), broker, clock, ToolExecutorConfig::default());
+    let authority = InvocationAuthority::new(
+        InvocationSource::Gateway,
+        "device",
+        None,
+        InvocationAccess::Execute,
+        0,
+    )
+    .expect("authority");
+    let cancellation = CancellationToken::new();
+    let mut call = Box::pin(executor.execute_authorized(
+        authorized_invocation(),
+        Some(authority),
+        &cancellation,
+    ));
+    assert!(support::poll_once(&mut call).is_pending());
+    cancellation.cancel();
+    assert!(matches!(
+        call.await,
+        Err(claw_runtime::tool::ToolExecutionError::OutcomeUnknown(_))
+    ));
+    assert_eq!(
+        tools
+            .cancelled
+            .lock()
+            .expect("cancelled host invocation")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn authorized_approval_revocation_prevents_pending_and_already_accepted_execution() {
+    for accepted in [false, true] {
+        let clock = FakeClock::new(0);
+        let approvals = RecordingApprovals::new();
+        let broker = broker_over(&clock, &approvals, Duration::from_secs(30));
+        let tools = Arc::new(AuthorityTools(Mutex::new(Vec::new())));
+        let executor = ToolExecutor::new(
+            tools.clone(),
+            broker.clone(),
+            clock,
+            ToolExecutorConfig::default(),
+        );
+        let revoked = CancellationToken::new();
+        let authority = InvocationAuthority::new(
+            InvocationSource::Gateway,
+            "device",
+            None,
+            InvocationAccess::Execute,
+            0,
+        )
+        .expect("authority")
+        .with_revocation(Arc::new(AuthorityRevocation(revoked.clone())));
+        let cancel = CancellationToken::new();
+        let mut call = Box::pin(executor.execute_authorized(
+            authorized_invocation(),
+            Some(authority.clone()),
+            &cancel,
+        ));
+        assert!(support::poll_once(&mut call).is_pending());
+        let id = broker.outstanding()[0].approval_id.clone();
+        let (_, token) = broker.binding(&id).expect("bound decision");
+        if accepted {
+            broker
+                .resolve_bound(&id, ApprovalDecision::approve_once(), &token)
+                .expect("accepted before revoke");
+        }
+        revoked.cancel();
+        assert!(!authority.can_execute());
+        assert!(
+            broker
+                .resolve_bound(&id, ApprovalDecision::approve_once(), &token)
+                .is_err()
+        );
+        assert_eq!(
+            call.await.expect("revocation result").status,
+            ToolStatus::Cancelled
+        );
+        assert!(tools.0.lock().expect("no tool invocation").is_empty());
+        assert!(broker.outstanding().is_empty());
+        assert!(!cancel.is_cancelled());
+    }
+}
+
+#[tokio::test]
+async fn authorized_mutating_grant_revocation_is_unknown_and_cancels_the_host_call() {
+    let clock = FakeClock::new(0);
+    let approvals = RecordingApprovals::new();
+    let broker = broker_over(&clock, &approvals, Duration::from_secs(30));
+    let tools = Arc::new(ScopedCallTools {
+        calls: Mutex::new(Vec::new()),
+        cancelled: Mutex::new(Vec::new()),
+        mutates: true,
+    });
+    let executor = ToolExecutor::new(tools.clone(), broker, clock, ToolExecutorConfig::default());
+    let revoked = CancellationToken::new();
+    let authority = InvocationAuthority::new(
+        InvocationSource::Gateway,
+        "device",
+        None,
+        InvocationAccess::Execute,
+        0,
+    )
+    .expect("authority")
+    .with_revocation(Arc::new(AuthorityRevocation(revoked.clone())));
+    let cancel = CancellationToken::new();
+    let mut call =
+        Box::pin(executor.execute_authorized(authorized_invocation(), Some(authority), &cancel));
+    assert!(support::poll_once(&mut call).is_pending());
+    revoked.cancel();
+    assert!(matches!(
+        call.await,
+        Err(claw_runtime::tool::ToolExecutionError::OutcomeUnknown(_))
+    ));
+    assert_eq!(tools.cancelled.lock().expect("cancelled call").len(), 1);
+    assert!(!cancel.is_cancelled());
+}
+
+#[tokio::test]
+async fn authorized_execution_preserves_subject_and_does_not_inherit_session_approval() {
+    let clock = FakeClock::new(0);
+    let approvals = RecordingApprovals::new();
+    let broker = broker_over(&clock, &approvals, Duration::from_secs(30));
+    let tools = Arc::new(AuthorityTools(Mutex::new(Vec::new())));
+    let executor = ToolExecutor::new(
+        tools.clone(),
+        broker.clone(),
+        clock,
+        ToolExecutorConfig::default(),
+    );
+    let cancel = CancellationToken::new();
+    let mut legacy = Box::pin(broker.request(ticket("write_file"), &cancel));
+    assert!(support::poll_once(&mut legacy).is_pending());
+    broker
+        .resolve(
+            &broker.outstanding()[0].approval_id,
+            ApprovalDecision::approve_for_session(),
+        )
+        .expect("old session decision");
+    assert!(legacy.await.expect("legacy outcome").is_approved());
+    for subject in ["device-one", "device-two"] {
+        let authority = InvocationAuthority::new(
+            InvocationSource::Gateway,
+            subject,
+            Some("verified-account"),
+            InvocationAccess::Execute,
+            4,
+        )
+        .expect("authority");
+        let mut invoked = Box::pin(executor.execute_authorized(
+            authorized_invocation(),
+            Some(authority.clone()),
+            &cancel,
+        ));
+        assert!(
+            support::poll_once(&mut invoked).is_pending(),
+            "remembered grant must not apply to authenticated calls"
+        );
+        let id = broker.outstanding()[0].approval_id.clone();
+        assert_eq!(broker.authority(&id), Some(authority.clone()));
+        assert!(
+            broker
+                .resolve(&id, ApprovalDecision::approve_for_session())
+                .is_err()
+        );
+        let (_, binding) = broker.binding(&id).expect("bound preview");
+        assert!(
+            broker
+                .resolve(&id, ApprovalDecision::approve_once())
+                .is_err()
+        );
+        assert!(
+            broker
+                .resolve_bound(&id, ApprovalDecision::approve_once(), &"f".repeat(64))
+                .is_err()
+        );
+        broker
+            .resolve_bound(&id, ApprovalDecision::approve_once(), &binding)
+            .expect("per-call bound decision");
+        assert_eq!(
+            invoked.await.expect("authorized outcome").status,
+            ToolStatus::Ok
+        );
+        assert_eq!(
+            tools.0.lock().expect("recorded identity").last(),
+            Some(&authority)
+        );
+    }
+    assert_eq!(approvals.authorities().len(), 2);
+    assert_eq!(tools.0.lock().expect("invocations").len(), 2);
+}
+
+#[tokio::test]
+async fn authorized_read_only_and_identity_losing_adapters_execute_nothing() {
+    let clock = FakeClock::new(0);
+    let approvals = RecordingApprovals::new();
+    let broker = broker_over(&clock, &approvals, Duration::from_secs(30));
+    let tools = RecordingTools::new(vec![readonly_tool("write_file")], Vec::new());
+    let executor = ToolExecutor::new(
+        tools.clone(),
+        broker.clone(),
+        clock,
+        ToolExecutorConfig::default(),
+    );
+    let cancel = CancellationToken::new();
+    let reader = InvocationAuthority::new(
+        InvocationSource::Mcp,
+        "reader",
+        None,
+        InvocationAccess::ReadOnly,
+        0,
+    )
+    .expect("reader");
+    assert_eq!(
+        executor
+            .execute_authorized(authorized_invocation(), Some(reader), &cancel)
+            .await
+            .expect("read-only denial")
+            .status,
+        ToolStatus::Denied
+    );
+    let writer = InvocationAuthority::new(
+        InvocationSource::Http,
+        "writer",
+        None,
+        InvocationAccess::Execute,
+        0,
+    )
+    .expect("writer");
+    let outcome = executor
+        .execute_authorized(authorized_invocation(), Some(writer), &cancel)
+        .await
+        .expect("unsupported identity adapter");
+    assert_eq!(outcome.status, ToolStatus::Failed);
+    assert!(outcome.output.contains("cannot bind"));
+    assert!(tools.invoked().is_empty());
+    assert!(broker.outstanding().is_empty());
+    assert!(approvals.records().is_empty());
+}
+
+#[tokio::test]
+async fn approval_redemption_rejects_expiry_before_the_waiter_observes_it() {
+    let clock = FakeClock::new(0);
+    let approvals = RecordingApprovals::new();
+    let broker = broker_over(&clock, &approvals, Duration::from_secs(1));
+    let cancel = CancellationToken::new();
+    let mut waiting = Box::pin(broker.request(ticket("write_file"), &cancel));
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    let id = broker.outstanding()[0].approval_id.clone();
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(
+        broker.resolve(&id, ApprovalDecision::approve_for_session()),
+        Err(ApprovalError::Unknown(id))
+    );
+    assert_eq!(broker.remembered(&session("approvals"), "write_file"), None);
+    assert_eq!(
+        waiting.await.expect("expiry"),
+        ApprovalOutcome::Withdrawn {
+            reason: ApprovalWithdrawal::TimedOut
+        }
+    );
+    assert!(broker.outstanding().is_empty());
+}
+
+#[tokio::test]
+async fn approval_redemption_rejects_cancellation_before_the_waiter_observes_it() {
+    let clock = FakeClock::new(0);
+    let approvals = RecordingApprovals::new();
+    let broker = broker_over(&clock, &approvals, Duration::from_secs(30));
+    let cancel = CancellationToken::new();
+    let mut waiting = Box::pin(broker.request(ticket("write_file"), &cancel));
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    let id = broker.outstanding()[0].approval_id.clone();
+    cancel.cancel();
+    assert_eq!(
+        broker.resolve(&id, ApprovalDecision::approve_for_session()),
+        Err(ApprovalError::Unknown(id))
+    );
+    assert_eq!(broker.remembered(&session("approvals"), "write_file"), None);
+    assert_eq!(
+        waiting.await.expect("cancellation"),
+        ApprovalOutcome::Withdrawn {
+            reason: ApprovalWithdrawal::Cancelled
+        }
+    );
+    assert!(broker.outstanding().is_empty());
+}
+
+#[tokio::test]
+async fn approval_redemption_cancellation_wins_over_an_unconsumed_decision() {
+    let clock = FakeClock::new(0);
+    let approvals = RecordingApprovals::new();
+    let broker = broker_over(&clock, &approvals, Duration::from_secs(30));
+    let cancel = CancellationToken::new();
+    let mut waiting = Box::pin(broker.request(ticket("write_file"), &cancel));
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    let id = broker.outstanding()[0].approval_id.clone();
+    broker
+        .resolve(&id, ApprovalDecision::approve_once())
+        .expect("timely approval");
+    cancel.cancel();
+    assert_eq!(
+        waiting.await.expect("cancellation"),
+        ApprovalOutcome::Withdrawn {
+            reason: ApprovalWithdrawal::Cancelled
+        }
+    );
+    assert!(broker.outstanding().is_empty());
+    assert_eq!(
+        approvals.records(),
+        vec![
+            ApprovalRecord::Presented(id.clone()),
+            ApprovalRecord::Withdrawn(id, ApprovalWithdrawal::Cancelled),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn approval_redemption_dropped_waiter_dismisses_an_unconsumed_decision() {
+    let clock = FakeClock::new(0);
+    let approvals = RecordingApprovals::new();
+    let broker = broker_over(&clock, &approvals, Duration::from_secs(30));
+    let cancel = CancellationToken::new();
+    let mut waiting = Box::pin(broker.request(ticket("write_file"), &cancel));
+    assert!(support::poll_once(&mut waiting).is_pending());
+    let id = broker.outstanding()[0].approval_id.clone();
+    broker
+        .resolve(&id, ApprovalDecision::approve_once())
+        .expect("timely approval");
+    drop(waiting);
+    assert!(broker.outstanding().is_empty());
+    assert_eq!(
+        approvals.records(),
+        vec![
+            ApprovalRecord::Presented(id.clone()),
+            ApprovalRecord::Abandoned(id)
+        ]
+    );
 }
 
 #[tokio::test]
@@ -382,6 +1135,53 @@ async fn a_tool_that_outlives_its_deadline_times_out() {
     assert_eq!(outcome.status, ToolStatus::TimedOut);
     assert_eq!(outcome.output, "exceeded the call deadline");
     assert_eq!(tools.cancelled(), vec![call_id("call-1")]);
+}
+
+#[tokio::test]
+async fn unknown_tool_outcome_is_fatal_and_not_a_model_retry_result() {
+    let clock = FakeClock::new(0);
+    let approvals = RecordingApprovals::new();
+    let broker = broker_over(&clock, &approvals, Duration::from_secs(30));
+    let tools = RecordingTools::new(
+        vec![readonly_tool("uncertain")],
+        vec![(
+            "uncertain",
+            ToolBehaviour::Unknown("external result was lost".to_owned()),
+        )],
+    );
+    let executor = ToolExecutor::new(tools.clone(), broker, clock, ToolExecutorConfig::default());
+    let error = executor
+        .execute(
+            ToolInvocation {
+                session_id: session("tools"),
+                turn: TurnId::FIRST,
+                call: ToolCall {
+                    call_id: call_id("call-unknown"),
+                    name: "uncertain".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("unknown outcome must not become an ordinary failed tool message");
+    assert!(matches!(
+        &error,
+        claw_runtime::tool::ToolExecutionError::OutcomeUnknown(_)
+    ));
+    let runtime = RuntimeError::Tool(error);
+    assert_eq!(
+        runtime.failure_class(),
+        claw_runtime::RuntimeFailureClass::OutcomeUnknown
+    );
+    assert!(!runtime.is_retryable());
+    let storage = RuntimeError::Port(PortError::OutcomeUnknown("commit receipt lost".to_owned()));
+    assert_eq!(
+        storage.failure_class(),
+        claw_runtime::RuntimeFailureClass::OutcomeUnknown
+    );
+    assert!(!storage.is_retryable());
+    assert_eq!(tools.invoked().len(), 1);
 }
 
 #[tokio::test]

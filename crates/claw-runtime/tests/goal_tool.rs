@@ -6,11 +6,15 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use claw_application::model::goal::GoalStatus;
 use claw_application::model::session::SessionState;
-use claw_application::ports::tool::ToolStatus;
+use claw_application::ports::tool::{
+    InternalToolAuditPhase, InvocationAuthority, ToolBinding, ToolDescriptor, ToolInvocation,
+    ToolOutcome, ToolPort, ToolStatus,
+};
+use claw_application::ports::{PortError, PortFuture};
 use claw_runtime::ScopeSet;
 use claw_runtime::goal_tool::{GOAL_TOOL_NAME, goal_tool_descriptor};
 use claw_runtime::runtime::{
@@ -26,17 +30,83 @@ struct Fixture {
     runtime: Runtime,
     goals: Arc<MemoryGoals>,
     provider: Arc<ScriptedProvider>,
+    audit: Arc<Mutex<Vec<InternalToolAuditPhase>>>,
+    audit_failure: Arc<std::sync::atomic::AtomicU8>,
+}
+
+struct GoalBindingTools(
+    Arc<Mutex<Vec<InternalToolAuditPhase>>>,
+    Arc<std::sync::atomic::AtomicU8>,
+);
+
+impl ToolPort for GoalBindingTools {
+    fn describe(&self) -> Vec<ToolDescriptor> {
+        vec![readonly_tool("read_file")]
+    }
+    fn invoke(
+        &self,
+        _invocation: ToolInvocation,
+    ) -> PortFuture<'_, Result<ToolOutcome, PortError>> {
+        Box::pin(async { Err(PortError::Invalid("runtime owns goal writes".to_owned())) })
+    }
+    fn cancel(
+        &self,
+        _call_id: &claw_application::model::ids::ToolCallId,
+    ) -> PortFuture<'_, Result<(), PortError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn bind_authorized(
+        &self,
+        invocation: &ToolInvocation,
+        authority: &InvocationAuthority,
+    ) -> Result<ToolBinding, PortError> {
+        if !authority.is_owner() {
+            return Err(PortError::Invalid("owner required".to_owned()));
+        }
+        claw_runtime::goal_tool::goal_tool_binding(invocation)
+    }
+    fn audit_internal<'a>(
+        &'a self,
+        invocation: &'a ToolInvocation,
+        _authority: &'a InvocationAuthority,
+        binding: &'a ToolBinding,
+        phase: InternalToolAuditPhase,
+    ) -> PortFuture<'a, Result<(), PortError>> {
+        assert_eq!(
+            binding,
+            &claw_runtime::goal_tool::goal_tool_binding(invocation).expect("goal binding")
+        );
+        self.0.lock().expect("audit").push(phase);
+        let fail = matches!(
+            (phase, self.1.load(std::sync::atomic::Ordering::Acquire)),
+            (InternalToolAuditPhase::Authorized, 1) | (InternalToolAuditPhase::Completed, 2)
+        );
+        Box::pin(async move {
+            if fail {
+                Err(PortError::Unavailable(
+                    "injected audit persistence failure".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
 }
 
 fn fixture_with(rounds: Vec<Round>, config: RuntimeConfig) -> Fixture {
     let goals = MemoryGoals::new();
     let provider = ScriptedProvider::new(rounds);
+    let audit = Arc::new(Mutex::new(Vec::new()));
+    let audit_failure = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let runtime = Runtime::new(
         RuntimePorts {
             clock: FakeClock::new(0) as Arc<_>,
             provider: Arc::clone(&provider) as Arc<_>,
             state: MemoryState::new() as Arc<_>,
-            tools: RecordingTools::new(vec![readonly_tool("read_file")], Vec::new()) as Arc<_>,
+            tools: Arc::new(GoalBindingTools(
+                Arc::clone(&audit),
+                Arc::clone(&audit_failure),
+            )),
             approvals: RecordingApprovals::new() as Arc<_>,
             goals: Arc::clone(&goals) as Arc<_>,
             context: SimpleContext::new() as Arc<_>,
@@ -47,6 +117,8 @@ fn fixture_with(rounds: Vec<Round>, config: RuntimeConfig) -> Fixture {
         runtime,
         goals,
         provider,
+        audit,
+        audit_failure,
     }
 }
 
@@ -56,6 +128,425 @@ fn fixture(rounds: Vec<Round>) -> Fixture {
 
 fn goal_round(call: &str, arguments: &str) -> Round {
     tool_round(call, GOAL_TOOL_NAME, arguments)
+}
+
+#[tokio::test]
+async fn authenticated_owner_goal_calls_require_once_approval_and_durable_audit() {
+    use claw_application::model::approval::ApprovalDecision;
+    use claw_application::ports::tool::{InvocationAccess, InvocationSource};
+    for approve in [false, true] {
+        let fixture = fixture(vec![
+            goal_round("c1", r#"{"action":"set","objective":"reviewed goal"}"#),
+            text_round("finished"),
+        ]);
+        let session_id = session("goal-owner-approval");
+        let authority = InvocationAuthority::new(
+            InvocationSource::Gateway,
+            "owner-device",
+            None,
+            InvocationAccess::Owner,
+            0,
+        )
+        .expect("owner authority");
+        let mut turn = fixture
+            .runtime
+            .submit_authorized(&session_id, "set a goal", authority)
+            .await
+            .expect("accepted turn");
+        while let Some(event) = turn.next_event().await {
+            if matches!(event.kind, RuntimeEventKind::AwaitingApproval { .. }) {
+                break;
+            }
+        }
+        assert!(
+            fixture
+                .runtime
+                .goals()
+                .history(&session_id)
+                .await
+                .expect("before approval")
+                .is_empty()
+        );
+        let broker = fixture.runtime.approvals();
+        let pending = broker.outstanding()[0].approval_id.clone();
+        let (binding, token) = broker.binding(&pending).expect("bound goal preview");
+        assert!(
+            binding
+                .resource()
+                .expect("resource")
+                .contains(session_id.as_str())
+        );
+        broker
+            .resolve_bound(
+                &pending,
+                if approve {
+                    ApprovalDecision::approve_once()
+                } else {
+                    ApprovalDecision::deny_once()
+                },
+                &token,
+            )
+            .expect("once decision");
+        let outcome = turn.join().await.expect("goal turn completed");
+        assert_eq!(
+            outcome.tool_outcomes[0].status,
+            if approve {
+                ToolStatus::Ok
+            } else {
+                ToolStatus::Denied
+            }
+        );
+        assert_eq!(
+            fixture
+                .runtime
+                .goals()
+                .history(&session_id)
+                .await
+                .expect("after decision")
+                .len(),
+            usize::from(approve)
+        );
+        assert_eq!(
+            *fixture.audit.lock().expect("audit phases"),
+            if approve {
+                vec![
+                    InternalToolAuditPhase::Authorized,
+                    InternalToolAuditPhase::Completed,
+                ]
+            } else {
+                Vec::new()
+            }
+        );
+        fixture.runtime.shutdown().await.expect("shutdown");
+    }
+}
+
+#[tokio::test]
+async fn authenticated_owner_goal_directive_cannot_bypass_approval_or_audit() {
+    use claw_application::model::approval::ApprovalDecision;
+    use claw_application::ports::tool::{InvocationAccess, InvocationSource};
+    for approve in [false, true] {
+        let fixture = fixture(vec![text_round("continued")]);
+        let session_id = session("goal-owner-directive");
+        let authority = InvocationAuthority::new(
+            InvocationSource::Gateway,
+            "owner",
+            None,
+            InvocationAccess::Owner,
+            0,
+        )
+        .expect("owner authority");
+        let mut turn = fixture
+            .runtime
+            .submit_authorized(&session_id, "!goal reviewed objective\ncontinue", authority)
+            .await
+            .expect("directive turn");
+        while let Some(event) = turn.next_event().await {
+            if matches!(event.kind, RuntimeEventKind::AwaitingApproval { .. }) {
+                break;
+            }
+        }
+        assert!(
+            fixture
+                .runtime
+                .goals()
+                .history(&session_id)
+                .await
+                .expect("pre-approval state")
+                .is_empty()
+        );
+        let broker = fixture.runtime.approvals();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while broker.outstanding().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "directive approval registration deadline"
+            );
+            tokio::task::yield_now().await;
+        }
+        let id = broker.outstanding()[0].approval_id.clone();
+        let (_, token) = broker.binding(&id).expect("directive bound preview");
+        broker
+            .resolve_bound(
+                &id,
+                if approve {
+                    ApprovalDecision::approve_once()
+                } else {
+                    ApprovalDecision::deny_once()
+                },
+                &token,
+            )
+            .expect("decision");
+        let outcome = turn.join().await.expect("directive completion");
+        assert_eq!(
+            outcome.state,
+            if approve {
+                SessionState::Completed
+            } else {
+                SessionState::Blocked
+            }
+        );
+        assert_eq!(
+            fixture
+                .runtime
+                .goals()
+                .history(&session_id)
+                .await
+                .expect("goal history")
+                .len(),
+            usize::from(approve)
+        );
+        assert_eq!(
+            fixture.audit.lock().expect("audit").len(),
+            if approve { 2 } else { 0 }
+        );
+        fixture.runtime.shutdown().await.expect("shutdown");
+    }
+}
+
+#[tokio::test]
+async fn authenticated_goal_audit_failure_distinguishes_zero_effects_from_unknown_completion() {
+    use claw_application::model::approval::ApprovalDecision;
+    use claw_application::model::ids::TurnId;
+    use claw_application::model::message::ToolCall;
+    use claw_application::ports::tool::{InvocationAccess, InvocationSource};
+    use tokio_util::sync::CancellationToken;
+    for phase in [1, 2] {
+        let fixture = fixture(Vec::new());
+        fixture
+            .audit_failure
+            .store(phase, std::sync::atomic::Ordering::Release);
+        let session_id = session("goal-audit-failure");
+        let authority = InvocationAuthority::new(
+            InvocationSource::Http,
+            "owner",
+            None,
+            InvocationAccess::Owner,
+            0,
+        )
+        .expect("owner");
+        let invocation = ToolInvocation {
+            session_id: session_id.clone(),
+            turn: TurnId::FIRST,
+            call: ToolCall {
+                call_id: call_id("goal-audit-call"),
+                name: GOAL_TOOL_NAME.to_owned(),
+                arguments: r#"{"action":"set","objective":"audited write"}"#.to_owned(),
+            },
+        };
+        let cancel = CancellationToken::new();
+        let runtime = fixture.runtime.clone();
+        let pending = tokio::spawn(async move {
+            runtime
+                .invoke_goal_authorized(invocation, authority, &cancel)
+                .await
+        });
+        let broker = fixture.runtime.approvals();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while broker.outstanding().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "goal approval must be registered"
+            );
+            tokio::task::yield_now().await;
+        }
+        let id = broker.outstanding()[0].approval_id.clone();
+        let (_, token) = broker.binding(&id).expect("bound approval");
+        broker
+            .resolve_bound(&id, ApprovalDecision::approve_once(), &token)
+            .expect("approved");
+        let result = pending.await.expect("owned invocation task");
+        if phase == 1 {
+            assert_eq!(
+                result.expect("known pre-write refusal").outcome.status,
+                ToolStatus::Failed
+            );
+            assert!(
+                fixture
+                    .runtime
+                    .goals()
+                    .history(&session_id)
+                    .await
+                    .expect("unchanged goals")
+                    .is_empty()
+            );
+        } else {
+            assert_eq!(
+                result
+                    .expect_err("completion audit is unconfirmed")
+                    .failure_class(),
+                claw_runtime::RuntimeFailureClass::OutcomeUnknown
+            );
+            assert_eq!(
+                fixture
+                    .runtime
+                    .goals()
+                    .history(&session_id)
+                    .await
+                    .expect("committed goal")
+                    .len(),
+                1
+            );
+        }
+        fixture.runtime.shutdown().await.expect("shutdown");
+    }
+}
+
+#[tokio::test]
+async fn goal_task_shutdown_drains_registered_unpolled_and_waiting_approval_calls() {
+    use claw_application::model::ids::TurnId;
+    use claw_application::model::message::ToolCall;
+    use claw_application::ports::tool::{InvocationAccess, InvocationSource};
+    use tokio_util::sync::CancellationToken;
+    for wait_for_approval in [false, true] {
+        let fixture = fixture(Vec::new());
+        let session_id = session("goal-shutdown");
+        let authority = InvocationAuthority::new(
+            InvocationSource::Http,
+            "owner",
+            None,
+            InvocationAccess::Owner,
+            0,
+        )
+        .expect("owner");
+        let invocation = ToolInvocation {
+            session_id: session_id.clone(),
+            turn: TurnId::FIRST,
+            call: ToolCall {
+                call_id: call_id("goal-shutdown-call"),
+                name: GOAL_TOOL_NAME.to_owned(),
+                arguments: r#"{"action":"set","objective":"must not commit"}"#.to_owned(),
+            },
+        };
+        let cancel = CancellationToken::new();
+        let mut pending = Box::pin(fixture.runtime.invoke_goal_authorized(
+            invocation.clone(),
+            authority.clone(),
+            &cancel,
+        ));
+        assert!(support::poll_once(&mut pending).is_pending());
+        assert_eq!(fixture.runtime.tracked_tasks(), 1);
+        if wait_for_approval {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            while fixture.runtime.approvals().outstanding().is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "approval registration deadline"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+        drop(pending);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fixture.runtime.shutdown(),
+        )
+        .await
+        .expect("shutdown must not wait for a new approval")
+        .expect("shutdown");
+        assert_eq!(fixture.runtime.tracked_tasks(), 0);
+        assert!(fixture.runtime.approvals().outstanding().is_empty());
+        assert!(
+            fixture
+                .runtime
+                .goals()
+                .history(&session_id)
+                .await
+                .expect("goal store")
+                .is_empty()
+        );
+        assert!(
+            fixture
+                .runtime
+                .invoke_goal_authorized(invocation, authority, &cancel)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn authenticated_non_owner_cannot_mutate_goals_from_model_output_or_directives() {
+    use claw_application::ports::tool::{InvocationAccess, InvocationAuthority, InvocationSource};
+    let fixture = fixture(vec![
+        goal_round("c1", r#"{"action":"set","objective":"must not persist"}"#),
+        text_round("no change"),
+    ]);
+    let session_id = session("goal-authentication");
+    let authority = InvocationAuthority::new(
+        InvocationSource::Gateway,
+        "device",
+        None,
+        InvocationAccess::Execute,
+        0,
+    )
+    .expect("authenticated execution scope");
+    let options = claw_runtime::command::TurnOptions {
+        goal: Some("must not persist".to_owned()),
+        authority: Some(authority.clone()),
+        ..claw_runtime::command::TurnOptions::default()
+    };
+    assert!(
+        fixture
+            .runtime
+            .submit_with(&session_id, "directive", options)
+            .await
+            .is_err()
+    );
+    let result = fixture
+        .runtime
+        .submit_authorized(&session_id, "make a goal", authority)
+        .await
+        .expect("chat admission")
+        .join()
+        .await
+        .expect("turn completes");
+    assert_eq!(result.tool_outcomes[0].status, ToolStatus::Denied);
+    assert!(
+        fixture
+            .runtime
+            .goals()
+            .history(&session_id)
+            .await
+            .expect("goal history")
+            .is_empty()
+    );
+    fixture.runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn production_authority_policy_blocks_anonymous_model_tools() {
+    let fixture = fixture_with(
+        vec![goal_round(
+            "c1",
+            r#"{"action":"set","objective":"anonymous mutation"}"#,
+        )],
+        RuntimeConfig {
+            require_tool_authority: true,
+            ..RuntimeConfig::default()
+        },
+    );
+    let session_id = session("goal-no-identity");
+    let result = fixture
+        .runtime
+        .submit(&session_id, "anonymous chat")
+        .await
+        .expect("chat admission")
+        .join()
+        .await
+        .expect("blocked turn");
+    assert_eq!(result.state, SessionState::Blocked);
+    assert!(fixture.provider.requests()[0].tool_names.is_empty());
+    assert!(
+        fixture
+            .runtime
+            .goals()
+            .history(&session_id)
+            .await
+            .expect("goal history")
+            .is_empty()
+    );
+    fixture.runtime.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]

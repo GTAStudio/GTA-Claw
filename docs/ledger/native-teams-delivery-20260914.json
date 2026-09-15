@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "stage": "teams-durable-action-delivery-and-strict-resource-receipts",
+  "capturedAtUtc": "2026-09-14T20:16:38.8520442Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-state/src/runs.rs","sha256":"ff848d646e49889180d72ceecfb93392669a8fa2b3c109214948fa0f2e28ced1"},
+    {"path":"apps/gta-claw-daemon/src/adapters/legacy.rs","sha256":"873add933d9b33b881c80b4554eb7dfc849bf5551f4245e3f35f05f7f00b212e"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"5653ac3dcc0df86018bd86ee3b439e721526831c21fca360cba32bb88ab27587"}
+  ],
+  "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p claw-channels -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":331, "failed":0, "ignored":4, "testBinaries":17,
+      "log":"target/native-teams-delivery-tests-20260914T201503982Z.log",
+      "sha256":"f4051477f802ddda4d934658cdc4925507dcde35e23e8ef9e22d86d08306e6af"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-teams-delivery-clippy-20260914T201625935Z.log",
+      "sha256":"8c2c4fa0fc9d579161f2cf98fa7d014d7f45a33e145f9c3021b4e47991973a3d"
+    }
+  ],
+  "behaviorEvidence": [
+    "teams_claimed_replies_keep_confirmed_prefix_and_do_not_repeat_after_restart",
+    "teams_reply_requires_trusted_path_and_unambiguous_resource_receipt",
+    "teams_resource_receipt_does_not_echo_remote_error_content",
+    "teams_durable_conversation_and_reset_keep_tenants_and_senders_isolated",
+    "teams_verified_message_preserves_tenant_sender_and_activity_identity"
+  ],
+  "notes": [
+    "Messages, commands, generated help and member welcome replies require a durable authenticated source activity",
+    "Actual handler-normalized message/result pairs are used for the once-only delivery claim",
+    "Typing and reply actions retain their original order; confirmed resource receipts commit before the next reply",
+    "Six real-state delivery/restart cases include partial failure, missing receipt, typing failure, storage closure and dropped future",
+    "Resource IDs are explicitly tagged msteams:<resource-id>; response errors never echo remote body data",
+    "No new dependencies or changes to the existing Cargo.lock witness"
+  ],
+  "unverified": [
+    "live Bot Framework OAuth/JWT endpoints, tenant delivery and provider-side receipt proof",
+    "complete activity-edit, callback and remote reconciliation workflows",
+    "cross-platform runtime and physical power-loss acceptance, deployment and whole-project completion"
+  ]
+}

@@ -539,6 +539,8 @@ async fn directives_are_stripped_from_the_prompt_and_lowered_into_turn_options()
             tools_enabled: false,
             quiet: false,
             goal: None,
+            direct_tool: None,
+            authority: None,
         }
     );
 

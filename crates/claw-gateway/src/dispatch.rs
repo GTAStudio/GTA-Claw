@@ -112,7 +112,7 @@ pub const fn scope_identity(scope: MethodScope) -> &'static str {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Entry {
     /// The frozen descriptor this entry was built from, in the exact shape
     /// [`claw_protocol::gateway::authorize`] takes.
@@ -127,7 +127,7 @@ struct Entry {
 }
 
 /// Registry of every frozen core method and its optional behavior.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MethodRegistry {
     entries: BTreeMap<&'static str, Entry>,
     dynamic: Arc<dyn DynamicScopeResolver>,

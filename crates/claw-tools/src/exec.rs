@@ -19,11 +19,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::error::ToolError;
 use crate::fs::PATH_MAX_BYTES;
 use crate::permission::{Authorization, Capability, PermissionDescriptor, Resource, RiskLevel};
-use crate::sandbox::ResolvedPath;
+use crate::sandbox::{ResolvedPath, Sandbox, SandboxLimits};
 use crate::schema::{Arguments, Field, FieldType, ParameterSchema};
 use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolOutput};
 
@@ -31,6 +32,7 @@ use crate::tool::{Tool, ToolContext, ToolDescriptor, ToolOutput};
 const MAX_ARGUMENT_BYTES: usize = 4096;
 /// Inclusive maximum number of argv entries after the program name.
 const MAX_ARGUMENTS: usize = 64;
+const MAX_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
 /// Inclusive maximum byte length of a program name.
 const MAX_PROGRAM_BYTES: usize = 128;
 /// Inclusive maximum request timeout in milliseconds.
@@ -98,9 +100,6 @@ const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 /// `FILE_SHARE_READ`.
 #[cfg(windows)]
 const FILE_SHARE_READ: u32 = 0x0000_0001;
-/// `FILE_SHARE_DELETE`.
-#[cfg(windows)]
-const FILE_SHARE_DELETE: u32 = 0x0000_0004;
 /// Longest wait for a pipe reader to finish after the tree was terminated.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
@@ -387,6 +386,7 @@ struct AllowedProgram {
     executable: PathBuf,
     identity: ExecutableIdentity,
     argv: ArgvPolicy,
+    sha256: Option<[u8; 32]>,
 }
 
 /// Operator-configured execution policy.
@@ -397,6 +397,24 @@ pub struct ExecPolicy {
     timeout: Duration,
     max_output_bytes: usize,
     writable_root: Option<PathBuf>,
+}
+
+/// A verified executable held for an adapter-controlled spawn.
+///
+/// The existing platform handles remain live until this value is dropped. On Windows,
+/// they deny executable write/delete sharing and pin ancestor directories.
+pub struct PinnedExecutable {
+    path: PathBuf,
+    _file: File,
+    _directory: Sandbox,
+}
+
+impl PinnedExecutable {
+    /// Returns the exact enrolled absolute path while its verification handles remain held.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl Default for ExecPolicy {
@@ -512,9 +530,67 @@ impl ExecPolicy {
                 identity: ExecutableIdentity::of(&metadata),
                 executable: canonical,
                 argv,
+                sha256: None,
             },
         );
         Ok(())
+    }
+
+    /// Allows a program only while its bounded executable matches a trusted digest.
+    ///
+    /// The digest is rechecked through the execution handle immediately before spawn.
+    /// Windows also denies executable write/delete sharing and pins ancestor directories.
+    ///
+    /// # Errors
+    ///
+    /// Returns the path/argument policy errors from [`Self::allow_program_with_argv`],
+    /// or [`ExecutionError::ExecutableChanged`] when the trusted digest cannot be verified.
+    /// A failed enrollment removes the named entry rather than retaining an older grant.
+    pub fn allow_program_with_sha256(
+        &mut self,
+        name: &str,
+        executable: impl Into<PathBuf>,
+        argv: ArgvPolicy,
+        sha256: [u8; 32],
+    ) -> Result<(), ExecutionError> {
+        self.programs.remove(name);
+        self.allow_program_with_argv(name, executable, argv)?;
+        let program = self
+            .programs
+            .get_mut(name)
+            .ok_or(ExecutionError::ProgramNotAllowed)?;
+        program.sha256 = Some(sha256);
+        if let Err(error) = open_verified_executable(program) {
+            self.programs.remove(name);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Verifies an enrolled executable without starting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an execution-policy refusal if the program is absent, changed or unsafe.
+    pub fn verify_program(&self, name: &str) -> Result<(), ExecutionError> {
+        open_verified_executable(self.program(name)?)?;
+        Ok(())
+    }
+
+    /// Verifies a fixed program and retains the existing platform protection handles.
+    ///
+    /// Adapters must still apply their approved argument/environment policy and own the child.
+    ///
+    /// # Errors
+    /// Returns the same enrollment, identity and digest refusals as [`Self::verify_program`].
+    pub fn pin_program(&self, name: &str) -> Result<PinnedExecutable, ExecutionError> {
+        let program = self.program(name)?;
+        let (file, directory) = open_verified_executable(program)?;
+        Ok(PinnedExecutable {
+            path: program.executable.clone(),
+            _file: file,
+            _directory: directory,
+        })
     }
 
     /// Replaces the environment policy.
@@ -581,14 +657,20 @@ impl ExecPolicy {
 /// The returned handle is held across the spawn. On Windows it is opened
 /// without `FILE_SHARE_WRITE`, so the file cannot be overwritten in place
 /// between this check and the spawn that follows it.
-fn open_verified_executable(program: &AllowedProgram) -> Result<File, ExecutionError> {
+fn open_verified_executable(program: &AllowedProgram) -> Result<(File, Sandbox), ExecutionError> {
+    let directory = program
+        .executable
+        .parent()
+        .ok_or(ExecutionError::ExecutableNotFound)?;
+    let pinned_directory = Sandbox::new_pinned(directory, SandboxLimits::default())
+        .map_err(|_| ExecutionError::ExecutableChanged)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
 
-        options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
+        options.share_mode(FILE_SHARE_READ);
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     #[cfg(unix)]
@@ -619,7 +701,35 @@ fn open_verified_executable(program: &AllowedProgram) -> Result<File, ExecutionE
     if read == 2 && prefix == *b"#!" {
         return Err(ExecutionError::InterpretedProgramForbidden);
     }
-    Ok(handle)
+    if let Some(expected) = program.sha256 {
+        if metadata.len() > MAX_EXECUTABLE_BYTES {
+            return Err(ExecutionError::ExecutableChanged);
+        }
+        let mut digest = Sha256::new();
+        digest.update(&prefix[..read]);
+        let mut total = u64::try_from(read).map_err(|_| ExecutionError::ExecutableChanged)?;
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .map_err(|_| ExecutionError::ExecutableChanged)?;
+            if read == 0 {
+                break;
+            }
+            total += u64::try_from(read).map_err(|_| ExecutionError::ExecutableChanged)?;
+            if total > MAX_EXECUTABLE_BYTES {
+                return Err(ExecutionError::ExecutableChanged);
+            }
+            digest.update(&buffer[..read]);
+        }
+        if digest.finalize()[..] != expected {
+            return Err(ExecutionError::ExecutableChanged);
+        }
+    }
+    pinned_directory
+        .validate_root()
+        .map_err(|_| ExecutionError::ExecutableChanged)?;
+    Ok((handle, pinned_directory))
 }
 
 /// Rejects an executable whose name is a shell, an interpreter, or a launcher.
@@ -808,7 +918,8 @@ impl Tool for ProcessExecTool {
             description: "Runs an allowlisted program with an explicit argument vector. There is \
                           no shell: arguments are passed verbatim, so shell metacharacters have \
                           no meaning. The child inherits no environment beyond the operator \
-                          allowlist and cannot leave the workspace.",
+                          allowlist. Its working directory is confined; the process otherwise \
+                          retains host operating-system permissions.",
             schema: EXEC_SCHEMA,
             permission: PermissionDescriptor {
                 capability: Capability::ProcessExecute,
@@ -822,12 +933,17 @@ impl Tool for ProcessExecTool {
     fn resource(
         &self,
         arguments: &Arguments,
-        _context: &ToolContext<'_>,
+        context: &ToolContext<'_>,
     ) -> Result<Resource, ToolError> {
         let program = arguments.required_text("program")?;
         // Resolution happens here so an unknown program is refused before a
         // permission broker is ever consulted.
-        self.policy.resolve_program(program)?;
+        let configured = self.policy.program(program)?;
+        configured
+            .argv
+            .check(arguments.text_list("args").unwrap_or_default())?;
+        working_directory(arguments, context)?;
+        self.policy.verify_program(program)?;
         Ok(Resource::Program(program.to_owned()))
     }
 
@@ -906,7 +1022,7 @@ fn place_in_own_process_group(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn place_in_own_process_group(_command: &mut Command) {}
+const fn place_in_own_process_group(_command: &mut Command) {}
 
 /// Drives one child to completion, enforcing the deadline and the output cap.
 ///
@@ -1298,6 +1414,103 @@ mod tests {
         } else {
             PathBuf::from(format!("/usr/bin/{name}"))
         }
+    }
+
+    #[test]
+    fn trusted_program_digest_rejects_same_metadata_changes_and_failed_reenrollment() {
+        let root = unique_temp_dir("claw-exec-digest");
+        std::fs::create_dir_all(&root).expect("owned fixture directory");
+        let executable = root.join("fixture.exe");
+        let original = b"MZ-native-policy-fixture-001";
+        std::fs::write(&executable, original).expect("inert fixture bytes");
+        let executable = std::fs::canonicalize(executable)
+            .map(strip_verbatim)
+            .expect("canonical fixture");
+        let mut expected = [0_u8; 32];
+        expected.copy_from_slice(&Sha256::digest(original));
+        let mut policy = ExecPolicy::deny_all();
+        policy
+            .allow_program_with_sha256(
+                "fixture",
+                &executable,
+                ArgvPolicy::exactly([] as [&str; 0]),
+                expected,
+            )
+            .expect("trusted digest enrollment");
+        policy.verify_program("fixture").expect("unchanged digest");
+        let modified = std::fs::metadata(&executable)
+            .expect("fixture metadata")
+            .modified()
+            .expect("fixture mtime");
+        std::fs::write(&executable, b"MZ-native-policy-fixture-002")
+            .expect("same-length replacement");
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .expect("owned fixture handle");
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("restore exact original timestamp");
+        drop(file);
+        assert_eq!(
+            policy.verify_program("fixture"),
+            Err(ExecutionError::ExecutableChanged)
+        );
+        assert_eq!(
+            policy.allow_program_with_sha256(
+                "fixture",
+                &executable,
+                ArgvPolicy::bounded(),
+                expected
+            ),
+            Err(ExecutionError::ExecutableChanged)
+        );
+        assert!(policy.program_names().is_empty());
+        std::fs::write(&executable, original).expect("restore owned fixture");
+        policy
+            .allow_program_with_sha256("fixture", &executable, ArgvPolicy::bounded(), expected)
+            .expect("fresh enrollment");
+        assert!(
+            policy
+                .allow_program_with_sha256(
+                    "fixture",
+                    root.join("missing.exe"),
+                    ArgvPolicy::bounded(),
+                    expected
+                )
+                .is_err()
+        );
+        assert!(policy.program_names().is_empty());
+        std::fs::remove_dir_all(root).expect("owned fixture cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_program_handle_prevents_write_delete_and_ancestor_replacement() {
+        let root = unique_temp_dir("claw-exec-handle");
+        std::fs::create_dir_all(root.join("programs")).expect("owned program directory");
+        let executable = root.join("programs/fixture.exe");
+        let original = b"MZ-inert-handle-fixture";
+        std::fs::write(&executable, original).expect("inert executable fixture");
+        let executable = std::fs::canonicalize(executable)
+            .map(strip_verbatim)
+            .expect("canonical fixture");
+        let mut expected = [0_u8; 32];
+        expected.copy_from_slice(&Sha256::digest(original));
+        let mut policy = ExecPolicy::deny_all();
+        policy
+            .allow_program_with_sha256("fixture", &executable, ArgvPolicy::bounded(), expected)
+            .expect("trusted digest");
+        let pinned = policy
+            .pin_program("fixture")
+            .expect("adapter execution pin");
+        assert_eq!(pinned.path(), executable);
+        assert!(OpenOptions::new().write(true).open(&executable).is_err());
+        assert!(std::fs::rename(&executable, root.join("replacement.exe")).is_err());
+        assert!(std::fs::rename(root.join("programs"), root.join("moved")).is_err());
+        drop(pinned);
+        std::fs::rename(root.join("programs"), root.join("moved"))
+            .expect("released pin permits owned cleanup");
+        std::fs::remove_dir_all(root).expect("owned fixture cleanup");
     }
 
     #[test]

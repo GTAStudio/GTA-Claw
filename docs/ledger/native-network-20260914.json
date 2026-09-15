@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "stage": "explicit-native-fixed-address-network",
+  "capturedAtUtc": "2026-09-14T11:59:28.3094865Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sources": [
+    {"path":"crates/claw-plugin-host/src/http.rs","sha256":"e91f64d3b8b9fd6a17e7da0415a5e1c821f67c014dd2f258726ce2050af559c8"},
+    {"path":"crates/claw-plugin-host/tests/pinned_http.rs","sha256":"38fb8cbc4e1127cdcecd4379782a5220c6976bdb9bd64f4ab09b4b30c667ad72"},
+    {"path":"apps/gta-claw-daemon/src/adapters/native_tools.rs","sha256":"2973c744cab5ab6ffd113081cb08bd657df15c4b854dbf06d8feb71e106338f7"},
+    {"path":"apps/gta-claw-daemon/src/adapters/native_tools/network.rs","sha256":"6b27fda9f8e891511df6f4458d4465f38c9fe332454622d51fff3af8e65bdc6f"},
+    {"path":"apps/gta-claw-daemon/src/production.rs","sha256":"6b944c6d72f7d156ab3be1ee8d3026ff937c55ed6e49bd09822df19ba69d38b9"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"ee7c7979eebf60354057641783b74eeec576f49a74781661d8e9faa81cf67e93"}
+  ],
+  "checks": [
+    {
+      "command":"cargo +stable test -p gta-claw-daemon -p claw-plugin-host -p claw-tools --all-targets --locked --quiet",
+      "result":"passed", "passed":497, "failed":0, "ignored":6, "testBinaries":32,
+      "log":"target/native-network-tests-20260914T195657120.log",
+      "sha256":"c25352db78a6df300168c5d5c753d84d2c59f5aaa28494663351eb28d1b824a2"
+    },
+    {
+      "command":"cargo +stable clippy -p gta-claw-daemon -p claw-plugin-host -p claw-tools --all-targets --locked -- -D warnings",
+      "result":"passed", "log":"target/native-network-clippy-20260914T195854490.log",
+      "sha256":"188303863a8b81aaa61708550cb06504cee044dff8267c921391488f68d07d53"
+    }
+  ],
+  "scope":"explicit owner-approved GET/HEAD; canonical origins with static IPs; no DNS, redirect, inherited credentials or proxy fallback",
+  "unverified":["arbitrary Internet destinations", "production public HTTPS endpoint", "proxy transport support", "DNS service integration", "Unix runtime", "whole-project completion"]
+}

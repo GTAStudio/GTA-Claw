@@ -13,10 +13,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ports::{
     AdminFailure, AdminPort, AdminSuccess, ApiServices, AuditPort, EmbeddingRequest,
-    GenerationEvent, GenerationOutput, GenerationRequest, Model, PortError, PortErrorKind,
-    PortFuture, ProviderPort, ReadinessPort, ReadinessSnapshot, ToolDefinition, ToolInvocation,
-    ToolOutcome, ToolPort, Usage, WatchAuthPort, WatchIdentity, WatchResultPort, WebhookOutcome,
-    WebhookPort,
+    GenerationEvent, GenerationFinishReason, GenerationOutput, GenerationRequest,
+    GenerationSummary, Model, PortError, PortErrorKind, PortFuture, ProviderPort, ReadinessPort,
+    ReadinessSnapshot, ToolDefinition, ToolInvocation, ToolOutcome, ToolPort, Usage, WatchAuthPort,
+    WatchIdentity, WatchResultPort, WebhookOutcome, WebhookPort,
 };
 
 /// Deterministic adapter implementing every runtime port.
@@ -37,8 +37,10 @@ impl Default for DeterministicRuntime {
             ready: AtomicBool::new(true),
             started: std::time::Instant::now(),
             output: Mutex::new(GenerationOutput {
+                usage_reporting: crate::UsageReporting::Complete,
                 text: "deterministic response".to_owned(),
                 tool_calls: Vec::new(),
+                finish_reason: GenerationFinishReason::Stop,
                 usage: Usage {
                     input_tokens: 3,
                     output_tokens: 2,
@@ -221,7 +223,7 @@ impl ProviderPort for DeterministicRuntime {
         request: GenerationRequest,
         events: mpsc::Sender<GenerationEvent>,
         cancellation: CancellationToken,
-    ) -> PortFuture<'_, Result<Usage, PortError>> {
+    ) -> PortFuture<'_, Result<GenerationSummary, PortError>> {
         Box::pin(async move {
             *self
                 .last_generation_request
@@ -264,7 +266,11 @@ impl ProviderPort for DeterministicRuntime {
                     ));
                 }
             }
-            Ok(output.usage)
+            Ok(GenerationSummary {
+                usage: output.usage,
+                usage_reporting: output.usage_reporting,
+                finish_reason: output.finish_reason,
+            })
         })
     }
 

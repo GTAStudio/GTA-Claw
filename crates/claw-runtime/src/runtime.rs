@@ -70,6 +70,10 @@ pub struct RuntimeConfig {
     pub max_rounds: u32,
     /// The token budget handed to the context engine.
     pub context_token_budget: u32,
+    /// Stops further provider rounds once explicitly reported input/output usage reaches this
+    /// threshold. Missing primary counters prevent another round when configured.
+    /// This is not a reservation or a hard bound on a single request's tokens or monetary cost.
+    pub max_observed_provider_tokens: Option<u64>,
     /// Durable goal limits.
     pub goals: GoalConfig,
     /// Whether the model-callable goal tool is advertised and served.
@@ -77,6 +81,8 @@ pub struct RuntimeConfig {
     /// Turning this off hides [`GOAL_TOOL_NAME`] from the provider's tool list and from `/tools`,
     /// and makes a call to it fail like any other unknown tool.
     pub goal_tool_enabled: bool,
+    /// Requires host-verified authority for tool execution and owner authority for goal writes.
+    pub require_tool_authority: bool,
     /// Maximum number of conversation sessions retained in memory.
     pub session_capacity: usize,
     /// How long an idle conversation remains owned without being touched.
@@ -93,8 +99,10 @@ impl Default for RuntimeConfig {
             tool_timeout: Duration::from_mins(2),
             max_rounds: 16,
             context_token_budget: 128_000,
+            max_observed_provider_tokens: None,
             goals: GoalConfig::default(),
             goal_tool_enabled: true,
+            require_tool_authority: false,
             session_capacity: 100,
             session_idle_ttl: Duration::from_hours(1),
             session_retire_timeout: Duration::from_secs(5),
@@ -225,6 +233,8 @@ pub enum RuntimeFailureClass {
     InvalidRequest,
     /// The mutation committed, but its publication is not proven power-loss durable.
     CommittedButNotDurable,
+    /// Execution may have produced side effects without a confirmed final outcome.
+    OutcomeUnknown,
     /// The caller or host cancelled the work.
     Cancelled,
     /// An internal runtime invariant failed.
@@ -241,6 +251,7 @@ impl RuntimeFailureClass {
             Self::NotFound => "not_found",
             Self::InvalidRequest => "invalid_request",
             Self::CommittedButNotDurable => "committed_but_not_durable",
+            Self::OutcomeUnknown => "outcome_unknown",
             Self::Cancelled => "cancelled",
             Self::Internal => "internal",
         }
@@ -260,6 +271,9 @@ impl RuntimeFailureClass {
             }
             Self::CommittedButNotDurable => {
                 "The change committed, but durability could not be confirmed. Do not retry blindly."
+            }
+            Self::OutcomeUnknown => {
+                "The operation outcome is unknown. Reconcile recorded effects before retrying; do not repeat it automatically."
             }
             Self::Cancelled => "The operation was cancelled.",
             Self::Internal => "The runtime could not complete the operation.",
@@ -381,6 +395,9 @@ impl RuntimeError {
             Self::Approval(error) | Self::Tool(ToolExecutionError::Approval(error)) => {
                 classify_approval_error(error)
             }
+            Self::Tool(ToolExecutionError::OutcomeUnknown(_)) => {
+                RuntimeFailureClass::OutcomeUnknown
+            }
             Self::Suspend(
                 SuspendError::AlreadySuspended { .. } | SuspendError::AlreadyDraining { .. },
             )
@@ -427,6 +444,7 @@ const fn classify_port_error(error: &PortError) -> RuntimeFailureClass {
         PortError::NotFound(_) => RuntimeFailureClass::NotFound,
         PortError::Invalid(_) => RuntimeFailureClass::InvalidRequest,
         PortError::CommittedButNotDurable(_) => RuntimeFailureClass::CommittedButNotDurable,
+        PortError::OutcomeUnknown(_) => RuntimeFailureClass::OutcomeUnknown,
         PortError::Cancelled => RuntimeFailureClass::Cancelled,
     }
 }
@@ -506,6 +524,12 @@ impl TurnHandle {
     /// Requests cancellation of this turn only.
     pub fn cancel(&self) {
         self.cancel.cancel();
+    }
+
+    /// Returns a cancellation handle for a host that owns the turn's event-draining task.
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancel.clone()
     }
 
     /// Returns the next event, or `None` once the turn stopped emitting.
@@ -1060,6 +1084,9 @@ impl RuntimeInner {
 pub struct Runtime {
     inner: Arc<RuntimeInner>,
     tracker: TaskTracker,
+    internal_tasks: TaskTracker,
+    internal_accepting: Arc<Mutex<bool>>,
+    internal_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl fmt::Debug for Runtime {
@@ -1127,6 +1154,9 @@ impl Runtime {
                 shutdown: CancellationToken::new(),
             }),
             tracker: TaskTracker::new(),
+            internal_tasks: TaskTracker::new(),
+            internal_accepting: Arc::new(Mutex::new(true)),
+            internal_slots: Arc::new(tokio::sync::Semaphore::new(session_capacity.clamp(1, 128))),
         }
     }
 
@@ -1211,7 +1241,7 @@ impl Runtime {
     /// tests assert.
     #[must_use]
     pub fn tracked_tasks(&self) -> usize {
-        self.tracker.len()
+        self.tracker.len() + self.internal_tasks.len()
     }
 
     /// Submits one operator input, scanning it for inline directives first.
@@ -1230,6 +1260,72 @@ impl Runtime {
         self.submit_with(session_id, &scan.body, options).await
     }
 
+    /// Submits directive-aware input with claims verified by the host's ingress.
+    ///
+    /// # Errors
+    /// Reports directive/admission failures as in [`Self::submit`].
+    pub async fn submit_authorized(
+        &self,
+        session_id: &SessionId,
+        input: &str,
+        authority: claw_application::ports::tool::InvocationAuthority,
+    ) -> Result<TurnHandle, RuntimeError> {
+        let scan = self.inner.directives.scan(input)?;
+        let mut options = self.inner.directives.apply(&scan.directives)?;
+        options.authority = Some(authority);
+        self.submit_with(session_id, &scan.body, options).await
+    }
+
+    /// Executes a runtime-owned goal mutation through the shared bound approval and audit path.
+    ///
+    /// # Errors
+    /// Refuses shutdown, failed approval delivery and unconfirmed goal or audit commits.
+    pub async fn invoke_goal_authorized(
+        &self,
+        invocation: ToolInvocation,
+        authority: claw_application::ports::tool::InvocationAuthority,
+        cancel: &CancellationToken,
+    ) -> Result<crate::goal_tool::AuthorizedGoalOutcome, RuntimeError> {
+        let task = {
+            let accepting = self
+                .internal_accepting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !*accepting || self.inner.shutdown.is_cancelled() {
+                return Err(RuntimeError::ShuttingDown);
+            }
+            let slot = Arc::clone(&self.internal_slots)
+                .try_acquire_owned()
+                .map_err(|_| {
+                    PortError::Unavailable("runtime goal task capacity exceeded".to_owned())
+                })?;
+            let inner = Arc::clone(&self.inner);
+            let cancel = cancel.clone();
+            let task = self.internal_tasks.spawn(async move {
+                let _slot = slot;
+                crate::goal_tool::execute_authorized_goal(
+                    &inner.goals,
+                    &inner.broker,
+                    inner.ports.tools.as_ref(),
+                    invocation,
+                    authority,
+                    &cancel,
+                    &inner.shutdown,
+                )
+                .await
+            });
+            drop(accepting);
+            task
+        };
+        task.await
+            .map_err(|_| {
+                RuntimeError::Tool(ToolExecutionError::OutcomeUnknown(
+                    "runtime-owned goal task did not confirm its terminal result".to_owned(),
+                ))
+            })?
+            .map_err(RuntimeError::Tool)
+    }
+
     /// Submits one operator input with explicit turn options.
     ///
     /// # Errors
@@ -1246,25 +1342,54 @@ impl Runtime {
         if self.inner.shutdown.is_cancelled() {
             return Err(RuntimeError::ShuttingDown);
         }
+        if options.direct_tool.is_some()
+            && (!input.trim().is_empty()
+                || options.goal.is_some()
+                || options.model.is_some()
+                || options.quiet
+                || !options.tools_enabled
+                || !options
+                    .authority
+                    .as_ref()
+                    .is_some_and(claw_application::ports::tool::InvocationAuthority::can_execute))
+        {
+            return Err(PortError::Invalid("direct tool commands require authenticated execution authority and no other input or directives".to_owned()).into());
+        }
+        if options.goal.is_some()
+            && (self.inner.config.require_tool_authority || options.authority.is_some())
+            && !options
+                .authority
+                .as_ref()
+                .is_some_and(claw_application::ports::tool::InvocationAuthority::is_owner)
+        {
+            return Err(PortError::Invalid(
+                "goal directives require an authenticated owner".to_owned(),
+            )
+            .into());
+        }
 
         let permit = self.inner.suspension.admit()?;
         let _expired = self.sweep_sessions();
         let generation = self.session_generation();
 
         let snapshot = self.inner.ports.state.load_session(session_id).await?;
-        let (turn, revision, reason) = snapshot.map_or(
-            (TurnId::FIRST, 0, BootstrapReason::NewSession),
-            |existing| {
-                (
-                    existing.turn.next(),
-                    existing.revision,
-                    BootstrapReason::Restart,
-                )
-            },
-        );
+        let (turn, revision, reason) = match snapshot {
+            Some(existing) => (
+                TurnId::new(existing.turn.ordinal().checked_add(1).ok_or_else(|| {
+                    PortError::Conflict("session turn identity exhausted".to_owned())
+                })?),
+                existing.revision,
+                BootstrapReason::Restart,
+            ),
+            None => (
+                self.inner.ports.state.next_turn(session_id).await?,
+                0,
+                BootstrapReason::NewSession,
+            ),
+        };
 
-        // `load_session` is the only await between the first check and the spawn, so re-checking
-        // here closes the window in which `shutdown` could have closed the task tracker while this
+        // State reads above can yield, so re-checking here closes the window in which
+        // `shutdown` could have closed the task tracker while this
         // call was parked. Past this point nothing yields, and the check happens before the
         // live-turn entry is inserted so the early return cannot strand the session.
         if self.inner.shutdown.is_cancelled() {
@@ -1350,6 +1475,24 @@ impl Runtime {
         let invocation = self.inner.commands.parse(line, scopes)?;
         let effect = CommandRegistry::effect(&invocation)?;
         self.execute_effect(session_id, effect).await
+    }
+
+    /// Cancels only the observed turn, never a replacement turn in the same session.
+    #[must_use]
+    pub fn cancel_turn_if_current(&self, session_id: &SessionId, expected: TurnId) -> bool {
+        let cancellation = {
+            let sessions = self.inner.sessions();
+            sessions
+                .entries
+                .get(session_id.as_str())
+                .and_then(|session| session.live.as_ref())
+                .filter(|turn| turn.turn == expected)
+                .map(|turn| turn.cancel.clone())
+        };
+        cancellation.is_some_and(|cancellation| {
+            cancellation.cancel();
+            true
+        })
     }
 
     /// Executes an already-resolved command effect.
@@ -1576,6 +1719,15 @@ impl Runtime {
     /// requests were withdrawn. Every task is still joined.
     pub async fn shutdown(&self) -> Result<(), RuntimeError> {
         self.inner.shutdown.cancel();
+        {
+            let mut accepting = self
+                .internal_accepting
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *accepting = false;
+            self.internal_tasks.close();
+            drop(accepting);
+        }
         let withdrawal = self
             .inner
             .broker
@@ -1584,6 +1736,7 @@ impl Runtime {
 
         self.tracker.close();
         self.tracker.wait().await;
+        self.internal_tasks.wait().await;
         let sessions = self.inner.sessions().clear();
         self.inner.cleanup_sessions(sessions);
 
@@ -1660,6 +1813,57 @@ struct TurnExecution {
     pause: watch::Receiver<bool>,
 }
 
+fn provider_budget_available(
+    limit: Option<u64>,
+    records: &[claw_application::ports::provider::ProviderRoundRecord],
+) -> Result<bool, PortError> {
+    use claw_application::ports::provider::{ProviderRoundRecord, UsageReporting};
+
+    let Some(limit) = limit else {
+        return Ok(true);
+    };
+    ProviderRoundRecord::validate_sequence(records)?;
+    let mut used = 0_u64;
+    for record in records {
+        let report = record
+            .response
+            .as_ref()
+            .filter(|report| report.usage_reporting == UsageReporting::Complete)
+            .ok_or_else(|| {
+                PortError::Invalid(
+                    "provider usage is unknown; another budgeted request is not permitted"
+                        .to_owned(),
+                )
+            })?;
+        used = used
+            .checked_add(report.input_tokens)
+            .and_then(|tokens| tokens.checked_add(report.output_tokens))
+            .ok_or_else(|| {
+                PortError::Invalid(
+                    "reported provider usage exceeds its accounting range".to_owned(),
+                )
+            })?;
+    }
+    Ok(used < limit)
+}
+
+fn capture_provider_report(
+    record: &mut claw_application::ports::provider::ProviderRoundRecord,
+    report: Option<claw_application::ports::provider::ProviderResponseReport>,
+) -> Result<bool, PortError> {
+    if let Some(response) = &report {
+        response.validate()?;
+    }
+    if record.response.is_some() && record.response != report {
+        return Err(PortError::Invalid(
+            "provider changed its confirmed response accounting".to_owned(),
+        ));
+    }
+    let changed = record.response != report;
+    record.response = report;
+    Ok(changed)
+}
+
 impl TurnExecution {
     async fn run(mut self) -> Result<TurnOutcome, RuntimeError> {
         let mut machine = TurnStateMachine::new();
@@ -1667,6 +1871,14 @@ impl TurnExecution {
         let mut tool_outcomes: Vec<ToolOutcome> = Vec::new();
         let mut message: Option<AssistantMessage> = None;
         let mut partial: Option<PartialAssistantMessage> = None;
+        let mut provider_journal = claw_application::ports::state::ProviderRoundJournal {
+            session_id: self.session_id.clone(),
+            turn: self.turn,
+            rounds: Vec::new(),
+            revision: 0,
+            closed: false,
+            updated_at: self.inner.ports.clock.now(),
+        };
 
         self.advance(&mut machine, SessionEvent::Enqueue).await?;
         self.advance(&mut machine, SessionEvent::Start).await?;
@@ -1678,6 +1890,7 @@ impl TurnExecution {
                 &mut tool_outcomes,
                 &mut message,
                 &mut partial,
+                &mut provider_journal,
             )
             .await;
 
@@ -1687,13 +1900,23 @@ impl TurnExecution {
                 self.advance(&mut machine, SessionEvent::Fail).await?;
             }
             self.emit(RuntimeEventKind::Failed { reason }).await;
-            self.persist_turn(machine.state(), message.clone(), partial.clone())
-                .await?;
+            self.persist_turn(
+                machine.state(),
+                message.clone(),
+                partial.clone(),
+                provider_journal.rounds,
+            )
+            .await?;
             return Err(error);
         }
 
-        self.persist_turn(machine.state(), message.clone(), partial.clone())
-            .await?;
+        self.persist_turn(
+            machine.state(),
+            message.clone(),
+            partial.clone(),
+            provider_journal.rounds,
+        )
+        .await?;
 
         Ok(TurnOutcome {
             session_id: self.session_id.clone(),
@@ -1713,6 +1936,7 @@ impl TurnExecution {
         tool_outcomes: &mut Vec<ToolOutcome>,
         message: &mut Option<AssistantMessage>,
         partial: &mut Option<PartialAssistantMessage>,
+        provider_journal: &mut claw_application::ports::state::ProviderRoundJournal,
     ) -> Result<(), RuntimeError> {
         self.inner
             .ports
@@ -1725,12 +1949,55 @@ impl TurnExecution {
             })
             .await?;
 
+        if let Some(tool) = self.options.direct_tool.take() {
+            return self
+                .drive_direct_tool(machine, tool_outcomes, message, tool)
+                .await;
+        }
+
         if let Some(objective) = self.options.goal.clone() {
-            let record = self.inner.goals.start(&self.session_id, &objective).await?;
-            self.emit(RuntimeEventKind::GoalUpdated {
-                goal: record.clone(),
-            })
-            .await;
+            if self.options.authority.is_some() {
+                let call = ToolCall {
+                    call_id: claw_application::model::ids::ToolCallId::new(
+                        "runtime-goal-directive",
+                    )?,
+                    name: GOAL_TOOL_NAME.to_owned(),
+                    arguments: serde_json::to_string(&crate::goal_tool::GoalAction::Set {
+                        objective,
+                    })
+                    .map_err(|_| PortError::Invalid("goal directive encoding failed".to_owned()))?,
+                };
+                if machine.accepts(SessionEvent::Stream) {
+                    self.advance(machine, SessionEvent::Stream).await?;
+                }
+                self.advance(machine, SessionEvent::RequestApproval).await?;
+                self.emit(RuntimeEventKind::AwaitingApproval { call: call.clone() })
+                    .await;
+                let outcome = self.run_goal_tool(&call).await?;
+                self.advance(machine, SessionEvent::ResolveApproval).await?;
+                self.emit(RuntimeEventKind::ToolFinished {
+                    outcome: outcome.clone(),
+                })
+                .await;
+                let status = outcome.status;
+                tool_outcomes.push(outcome);
+                if status != ToolStatus::Ok {
+                    self.advance(
+                        machine,
+                        if status == ToolStatus::Cancelled {
+                            SessionEvent::Cancel
+                        } else {
+                            SessionEvent::Block
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            } else {
+                let record = self.inner.goals.start(&self.session_id, &objective).await?;
+                self.emit(RuntimeEventKind::GoalUpdated { goal: record })
+                    .await;
+            }
         }
 
         let goal_context = self.inner.goals.active(&self.session_id).await?.map_or(
@@ -1752,11 +2019,26 @@ impl TurnExecution {
         // whole catalogue on every call the model made. The executor still resolves it once more
         // inside `execute`, which is where the gate that matters lives; this removes the second,
         // purely advisory copy.
-        let catalogue: Vec<ToolDescriptor> = if self.options.tools_enabled {
-            self.inner.tool_catalogue()
-        } else {
-            Vec::new()
-        };
+        let catalogue: Vec<ToolDescriptor> =
+            if self.options.tools_enabled
+                && (!self.inner.config.require_tool_authority
+                    || self.options.authority.as_ref().is_some_and(
+                        claw_application::ports::tool::InvocationAuthority::can_execute,
+                    ))
+            {
+                self.inner
+                    .tool_catalogue()
+                    .into_iter()
+                    .filter(|tool| {
+                        tool.name != GOAL_TOOL_NAME
+                            || self.options.authority.as_ref().is_none_or(
+                                claw_application::ports::tool::InvocationAuthority::is_owner,
+                            )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let tool_names: Vec<String> = catalogue
             .iter()
             .map(|descriptor| descriptor.name.clone())
@@ -1778,6 +2060,14 @@ impl TurnExecution {
                 return Ok(());
             }
 
+            if !provider_budget_available(
+                self.inner.config.max_observed_provider_tokens,
+                &provider_journal.rounds,
+            )? {
+                self.advance(machine, SessionEvent::Block).await?;
+                return Ok(());
+            }
+
             let round = *rounds;
             let prompt = self
                 .inner
@@ -1790,6 +2080,27 @@ impl TurnExecution {
                 })
                 .await?;
 
+            if provider_journal.rounds.len()
+                >= claw_application::ports::provider::MAX_PROVIDER_ROUND_RECORDS
+            {
+                return Err(PortError::Invalid(
+                    "provider accounting round limit exceeded".to_owned(),
+                )
+                .into());
+            }
+            let mut admitted = provider_journal.clone();
+            admitted
+                .rounds
+                .push(claw_application::ports::provider::ProviderRoundRecord {
+                    round,
+                    response: None,
+                });
+            self.persist_provider_journal(&mut admitted).await?;
+            *provider_journal = admitted;
+            if self.cancel.is_cancelled() {
+                self.advance(machine, SessionEvent::Cancel).await?;
+                return Ok(());
+            }
             let opening = self.inner.ports.provider.start_round(ProviderRequest {
                 session_id: self.session_id.clone(),
                 turn: self.turn,
@@ -1806,6 +2117,8 @@ impl TurnExecution {
                 }
                 opened = opening => opened?,
             };
+            self.persist_provider_report(provider_journal, stream.response_report())
+                .await?;
 
             if machine.accepts(SessionEvent::Stream) {
                 self.advance(machine, SessionEvent::Stream).await?;
@@ -1821,9 +2134,18 @@ impl TurnExecution {
             loop {
                 let chunk = tokio::select! {
                     biased;
-                    next = stream.next_chunk() => next?,
+                    next = stream.next_chunk() => match next {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            *partial = Some(assembler.into_partial());
+                            *rounds = rounds.saturating_add(1);
+                            self.persist_provider_report(provider_journal, stream.response_report()).await?;
+                            return Err(error.into());
+                        }
+                    },
                     () = self.cancel.cancelled() => {
                         *partial = Some(assembler.into_partial());
+                        self.persist_provider_report(provider_journal, stream.response_report()).await?;
                         self.advance(machine, SessionEvent::Cancel).await?;
                         return Ok(());
                     }
@@ -1833,7 +2155,17 @@ impl TurnExecution {
                     break;
                 };
 
-                for event in assembler.push(chunk)? {
+                let stream_events = match assembler.push(chunk) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        *partial = Some(assembler.into_partial());
+                        *rounds = rounds.saturating_add(1);
+                        self.persist_provider_report(provider_journal, stream.response_report())
+                            .await?;
+                        return Err(error.into());
+                    }
+                };
+                for event in stream_events {
                     if let StreamPayload::ToolCallCompleted { call } = &event.payload {
                         calls.push(call.clone());
                     }
@@ -1849,8 +2181,16 @@ impl TurnExecution {
             }
 
             *rounds = rounds.saturating_add(1);
+            if let Err(error) = self
+                .persist_provider_report(provider_journal, stream.response_report())
+                .await
+            {
+                *partial = Some(assembler.into_partial());
+                return Err(error);
+            }
 
-            let Some(completed) = assembler.finish() else {
+            if !assembler.is_ended() {
+                *partial = Some(assembler.into_partial());
                 return Err(RuntimeError::Stream(StreamError::UnterminatedToolCall(
                     calls.first().map_or_else(
                         || {
@@ -1860,12 +2200,43 @@ impl TurnExecution {
                         |call| call.call_id.clone(),
                     ),
                 )));
-            };
+            }
+            if provider_journal
+                .rounds
+                .last()
+                .and_then(|round| round.response.as_ref())
+                .is_some_and(|report| {
+                    use claw_application::ports::provider::ProviderResponseFinish;
 
-            self.ingest(ContextItem::AssistantMessage {
-                text: completed.text.clone(),
-            })
-            .await?;
+                    match report.finish_reason {
+                        ProviderResponseFinish::Length | ProviderResponseFinish::ContentFilter => {
+                            true
+                        }
+                        ProviderResponseFinish::ToolCalls => calls.is_empty(),
+                        ProviderResponseFinish::Stop => !calls.is_empty(),
+                    }
+                })
+            {
+                *partial = Some(assembler.into_partial());
+                return Err(PortError::Invalid(
+                    "provider response terminal does not match the completed stream".to_owned(),
+                )
+                .into());
+            }
+            let completed = assembler.finish().expect("message end was checked");
+
+            if calls.is_empty() {
+                self.ingest(ContextItem::AssistantMessage {
+                    text: completed.text.clone(),
+                })
+                .await?;
+            } else {
+                self.ingest(ContextItem::AssistantToolCalls {
+                    text: completed.text.clone(),
+                    tool_calls: completed.tool_calls.clone(),
+                })
+                .await?;
+            }
             *message = Some(completed);
 
             self.emit(RuntimeEventKind::RoundFinished {
@@ -1888,13 +2259,37 @@ impl TurnExecution {
                 self.advance(machine, SessionEvent::Block).await?;
                 return Ok(());
             }
+            if self.inner.config.require_tool_authority
+                && !self
+                    .options
+                    .authority
+                    .as_ref()
+                    .is_some_and(claw_application::ports::tool::InvocationAuthority::can_execute)
+            {
+                self.advance(machine, SessionEvent::Block).await?;
+                return Ok(());
+            }
 
             for call in calls {
                 if self.inner.config.goal_tool_enabled && call.name == GOAL_TOOL_NAME {
-                    self.emit(RuntimeEventKind::ToolStarted { call: call.clone() })
-                        .await;
+                    let approved =
+                        self.options.authority.as_ref().is_some_and(
+                            claw_application::ports::tool::InvocationAuthority::is_owner,
+                        );
+                    if approved {
+                        self.advance(machine, SessionEvent::RequestApproval).await?;
+                        self.emit(RuntimeEventKind::AwaitingApproval { call: call.clone() })
+                            .await;
+                    } else {
+                        self.emit(RuntimeEventKind::ToolStarted { call: call.clone() })
+                            .await;
+                    }
                     let outcome = self.run_goal_tool(&call).await?;
-                    self.ingest(ContextItem::ToolResult {
+                    if approved {
+                        self.advance(machine, SessionEvent::ResolveApproval).await?;
+                    }
+                    self.ingest(ContextItem::ToolCallResult {
+                        call_id: call.call_id.clone(),
                         tool_name: call.name.clone(),
                         output: outcome.output.clone(),
                         failed: outcome.status.is_failure(),
@@ -1906,7 +2301,11 @@ impl TurnExecution {
                     .await;
                     tool_outcomes.push(outcome);
 
-                    if self.cancel.is_cancelled() {
+                    if self.cancel.is_cancelled()
+                        || self.options.authority.as_ref().is_some_and(
+                            claw_application::ports::tool::InvocationAuthority::is_revoked,
+                        )
+                    {
                         self.advance(machine, SessionEvent::Cancel).await?;
                         return Ok(());
                     }
@@ -1921,11 +2320,12 @@ impl TurnExecution {
                     .iter()
                     .find(|descriptor| descriptor.name == call.name)
                     .is_some_and(|descriptor| descriptor.requires_approval)
-                    && self
-                        .inner
-                        .broker
-                        .remembered(&self.session_id, &call.name)
-                        .is_none();
+                    && (self.options.authority.is_some()
+                        || self
+                            .inner
+                            .broker
+                            .remembered(&self.session_id, &call.name)
+                            .is_none());
 
                 // `call` is owned by this loop and its last borrow is the descriptor lookup above,
                 // so the invocation takes it by move. Only the name is copied out beforehand for
@@ -1944,12 +2344,13 @@ impl TurnExecution {
                 let outcome = self
                     .inner
                     .executor
-                    .execute(
+                    .execute_authorized(
                         ToolInvocation {
                             session_id: self.session_id.clone(),
                             turn: self.turn,
                             call,
                         },
+                        self.options.authority.clone(),
                         &self.cancel,
                     )
                     .await?;
@@ -1959,7 +2360,8 @@ impl TurnExecution {
                 }
 
                 changed_workspace |= outcome.changed_workspace;
-                self.ingest(ContextItem::ToolResult {
+                self.ingest(ContextItem::ToolCallResult {
+                    call_id: outcome.call_id.clone(),
                     tool_name,
                     output: outcome.output.clone(),
                     failed: outcome.status.is_failure(),
@@ -1995,6 +2397,95 @@ impl TurnExecution {
         Ok(())
     }
 
+    async fn drive_direct_tool(
+        &mut self,
+        machine: &mut TurnStateMachine,
+        tool_outcomes: &mut Vec<ToolOutcome>,
+        message: &mut Option<AssistantMessage>,
+        tool: crate::command::DirectTool,
+    ) -> Result<(), RuntimeError> {
+        if self.quiesce(machine).await? {
+            return Ok(());
+        }
+        let call = ToolCall {
+            call_id: claw_application::model::ids::ToolCallId::new("runtime-direct-tool")?,
+            name: tool.name().to_owned(),
+            arguments: tool.arguments().to_owned(),
+        };
+        self.ingest(ContextItem::UserInput {
+            text: format!("Native tool command: {}", call.name),
+        })
+        .await?;
+        self.advance(machine, SessionEvent::Stream).await?;
+        let requires_approval = self
+            .inner
+            .tool_catalogue()
+            .iter()
+            .find(|descriptor| descriptor.name == call.name)
+            .is_some_and(|descriptor| descriptor.requires_approval);
+        if requires_approval {
+            self.advance(machine, SessionEvent::RequestApproval).await?;
+            self.emit(RuntimeEventKind::AwaitingApproval { call: call.clone() })
+                .await;
+        } else {
+            self.emit(RuntimeEventKind::ToolStarted { call: call.clone() })
+                .await;
+        }
+        let outcome = if self.inner.config.goal_tool_enabled && call.name == GOAL_TOOL_NAME {
+            self.run_goal_tool(&call).await?
+        } else {
+            self.inner
+                .executor
+                .execute_authorized(
+                    ToolInvocation {
+                        session_id: self.session_id.clone(),
+                        turn: self.turn,
+                        call: call.clone(),
+                    },
+                    self.options.authority.clone(),
+                    &self.cancel,
+                )
+                .await?
+        };
+        if requires_approval {
+            self.advance(machine, SessionEvent::ResolveApproval).await?;
+        }
+        self.ingest(ContextItem::ToolResult {
+            tool_name: call.name.clone(),
+            output: outcome.output.clone(),
+            failed: outcome.status.is_failure(),
+        })
+        .await?;
+        self.emit(RuntimeEventKind::ToolFinished {
+            outcome: outcome.clone(),
+        })
+        .await;
+        *message = Some(AssistantMessage {
+            text: outcome.output.clone(),
+            tool_calls: vec![call],
+            ..AssistantMessage::default()
+        });
+        let event = if outcome.status == ToolStatus::Cancelled
+            || self.cancel.is_cancelled()
+            || self
+                .options
+                .authority
+                .as_ref()
+                .is_some_and(claw_application::ports::tool::InvocationAuthority::is_revoked)
+        {
+            SessionEvent::Cancel
+        } else if outcome.status != ToolStatus::Ok {
+            SessionEvent::Block
+        } else if outcome.changed_workspace {
+            SessionEvent::CompleteWithChanges
+        } else {
+            SessionEvent::Complete
+        };
+        tool_outcomes.push(outcome);
+        self.advance(machine, event).await?;
+        Ok(())
+    }
+
     /// Applies one model-authored goal-tool call.
     ///
     /// Argument and ordinary goal-service failures become a failed [`ToolOutcome`] rather than a
@@ -2002,17 +2493,54 @@ impl TurnExecution {
     /// same turn. A committed-but-not-durable store outcome aborts the turn because presenting it
     /// as a failed tool call would invite an unsafe model retry.
     async fn run_goal_tool(&self, call: &ToolCall) -> Result<ToolOutcome, RuntimeError> {
-        let action = match parse_goal_action(&call.arguments) {
-            Ok(action) => action,
-            Err(error) => return Ok(Self::failed_goal_call(call, &error)),
-        };
-
-        let record = match self.inner.goals.apply(&self.session_id, &action).await {
-            Ok(record) => record,
-            Err(error @ GoalError::Port(PortError::CommittedButNotDurable(_))) => {
-                return Err(RuntimeError::Goal(error));
+        if self
+            .options
+            .authority
+            .as_ref()
+            .is_some_and(|authority| !authority.is_owner())
+        {
+            return Ok(ToolOutcome {
+                call_id: call.call_id.clone(),
+                status: ToolStatus::Denied,
+                output: "goal mutation requires an authenticated owner".to_owned(),
+                changed_workspace: false,
+            });
+        }
+        let record = if let Some(authority) = self.options.authority.clone() {
+            let result = crate::goal_tool::execute_authorized_goal(
+                &self.inner.goals,
+                &self.inner.broker,
+                self.inner.ports.tools.as_ref(),
+                ToolInvocation {
+                    session_id: self.session_id.clone(),
+                    turn: self.turn,
+                    call: call.clone(),
+                },
+                authority,
+                &self.cancel,
+                &self.inner.shutdown,
+            )
+            .await?;
+            let Some(record) = result.record else {
+                return Ok(result.outcome);
+            };
+            record
+        } else {
+            let action = match parse_goal_action(&call.arguments) {
+                Ok(action) => action,
+                Err(error) => return Ok(Self::failed_goal_call(call, &error)),
+            };
+            match self.inner.goals.apply(&self.session_id, &action).await {
+                Ok(record) => record,
+                Err(
+                    error @ GoalError::Port(
+                        PortError::CommittedButNotDurable(_) | PortError::OutcomeUnknown(_),
+                    ),
+                ) => {
+                    return Err(RuntimeError::Goal(error));
+                }
+                Err(error) => return Ok(Self::failed_goal_call(call, &error)),
             }
-            Err(error) => return Ok(Self::failed_goal_call(call, &error)),
         };
 
         self.emit(RuntimeEventKind::GoalUpdated {
@@ -2052,7 +2580,13 @@ impl TurnExecution {
     ///
     /// Returns `true` when the turn should stop because it was cancelled.
     async fn quiesce(&mut self, machine: &mut TurnStateMachine) -> Result<bool, RuntimeError> {
-        if self.cancel.is_cancelled() {
+        if self.cancel.is_cancelled()
+            || self
+                .options
+                .authority
+                .as_ref()
+                .is_some_and(claw_application::ports::tool::InvocationAuthority::is_revoked)
+        {
             self.advance(machine, SessionEvent::Cancel).await?;
             return Ok(true);
         }
@@ -2156,11 +2690,45 @@ impl TurnExecution {
         Ok(())
     }
 
+    async fn persist_provider_journal(
+        &self,
+        journal: &mut claw_application::ports::state::ProviderRoundJournal,
+    ) -> Result<(), RuntimeError> {
+        journal.updated_at = self.inner.ports.clock.now();
+        journal.revision = self
+            .inner
+            .ports
+            .state
+            .save_provider_journal(journal.clone())
+            .await?;
+        Ok(())
+    }
+
+    async fn persist_provider_report(
+        &self,
+        journal: &mut claw_application::ports::state::ProviderRoundJournal,
+        report: Option<claw_application::ports::provider::ProviderResponseReport>,
+    ) -> Result<(), RuntimeError> {
+        let mut confirmed = journal.clone();
+        if capture_provider_report(
+            confirmed
+                .rounds
+                .last_mut()
+                .expect("admitted provider round"),
+            report,
+        )? {
+            self.persist_provider_journal(&mut confirmed).await?;
+            *journal = confirmed;
+        }
+        Ok(())
+    }
+
     async fn persist_turn(
         &self,
         state: SessionState,
         message: Option<AssistantMessage>,
         partial: Option<PartialAssistantMessage>,
+        provider_rounds: Vec<claw_application::ports::provider::ProviderRoundRecord>,
     ) -> Result<(), RuntimeError> {
         self.inner
             .ports
@@ -2171,6 +2739,7 @@ impl TurnExecution {
                 state,
                 message,
                 partial,
+                provider_rounds,
                 updated_at: self.inner.ports.clock.now(),
             })
             .await?;

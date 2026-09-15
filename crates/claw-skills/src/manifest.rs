@@ -52,14 +52,24 @@ impl SkillManifest {
             return Err(ManifestError::EmptyDescription);
         }
         validate_schema(&self.parameters).map_err(ManifestError::InvalidParameterSchema)?;
+        if matches!(self.execution, SkillExecution::Instructions { .. })
+            && self.parameters != serde_json::json!({"type":"object","properties":{},"additionalProperties":false})
+        {
+            return Err(ManifestError::InvalidInstructions);
+        }
         self.execution.validate()
     }
 }
 
-/// Closed executable forms. JavaScript is deliberately not representable.
+/// Closed instruction and execution forms. JavaScript is not representable.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SkillExecution {
+    /// Fixed instruction content returned as data, without execution grants.
+    Instructions {
+        /// Bounded UTF-8 instructions; this is never evaluated as code.
+        content: String,
+    },
     /// Rust-native handler registered in the process.
     Native {
         /// Exact handler identifier.
@@ -82,6 +92,13 @@ pub enum SkillExecution {
 impl SkillExecution {
     fn validate(&self) -> Result<(), ManifestError> {
         match self {
+            Self::Instructions { content }
+                if content.trim().is_empty()
+                    || content.len() > 8 * 1024
+                    || content.chars().any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t')) =>
+            {
+                Err(ManifestError::InvalidInstructions)
+            }
             Self::Native { handler } if !valid_skill_id(handler) => {
                 Err(ManifestError::InvalidNativeHandler)
             }
@@ -91,7 +108,7 @@ impl SkillExecution {
             {
                 Err(ManifestError::InvalidWasmTarget)
             }
-            Self::Native { .. } | Self::Wasm { .. } => Ok(()),
+            Self::Instructions { .. } | Self::Native { .. } | Self::Wasm { .. } => Ok(()),
         }
     }
 }
@@ -223,6 +240,8 @@ pub enum ManifestError {
     EmptyDescription,
     /// Parameter schema is invalid.
     InvalidParameterSchema(SchemaError),
+    /// Instruction content is empty, oversized, unsafe text, or accepts arguments.
+    InvalidInstructions,
     /// Native handler identifier is invalid.
     InvalidNativeHandler,
     /// HTTP URL is relative, malformed, or contains user information.
@@ -241,7 +260,7 @@ pub enum ManifestError {
 ///
 /// Returns [`ManifestError::MalformedJson`] when `json` is not JSON or does not
 /// decode into the closed model, which includes any `execution.kind` other than
-/// `native`, `http` or `wasm`: JavaScript is not representable, so it is
+/// `instructions`, `native`, `http` or `wasm`: JavaScript is not representable, so it is
 /// rejected by the parser rather than by a later check.
 ///
 /// Returns [`ManifestError::InvalidId`] when the identifier is empty, longer
@@ -286,6 +305,7 @@ impl Display for ManifestError {
                 "skill manifest JSON is invalid at line {line}, column {column}: {message}"
             ),
             Self::InvalidId => formatter.write_str("skill id is invalid"),
+            Self::InvalidInstructions => formatter.write_str("instruction skills require bounded content and an empty closed parameter object"),
             Self::EmptyDescription => formatter.write_str("skill description must not be blank"),
             Self::InvalidParameterSchema(error) => write!(
                 formatter,

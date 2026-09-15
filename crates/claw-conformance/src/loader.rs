@@ -872,7 +872,7 @@ where
     parse_bytes(relative, &bytes)
 }
 
-fn parse_bytes<T>(relative: &str, bytes: &[u8]) -> Result<T, ConformanceError>
+pub(crate) fn parse_bytes<T>(relative: &str, bytes: &[u8]) -> Result<T, ConformanceError>
 where
     T: DeserializeOwned,
 {
@@ -891,7 +891,7 @@ where
     Ok(value)
 }
 
-fn read_file(root: &Path, relative: &str) -> Result<Vec<u8>, ConformanceError> {
+pub(crate) fn read_file(root: &Path, relative: &str) -> Result<Vec<u8>, ConformanceError> {
     let path = root.join(relative);
     let file = File::open(&path).map_err(|error| {
         ConformanceError::new(
@@ -1013,7 +1013,7 @@ fn verify_hashes<'a>(
 /// Lowercase hexadecimal SHA-256 of `bytes` with CRLF folded to LF, so a frozen
 /// artifact hashes the same whichever way a checkout materialized its line
 /// endings.
-fn normalized_digest(bytes: &[u8]) -> String {
+pub(crate) fn normalized_digest(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut hasher = Sha256::new();
     let mut chunk_start = 0;

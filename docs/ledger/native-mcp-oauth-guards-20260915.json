@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "stage": "mcp-oauth-authorization-and-refresh-guards",
+  "capturedAtUtc": "2026-09-15T00:27:23.3350235Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-mcp/src/oauth.rs","sha256":"7143ea1ac2c3e2aebff1a72b0e1bfbc7b3265b6b570419fcf1996877ec63a35c"}
+  ],
+  "cargoLockSha256": "7b7fbedc4a9eb99b780bca28c2cfaf789b7e55fcd40101d67359ac4e5b5ccaf1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":79, "failed":0, "ignored":0, "testBinaries":6,
+      "log":"target/native-mcp-oauth-guards-tests-20260915T002636609Z.log",
+      "sha256":"b04e973059d131735533fe15a899e27b1c6bf04f50374faab14559983f2d4e3a"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-oauth-guards-clippy-20260915T002624651Z.log",
+      "sha256":"85f9484036947bfeb5dd5076d355b19bb002361908b540241312cd26169fb9b9"
+    }
+  ],
+  "behaviorEvidence": [
+    "authorization_context_changes_and_expiry_are_refused_before_network",
+    "authorization_exchange_never_replays_after_send_cancel_or_store_failure",
+    "oauth_refresh_lost_response_fences_fresh_tokens_and_keeps_a_bounded_registry",
+    "uncertain_refresh_blocks_waiters_until_new_authorization_and_failed_logout_stays_closed",
+    "token_responses_require_bounded_bearer_credentials_before_persistence",
+    "concurrent_bearer_requests_share_one_rotating_refresh",
+    "logout_waits_for_in_flight_refresh_and_removes_the_rotated_token"
+  ],
+  "notes": [
+    "AuthorizationRequest seals original context, expires after ten minutes and is consumed before awaiting token I/O",
+    "Callback/request Debug omits codes, state, URLs and PKCE; reserved query injection is refused",
+    "Same-client code exchange, refresh and logout serialize under at most 256 retained binding locks",
+    "Uncertain refresh and failed logout remain fenced until successful new authorization; no automatic replay or rollback",
+    "Token response validation precedes persistence and rejected wire secrets are zeroized",
+    "Actual ephemeral loopback protocol fixtures only; no browser, remote accounts, dependencies or lock changes"
+  ],
+  "unverified": [
+    "Independent-client/process/restart coordination and crash-durable uncertainty records",
+    "Cancellation of previously issued bearer headers or separately pending browser authorizations",
+    "Product OAuth route enrollment, native TokenStore persistence and issuer/client-bound token records",
+    "Full browser login/refresh, cross-platform and real-account acceptance, deployment and whole-project completion"
+  ]
+}

@@ -62,14 +62,18 @@ impl PluginActivationSummary {
 }
 
 #[derive(Clone)]
-struct PublishedTool {
+pub(super) struct PublishedTool {
     registration: ToolRegistration,
     input_schema: Value,
+    validator: Arc<jsonschema::Validator>,
+    revision: u64,
 }
 
 /// Tool sink shared by the plugin host, HTTP tools, MCP, and model declarations.
 pub struct PluginToolSurface {
-    registrations: Mutex<BTreeMap<String, PublishedTool>>,
+    registrations: Arc<Mutex<BTreeMap<String, PublishedTool>>>,
+    audit: std::sync::OnceLock<Arc<super::http_api::DurableSecurityAudit>>,
+    next_publication: AtomicU64,
     host: Mutex<Option<Weak<Mutex<PluginHost>>>>,
     diagnostics: Arc<Diagnostics>,
     accepting: Mutex<bool>,
@@ -80,9 +84,11 @@ pub struct PluginToolSurface {
 }
 
 impl PluginToolSurface {
-    fn new(diagnostics: Arc<Diagnostics>) -> Arc<Self> {
+    pub(super) fn new(diagnostics: Arc<Diagnostics>) -> Arc<Self> {
         Arc::new(Self {
-            registrations: Mutex::new(BTreeMap::new()),
+            registrations: Arc::new(Mutex::new(BTreeMap::new())),
+            audit: std::sync::OnceLock::new(),
+            next_publication: AtomicU64::new(0),
             host: Mutex::new(None),
             diagnostics,
             accepting: Mutex::new(true),
@@ -95,6 +101,64 @@ impl PluginToolSurface {
 
     fn attach(&self, host: &Arc<Mutex<PluginHost>>) {
         *self.host.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::downgrade(host));
+        self.registrations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, tool| {
+                if let Some(revision) = self.allocate_revision() {
+                    tool.revision = revision;
+                    true
+                } else {
+                    false
+                }
+            });
+    }
+
+    fn allocate_revision(&self) -> Option<u64> {
+        self.next_publication
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .ok()
+            .map(|previous| previous + 1)
+    }
+
+    pub(super) fn attach_audit(
+        &self,
+        audit: Arc<super::http_api::DurableSecurityAudit>,
+    ) -> Result<(), String> {
+        self.audit
+            .set(audit)
+            .map_err(|_| "plugin effect audit is already attached".to_owned())
+    }
+
+    pub(super) fn validate_arguments(
+        &self,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<claw_application::ports::tool::ToolBinding, PortError> {
+        let tool = self.resolve(name)?;
+        let encoded = serde_json::to_vec(arguments).map_err(|_| {
+            PortError::new(
+                PortErrorKind::InvalidRequest,
+                "plugin arguments cannot be encoded",
+            )
+        })?;
+        if encoded.len() > 16 * 1024
+            || !arguments.is_object()
+            || !tool.validator.is_valid(arguments)
+        {
+            return Err(PortError::new(
+                PortErrorKind::InvalidRequest,
+                "plugin arguments do not satisfy the bounded published schema",
+            ));
+        }
+        claw_application::ports::tool::ToolBinding::new(name, tool.revision).map_err(|_| {
+            PortError::new(
+                PortErrorKind::Unavailable,
+                "tool publication cannot be bound",
+            )
+        })
     }
 
     fn public_name(plugin_id: &str, tool: &str) -> String {
@@ -126,7 +190,7 @@ impl PluginToolSurface {
         hash
     }
 
-    fn resolve(&self, name: &str) -> Result<PublishedTool, PortError> {
+    pub(super) fn resolve(&self, name: &str) -> Result<PublishedTool, PortError> {
         self.registrations
             .lock()
             .map_err(|_| {
@@ -135,6 +199,19 @@ impl PluginToolSurface {
             .get(name)
             .cloned()
             .ok_or_else(|| PortError::new(PortErrorKind::NotFound, "plugin tool is not registered"))
+    }
+
+    pub(super) fn skill_target(&self, plugin_id: &str, export: &str) -> Result<String, PortError> {
+        let name = Self::public_name(plugin_id, export);
+        let published = self.resolve(&name)?;
+        if published.registration.plugin_id != plugin_id || published.registration.name != export {
+            return Err(PortError::new(
+                PortErrorKind::InvalidRequest,
+                "skill plugin target identity conflicts",
+            ));
+        }
+        self.host()?;
+        Ok(name)
     }
 
     fn host(&self) -> Result<Arc<Mutex<PluginHost>>, PortError> {
@@ -200,8 +277,32 @@ impl Drop for PluginInvocationGuard {
 impl ToolSink for PluginToolSurface {
     fn register(&self, registration: ToolRegistration) {
         let public_name = Self::public_name(&registration.plugin_id, &registration.name);
+        if registration.input_schema.len() > 32 * 1024 {
+            self.unregister(&registration.plugin_id, &registration.name);
+            self.diagnostics
+                .record("plugin tool schema exceeds its byte limit");
+            return;
+        }
         match serde_json::from_str::<Value>(&registration.input_schema) {
             Ok(input_schema) if input_schema.is_object() => {
+                let Ok(validator) = jsonschema::options()
+                    .offline()
+                    .with_pattern_options(
+                        jsonschema::PatternOptions::regex()
+                            .size_limit(256 * 1024)
+                            .dfa_size_limit(512 * 1024),
+                    )
+                    .build(&input_schema)
+                else {
+                    self.unregister(&registration.plugin_id, &registration.name);
+                    self.diagnostics.record("plugin tool schema is invalid or requires unsupported external resources or patterns");
+                    return;
+                };
+                let Some(revision) = self.allocate_revision() else {
+                    self.diagnostics
+                        .record("plugin publication identity exhausted");
+                    return;
+                };
                 self.registrations
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -210,14 +311,18 @@ impl ToolSink for PluginToolSurface {
                         PublishedTool {
                             registration,
                             input_schema,
+                            validator: Arc::new(validator),
+                            revision,
                         },
                     );
                 self.diagnostics
                     .record(format!("plugin tool registered: {public_name}"));
             }
-            _ => self
-                .diagnostics
-                .record(format!("plugin tool schema rejected: {public_name}")),
+            _ => {
+                self.unregister(&registration.plugin_id, &registration.name);
+                self.diagnostics
+                    .record(format!("plugin tool schema rejected: {public_name}"));
+            }
         }
     }
 
@@ -268,10 +373,39 @@ impl ToolPort for PluginToolSurface {
 
     fn invoke(
         &self,
-        invocation: ToolInvocation,
+        mut invocation: ToolInvocation,
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<ToolOutcome, PortError>> {
         Box::pin(async move {
+            if cancellation.is_cancelled() {
+                return Err(PortError::new(
+                    PortErrorKind::Unavailable,
+                    "plugin invocation was cancelled before execution",
+                ));
+            }
+            let authority = invocation
+                .context
+                .authority
+                .as_ref()
+                .filter(|authority| authority.can_execute())
+                .ok_or_else(|| {
+                    PortError::new(
+                        PortErrorKind::InvalidRequest,
+                        "plugin invocation requires verified execution authority",
+                    )
+                })?;
+            let binding = invocation.context.binding.as_ref().ok_or_else(|| {
+                PortError::new(
+                    PortErrorKind::InvalidRequest,
+                    "plugin invocation requires an approved publication",
+                )
+            })?;
+            if binding.identity() != invocation.name {
+                return Err(PortError::new(
+                    PortErrorKind::InvalidRequest,
+                    "tool publication identity changed",
+                ));
+            }
             let (result_rx, plugin_cancel, mut cancel_guard) = {
                 let accepting = self.accepting.lock().map_err(|_| {
                     PortError::new(
@@ -286,6 +420,18 @@ impl ToolPort for PluginToolSurface {
                     ));
                 }
                 let tool = self.resolve(&invocation.name)?;
+                if tool.revision != binding.revision() {
+                    return Err(PortError::new(
+                        PortErrorKind::InvalidRequest,
+                        "tool publication changed after approval",
+                    ));
+                }
+                if self.validate_arguments(&invocation.name, &invocation.arguments)? != *binding {
+                    return Err(PortError::new(
+                        PortErrorKind::InvalidRequest,
+                        "tool publication changed during argument validation",
+                    ));
+                }
                 if invocation.context.dry_run {
                     return Ok(ToolOutcome {
                         status: 200,
@@ -297,12 +443,23 @@ impl ToolPort for PluginToolSurface {
                     });
                 }
                 let host = self.host()?;
+                let audit = self.audit.get().cloned().ok_or_else(|| {
+                    PortError::new(
+                        PortErrorKind::Unavailable,
+                        "plugin effect audit is not attached",
+                    )
+                })?;
+                let expected_binding = binding.clone();
+                let execution_authority = authority.clone();
+                let execution_cancellation = cancellation.clone();
+                let registrations = Arc::clone(&self.registrations);
+                tracing::debug!(tool = invocation.name, caller_source = ?authority.source(), permission_generation = authority.generation(), publication = binding.revision(), "authorized plugin invocation");
                 let plugin_cancel = claw_plugin_host::CancellationToken::new();
                 let cancel_guard = PluginCancelGuard(Some(plugin_cancel.clone()));
                 let task_cancel = plugin_cancel.clone();
                 let plugin_id = tool.registration.plugin_id;
                 let tool_name = tool.registration.name;
-                let parameters = invocation.arguments;
+                let parameters = std::mem::take(&mut invocation.arguments);
                 let (result_tx, result_rx) = oneshot::channel();
                 let id = self.spawned.fetch_add(1, Ordering::SeqCst);
                 let terminated = Arc::clone(&self.terminated);
@@ -319,16 +476,31 @@ impl ToolPort for PluginToolSurface {
                     };
                     let result = tokio::task::spawn_blocking(move || {
                         let mut host = host.lock().unwrap_or_else(PoisonError::into_inner);
-                        host.invoke_json_tool(PluginToolInvocation {
+                        let unchanged = registrations.lock().map_err(|_| PortError::new(PortErrorKind::Unavailable, "tool catalog unavailable"))?
+                            .get(expected_binding.identity()).is_some_and(|current| current.revision == expected_binding.revision());
+                        if !unchanged { return Err(PortError::new(PortErrorKind::InvalidRequest, "tool publication changed before host execution")); }
+                        if execution_cancellation.is_cancelled() || task_cancel.is_cancelled() || !execution_authority.can_execute() {
+                            return Err(PortError::new(PortErrorKind::InvalidRequest, "plugin authority was withdrawn before execution"));
+                        }
+                        audit.persist_plugin_tool(&invocation, claw_application::ports::tool::InternalToolAuditPhase::Authorized)?;
+                        if execution_cancellation.is_cancelled() || task_cancel.is_cancelled() || !execution_authority.can_execute() {
+                            audit.persist_plugin_tool(&invocation, claw_application::ports::tool::InternalToolAuditPhase::Failed)?;
+                            return Err(PortError::new(PortErrorKind::InvalidRequest, "plugin authority was withdrawn before effects"));
+                        }
+                        let result = host.invoke_json_tool(PluginToolInvocation {
                             plugin_id: &plugin_id,
                             tool: &tool_name,
                             parameters: &parameters,
                             cancellation: Some(&task_cancel),
-                        })
+                        });
+                        drop(host);
+                        let phase = if result.is_ok() { claw_application::ports::tool::InternalToolAuditPhase::Completed } else { claw_application::ports::tool::InternalToolAuditPhase::Failed };
+                        audit.persist_plugin_tool(&invocation, phase).map_err(|_| PortError::new(PortErrorKind::OutcomeUnknown, "Plugin completion audit is unconfirmed; reconcile effects before retrying."))?;
+                        result.map_err(|_| PortError::new(PortErrorKind::OutcomeUnknown, "Plugin execution failed after authorization and may have produced effects; do not repeat it automatically."))
                     })
                     .await
-                    .map_err(|_| PortError::new(PortErrorKind::Internal, "plugin tool task failed"))
-                    .and_then(|result| result.map_err(|error| host_port_error(&error)));
+                    .map_err(|_| PortError::new(PortErrorKind::OutcomeUnknown, "plugin tool task did not confirm its result"))
+                    .and_then(std::convert::identity);
                     let _ = result_tx.send(result);
                 });
                 drop(accepting);
@@ -336,11 +508,11 @@ impl ToolPort for PluginToolSurface {
             };
             let result = tokio::select! {
                 result = result_rx => result.map_err(|_| {
-                    PortError::new(PortErrorKind::Internal, "plugin tool result disappeared")
+                    PortError::new(PortErrorKind::OutcomeUnknown, "plugin tool result disappeared; do not repeat automatically")
                 })??,
                 () = cancellation.cancelled() => {
                     plugin_cancel.cancel();
-                    return Err(PortError::new(PortErrorKind::Unavailable, "request cancelled"));
+                    return Err(PortError::new(PortErrorKind::OutcomeUnknown, "Plugin call was interrupted; reconcile effects before retrying."));
                 }
             };
             cancel_guard.disarm();
@@ -784,27 +956,12 @@ fn decode_hex_key(encoded: &str) -> Result<[u8; 32], String> {
         return Err("Ed25519 public keys must be 64 hexadecimal characters".to_owned());
     }
     let mut key = [0_u8; 32];
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = std::str::from_utf8(pair).map_err(|_| "plugin key is not UTF-8".to_owned())?;
         key[index] =
             u8::from_str_radix(pair, 16).map_err(|_| "plugin key is not hexadecimal".to_owned())?;
     }
     Ok(key)
-}
-
-fn host_port_error(error: &HostError) -> PortError {
-    let kind = match host_error_kind(error) {
-        WasmHostErrorKind::PluginNotFound | WasmHostErrorKind::ToolNotFound => {
-            PortErrorKind::NotFound
-        }
-        WasmHostErrorKind::PayloadTooLarge | WasmHostErrorKind::InvalidResponse => {
-            PortErrorKind::InvalidRequest
-        }
-        WasmHostErrorKind::Timeout => PortErrorKind::Timeout,
-        WasmHostErrorKind::Internal => PortErrorKind::Internal,
-        _ => PortErrorKind::Unavailable,
-    };
-    PortError::new(kind, error.to_string())
 }
 
 fn host_wasm_error(error: &HostError) -> WasmHostError {
@@ -916,6 +1073,56 @@ mod tests {
     }
 
     #[test]
+    fn plugin_schema_validation_is_offline_bounded_and_precedes_execution() {
+        let tools =
+            PluginToolSurface::new(Arc::new(crate::adapters::http_api::Diagnostics::new(8)));
+        let registration = |schema: serde_json::Value| ToolRegistration {
+            plugin_id: "schema-fixture".to_owned(),
+            name: "lookup".to_owned(),
+            summary: "Schema fixture".to_owned(),
+            input_schema: schema.to_string(),
+        };
+        let valid = json!({"type": "object", "properties": {"path": {"type": "string", "minLength": 1}}, "required": ["path"], "additionalProperties": false});
+        tools.register(registration(valid.clone()));
+        let name = crate::adapters::http_api::ModelToolCatalog::definitions(&*tools)[0]
+            .name
+            .clone();
+        assert!(
+            tools
+                .validate_arguments(&name, &json!({"path": "reviewed.txt"}))
+                .is_ok()
+        );
+        for arguments in [
+            json!({}),
+            json!({"path": 7}),
+            json!({"path": ""}),
+            json!({"path": "safe", "owner": true}),
+            json!({"path": "private-schema-input".repeat(1024)}),
+        ] {
+            let error = tools
+                .validate_arguments(&name, &arguments)
+                .expect_err("invalid arguments");
+            assert_eq!(error.kind, claw_http_api::PortErrorKind::InvalidRequest);
+            assert!(!error.message.contains("private-schema-input"));
+        }
+        for schema in [
+            json!({"$ref": "https://example.test/private-schema"}),
+            json!({"$ref": "file:///C:/private-schema"}),
+            json!({"type": "not-a-type"}),
+            json!({"type": "string", "pattern": "(?<=secret)value"}),
+            json!({"type": "string", "pattern": "a{1000000}"}),
+        ] {
+            tools.register(registration(schema));
+            assert!(
+                crate::adapters::http_api::ModelToolCatalog::definitions(&*tools).is_empty(),
+                "unsupported replacement withdraws old publication"
+            );
+            tools.register(registration(valid.clone()));
+        }
+        assert_eq!(tools.spawned.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn tool_sink_publishes_and_withdraws_model_catalog_entries() {
         let tools = PluginToolSurface::new(std::sync::Arc::new(
             crate::adapters::http_api::Diagnostics::new(8),
@@ -959,11 +1166,25 @@ mod tests {
             .pop()
             .expect("registered tool")
             .name;
+        let binding = tools
+            .validate_arguments(&name, &json!({}))
+            .expect("test publication");
         let invocation = ToolInvocation {
             name,
             arguments: json!({}),
             action: None,
             context: ToolInvocationContext {
+                authority: Some(
+                    claw_application::ports::tool::InvocationAuthority::new(
+                        claw_application::ports::tool::InvocationSource::Http,
+                        "test-owner",
+                        None,
+                        claw_application::ports::tool::InvocationAccess::Owner,
+                        0,
+                    )
+                    .expect("test authority"),
+                ),
+                binding: Some(binding),
                 session_key: None,
                 agent_id: None,
                 idempotency_key: None,
@@ -976,9 +1197,45 @@ mod tests {
             },
         };
 
-        ToolPort::invoke(&*tools, invocation.clone(), CancellationToken::new())
+        let error = ToolPort::invoke(&*tools, invocation.clone(), CancellationToken::new())
+            .await
+            .expect_err("effect audit is required before task admission");
+        assert_eq!(error.kind, claw_http_api::PortErrorKind::Unavailable);
+        assert!(error.message.contains("audit is not attached"));
+        assert_eq!(tools.spawned.load(Ordering::SeqCst), 0);
+        let audit_path = std::env::temp_dir().join(format!(
+            "claw-plugin-effect-audit-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        tools
+            .attach_audit(Arc::new(
+                crate::adapters::http_api::DurableSecurityAudit::open(
+                    &audit_path,
+                    Arc::new(crate::adapters::http_api::DependencyReadiness::new([
+                        "audit",
+                    ])),
+                )
+                .expect("durable effect audit"),
+            ))
+            .expect("attach audit");
+        let error = ToolPort::invoke(&*tools, invocation.clone(), CancellationToken::new())
             .await
             .expect_err("missing plugin");
+        assert_eq!(error.kind, claw_http_api::PortErrorKind::OutcomeUnknown);
+        let records = std::fs::read_to_string(&audit_path).expect("plugin effect audit");
+        let records: Vec<serde_json::Value> = records
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("audit JSON"))
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["action"], "plugin_tool");
+        assert_eq!(records[0]["phase"], "authorized");
+        assert_eq!(records[1]["phase"], "failed");
+        assert_eq!(records[0]["subject"], "test-owner");
         let report = tools.shutdown_tasks(Duration::from_secs(1)).await;
         assert_eq!(report.spawned, 1);
         assert_eq!(report.terminated, 1);
@@ -989,6 +1246,8 @@ mod tests {
             .await
             .expect_err("draining surface rejects calls");
         assert_eq!(error.kind, claw_http_api::PortErrorKind::Unavailable);
+        drop(tools);
+        std::fs::remove_file(audit_path).expect("remove owned test audit");
     }
 
     #[tokio::test]

@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-reviewed-mcp-resource-and-prompt-reads",
+  "capturedAtUtc": "2026-09-14T23:34:48.0978564Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-daemon/src/adapters/native_mcp.rs","sha256":"8b6d564ea34d1bcee57f14a3cff49549a47e81e7d02137259ee282849cd79b2e"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"a7f947e4ea7426a3dc79848ecf14d5446eeb0c1334166923d0170bf856876025"}
+  ],
+  "cargoLockSha256": "35d6c486d9f786555694093b3131f1da1fbe4c95985d3d9d0909bd2d07c04254",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":214, "failed":0, "ignored":4, "testBinaries":9,
+      "log":"target/native-mcp-data-tests-20260914T233300848Z.log",
+      "sha256":"b1dea3a260fb45cd48c1047e87b61b3cbbc777655d343c3cbee900ceb73ac2ac"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-data-clippy-20260914T233424974Z.log",
+      "sha256":"4ba6cffc8787ad4787aada4f441869f1ae6eca03068ed2da710be3ac507eab9e"
+    }
+  ],
+  "behaviorEvidence": [
+    "native_mcp_data_policy_rejects_ambiguous_parameters_and_nonabsolute_resources",
+    "native_mcp_resources_and_prompts_are_reviewed_bounded_untrusted_data",
+    "bound_native_mcp_tools_require_exact_approval_and_never_auto_publish_or_replay"
+  ],
+  "notes": [
+    "Reviewed resource/prompt kinds share the existing model/HTTP/MCP approval, audit, revocation and transport lifecycle",
+    "Resources use static absolute URIs and empty arguments; prompts expose only reviewed bounded string parameters",
+    "Corresponding capabilities and full typed descriptors are checked before one resource read or prompt get",
+    "Sixteen local-service cases and actual daemon approvals prove URI/parameter/result budgets and no automatic instruction injection",
+    "No dependencies or current root lock changes"
+  ],
+  "unverified": [
+    "resource templates, subscriptions/event replay and automatic context selection",
+    "OAuth and real third-party resource/prompt acceptance",
+    "cross-platform/power-loss acceptance, deployment and whole-project completion"
+  ]
+}

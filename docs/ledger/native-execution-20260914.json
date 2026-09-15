@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-execution-and-recovery",
+  "capturedAtUtc": "2026-09-14T09:55:52.6552922Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceWitness": {
+    "count": 654,
+    "sha256": "e6986dbd24d744adaf4629a48a675c235cf955db61e5fe4d8f8aea33df1f6983",
+    "inventory": "git ls-files --cached --others --exclude-standard -- *.rs *.toml *.lock; unique ordinal path order",
+    "encoding": "UTF-8 concatenated relative path + NUL + lowercase file SHA256 + LF"
+  },
+  "checks": [
+    {
+      "command": "cargo +stable test -p claw-application -p claw-protocol -p claw-runtime -p claw-tools -p claw-state -p claw-http-api -p claw-gateway -p gta-claw-daemon -p gta-claw-cli -p gta-claw-tui --all-targets --locked --quiet",
+      "result": "passed",
+      "passed": 1243,
+      "failed": 0,
+      "ignored": 4,
+      "testBinaries": 65,
+      "log": "target/native-execution-core-tests-20260914.log",
+      "sha256": "ff39ac0b8405773e5dd5edf84e384c2011a874ba5f1cdb9c5b185dc5e7fc8e97"
+    },
+    {
+      "command": "cargo +stable test --manifest-path desktop/Cargo.toml --bin gta-claw-desktop --locked --quiet",
+      "result": "passed",
+      "passed": 77,
+      "failed": 0,
+      "ignored": 0,
+      "log": "target/native-execution-desktop-tests-20260914.log",
+      "sha256": "cc7d0ca033e30aeb97ad2cd22626e367812d5ea2fb8a07f2f7266ad9de55663d"
+    },
+    {
+      "command": "cargo +stable clippy -p claw-application -p claw-protocol -p claw-runtime -p claw-tools -p claw-state -p claw-http-api -p claw-gateway -p gta-claw-daemon -p gta-claw-cli -p gta-claw-tui --all-targets --locked -- -D warnings",
+      "result": "passed",
+      "log": "target/native-execution-core-clippy-20260914-r2.log",
+      "sha256": "dc7cd906505eab26c3a67cfcf0e869f5f30cb4af2dae666116c2b63cb5290870"
+    },
+    {
+      "command": "cargo +stable clippy --manifest-path desktop/Cargo.toml --bin gta-claw-desktop --all-targets --locked -- -D warnings",
+      "result": "passed",
+      "log": "target/native-execution-desktop-clippy-20260914.log",
+      "sha256": "d47bf861da5a10f548a545e7e51ea75bc0376037a7139abd1c5f04292ee564ff"
+    },
+    {
+      "command": "cargo +stable test -p claw-repo-policy --all-targets --locked --quiet",
+      "result": "passed",
+      "passed": 12,
+      "failed": 0,
+      "log": "target/native-execution-policy-20260914.log",
+      "sha256": "9b50b1b0d4a89e1f211e71053b98bdfd66b0c3a4fba3178ccd647d8ebcd60000"
+    }
+  ],
+  "testOnlyChangesAfterCoreTest": ["release observer Gateway events immediately after decoding", "equivalent is_ok_and junction fixture expression"],
+  "unverified": ["whole-project completion", "complete upstream interoperability", "local upstream cryptographic verification", "MSRV 1.94", "physical power loss", "Linux/macOS runtime", "real model/channel accounts", "visible GUI usability", "mobile devices", "user-state migration", "production cutover", "signed release", "soak"]
+}

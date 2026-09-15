@@ -39,6 +39,7 @@ mod claims;
 mod error;
 mod loader;
 mod model;
+mod release;
 mod report;
 
 pub use claims::{
@@ -48,6 +49,7 @@ pub use claims::{
 pub use error::{ConformanceError, ViolationCode};
 pub use loader::Contract;
 pub use model::{Classification, Feature, FeatureLedger, InventoryRecord};
+pub use release::{CANDIDATE_RELEASE, ReleaseBaseline};
 pub use report::{
     EvidenceGap, EvidenceState, EvidenceTotals, FeatureReport, InventoryCoverage, LedgerReport,
     ParityReport, ParityStatus, ParityTotals, generate_report,

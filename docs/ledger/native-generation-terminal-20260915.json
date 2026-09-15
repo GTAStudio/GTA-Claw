@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-provider-adapter-terminal-gate",
+  "capturedAtUtc": "2026-09-15T04:34:49.8948574Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-daemon/src/adapters/http_api.rs","sha256":"b5318049f278ba6d044c75c5a01b330fe626144977f66914e1be211d9958b723"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"1392617af9741c3f7a7cdf3a785a96765e24c1d0b752257dbba3ed954dbabbdb"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":345, "failed":0, "ignored":4, "testBinaries":19,
+      "log":"target/native-generation-terminal-tests-20260915T043234134Z.log",
+      "sha256":"4f779e38ef432546445865040564e2e4ddb52208eefdcdcbc2723becf6bb8953"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-generation-terminal-clippy-20260915T043210713Z.log",
+      "sha256":"1720c6973ae3404e0606e8369c0504e8265d4630be8b3a0724eba3b7a38638ac"
+    }
+  ],
+  "behaviorEvidence": [
+    "provider_adapter_never_promotes_partial_or_unknown_generation_to_success",
+    "provider_adapter_holds_tools_until_complete_and_does_not_remember_failed_turns",
+    "bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection"
+  ],
+  "notes": [
+    "The HTTP provider port discarded SDK finish_reason and regenerated stop/tool_calls; adapter now gates unsupported incomplete terminals before that lossy conversion",
+    "Length, ContentFilter, Cancelled, Other and ToolCalls without calls cannot become ordinary successful output or completed history",
+    "Streaming completed tools are held until the provider stream closes with an accepted complete terminal; partial text may be visible but cannot authorize tools",
+    "Controlled provider barrier proves tools are withheld before terminal and failure is not remembered for both buffered and streamed generation",
+    "Real daemon Chat/Responses/Anthropic fixtures now return length/filter outcomes; all are refused without an extra provider request or failed-answer history injection",
+    "Current gate maps incomplete outcomes to unavailable/503, not lossless partial-result transport. Full typed finish/status propagation remains a follow-up requirement",
+    "No dependencies, production services, real accounts, browser execution, deployment or Git writes changed"
+  ],
+  "unverified": [
+    "Lossless typed partial/filtered completion status and usage across HTTP/application/runtime persistence",
+    "Full unknown/billing workflow, reasoning continuation and real-provider/platform acceptance",
+    "Root causes of the two earlier intermittent native-credential failures",
+    "Complete frozen build manifest, MSRV/release and whole-project acceptance"
+  ]
+}

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::ApiConfig;
 use crate::error::ApiError;
@@ -28,6 +29,9 @@ pub(crate) struct ApiStateInner {
     pub(crate) watch: WatchRuntime,
     pub(crate) admin_rpc: AdminRpcService,
     pub(crate) serving: Arc<dyn ServingStatePort>,
+    pub(crate) mcp_requests: crate::mcp::McpRequests,
+    pub(crate) mcp_sessions: crate::mcp::McpSessions,
+    pub(crate) mcp_shutdown: CancellationToken,
     response_sessions: Mutex<HashMap<String, ResponseSession>>,
     next_id: AtomicU64,
 }
@@ -56,6 +60,7 @@ impl ApiState {
                 body_timeout: config.limits.body_timeout,
                 dispatch_timeout: config.limits.operation_timeout,
             });
+        let mcp_shutdown = CancellationToken::new();
         Self {
             inner: Arc::new(ApiStateInner {
                 config,
@@ -63,6 +68,9 @@ impl ApiState {
                 watch,
                 admin_rpc,
                 serving,
+                mcp_requests: crate::mcp::McpRequests::new(mcp_shutdown.clone()),
+                mcp_sessions: crate::mcp::McpSessions::new(&mcp_shutdown),
+                mcp_shutdown,
                 response_sessions: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
             }),

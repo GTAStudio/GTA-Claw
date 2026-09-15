@@ -369,8 +369,28 @@ fn check_private_file(path: &Path) -> Result<(), SecretStoreError> {
 }
 
 #[cfg(not(unix))]
-fn check_private_file(_path: &Path) -> Result<(), SecretStoreError> {
-    // Windows relies on the per-user profile ACL rather than POSIX mode bits.
+fn check_private_file(path: &Path) -> Result<(), SecretStoreError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| SecretStoreError::Backend {
+        backend: BACKEND,
+        detail: "credential file could not be inspected",
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(SecretStoreError::Backend {
+            backend: BACKEND,
+            detail: "credential path must be a regular file",
+        });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(SecretStoreError::Backend {
+                backend: BACKEND,
+                detail: "credential reparse points are refused",
+            });
+        }
+    }
     Ok(())
 }
 

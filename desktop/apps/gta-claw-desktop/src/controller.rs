@@ -15,10 +15,10 @@ use claw_protocol::gateway::{
 use claw_security::authorization::{Scope, ScopeSet};
 use claw_security::identity::DeviceIdentity;
 use getrandom::{SysRng, rand_core::UnwrapErr};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle as TokioJoinHandle;
+use tokio::task::{JoinHandle as TokioJoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::onboarding::{
@@ -38,11 +38,65 @@ type HealthObserverFuture =
 type HealthSuccessObserver = Arc<dyn Fn() -> HealthObserverFuture + Send + Sync + 'static>;
 type AttemptStopObserver = Arc<dyn Fn() + Send + Sync + 'static>;
 type GatewayRuntime = Arc<dyn ClientRuntime>;
+type ProductSink = Arc<dyn Fn(ProductUpdate) + Send + Sync + 'static>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProductConnection {
+    pub(crate) generation: u64,
+    pub(crate) epoch: u64,
+}
+
+pub(crate) enum ProductUpdate {
+    Reset {
+        generation: u64,
+    },
+    Ready {
+        connection: ProductConnection,
+    },
+    Unavailable {
+        generation: u64,
+    },
+    HistoryStarted {
+        connection: ProductConnection,
+        request: u64,
+        session: String,
+    },
+    HistoryFinished {
+        connection: ProductConnection,
+        request: u64,
+        payload: Option<Value>,
+    },
+    Response {
+        connection: ProductConnection,
+        method: &'static str,
+        params: Value,
+        payload: Value,
+    },
+    Event {
+        connection: ProductConnection,
+        name: String,
+        payload: Value,
+    },
+    Failed {
+        connection: ProductConnection,
+        method: &'static str,
+        params: Value,
+        definitive: bool,
+    },
+}
+
+struct ProductCommand {
+    connection: ProductConnection,
+    method: &'static str,
+    params: Value,
+    memory: bool,
+}
 
 #[derive(Clone, Default)]
 struct AttemptObservers {
     gateway_event: Option<GatewayEventObserver>,
     health_success: Option<HealthSuccessObserver>,
+    product: Option<ProductSink>,
 }
 
 enum ControllerCommand {
@@ -51,6 +105,7 @@ enum ControllerCommand {
         completion: Option<oneshot::Sender<ConnectDisposition>>,
     },
     RejectSubmission(SubmissionRejection),
+    Product(ProductCommand),
     Cancel,
     Disconnect,
 }
@@ -69,6 +124,61 @@ pub(crate) struct ControllerSender {
 }
 
 impl ControllerSender {
+    pub(crate) fn product_request(
+        &self,
+        connection: ProductConnection,
+        method: &'static str,
+        params: Value,
+    ) -> Result<(), CommandRejection> {
+        if method == "chat.send" && params["message"].as_str().is_some_and(has_direct_tool_line) {
+            return Err(CommandRejection::DirectTool);
+        }
+        self.enqueue_product(connection, method, params, false)
+    }
+
+    pub(crate) fn memory_request(
+        &self,
+        connection: ProductConnection,
+        params: Value,
+    ) -> Result<(), CommandRejection> {
+        if memory_action(&params).is_none() {
+            return Err(CommandRejection::DirectTool);
+        }
+        self.enqueue_product(connection, "chat.send", params, true)
+    }
+
+    fn enqueue_product(
+        &self,
+        connection: ProductConnection,
+        method: &'static str,
+        params: Value,
+        memory: bool,
+    ) -> Result<(), CommandRejection> {
+        if !matches!(
+            method,
+            "sessions.list"
+                | "sessions.get"
+                | "agent.wait"
+                | "chat.send"
+                | "chat.history"
+                | "chat.abort"
+                | "approval.resolve"
+                | "exec.approval.list"
+                | "exec.approval.get"
+        ) || params.to_string().len() > 64 * 1024
+        {
+            return Err(CommandRejection::Busy);
+        }
+        self.commands
+            .try_send(ControllerCommand::Product(ProductCommand {
+                connection,
+                method,
+                params,
+                memory,
+            }))
+            .map_err(|error| CommandRejection::from_send(&error))
+    }
+
     pub(crate) fn connect(&self, request: ConnectRequest) -> Result<(), CommandRejection> {
         self.enqueue_connect(request, None)
     }
@@ -126,6 +236,7 @@ impl ControllerSender {
 pub(crate) enum CommandRejection {
     Busy,
     Closed,
+    DirectTool,
 }
 
 impl CommandRejection {
@@ -138,6 +249,11 @@ impl CommandRejection {
 
     pub(crate) fn user_error(self) -> UserError {
         match self {
+            Self::DirectTool => UserError::input(
+                "desktop.direct-tool-input",
+                "Direct tools require a valid explicit memory command.",
+                "Use the memory controls with a saved device identity. No command was sent.",
+            ),
             Self::Busy => UserError::input(
                 "desktop.command-queue-busy",
                 "The bounded desktop command queue is busy.",
@@ -159,6 +275,22 @@ pub(crate) struct DesktopController {
 }
 
 impl DesktopController {
+    pub(crate) fn spawn_product(
+        sink: impl Fn(ViewSnapshot) + Send + Sync + 'static,
+        product: impl Fn(ProductUpdate) + Send + Sync + 'static,
+    ) -> Result<Self, ControllerStartError> {
+        Self::spawn_inner(
+            Arc::new(sink),
+            AttemptObservers {
+                product: Some(Arc::new(product)),
+                ..AttemptObservers::default()
+            },
+            None,
+            None,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn spawn(
         sink: impl Fn(ViewSnapshot) + Send + Sync + 'static,
     ) -> Result<Self, ControllerStartError> {
@@ -215,6 +347,7 @@ impl DesktopController {
             AttemptObservers {
                 gateway_event: Some(Arc::new(event_observer)),
                 health_success: None,
+                product: None,
             },
             None,
             None,
@@ -261,6 +394,7 @@ impl DesktopController {
             AttemptObservers {
                 gateway_event: None,
                 health_success: Some(Arc::new(move || Box::pin(health_success_observer()))),
+                product: None,
             },
             None,
             None,
@@ -326,6 +460,7 @@ impl Error for ControllerShutdownError {}
 struct ActiveAttempt {
     cancellation: CancellationToken,
     task: TokioJoinHandle<()>,
+    product: mpsc::Sender<ProductCommand>,
 }
 
 async fn controller_loop(
@@ -375,6 +510,7 @@ async fn controller_loop(
                         }
                         let endpoint = request.endpoint_display().to_owned();
                         let generation = model.begin(endpoint);
+                        if let Some(product) = &observers.product { product(ProductUpdate::Reset { generation }); }
                         publish(&sink, &model);
                         stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
                         if close.is_cancelled() {
@@ -385,25 +521,26 @@ async fn controller_loop(
                             let mut rng = UnwrapErr(SysRng);
                             Arc::new(DeviceIdentity::generate(&mut rng))
                         }));
-                        model.apply(
+                        if !request.remember_device() { model.apply(
                             generation,
                             AttemptUpdate::IdentityCreated(format!(
                                 "{} (session only)",
                                 identity.device_id()
                             )),
-                        );
+                        ); }
                         publish(&sink, &model);
                         let cancellation = CancellationToken::new();
+                        let (product, product_commands) = mpsc::channel(8);
                         let task = tokio::spawn(run_attempt(
                             generation,
                             request,
                             identity,
-                            cancellation.clone(),
+                            AttemptControl { cancellation: cancellation.clone(), product_commands },
                             attempt_events.clone(),
                             observers.clone(),
                             gateway_runtime.clone(),
                         ));
-                        active = Some(ActiveAttempt { cancellation, task });
+                        active = Some(ActiveAttempt { cancellation, task, product });
                         complete_connect(completion, ConnectDisposition::Started);
                     }
                     ControllerCommand::RejectSubmission(rejection) => {
@@ -416,11 +553,21 @@ async fn controller_loop(
                     }
                     ControllerCommand::Cancel | ControllerCommand::Disconnect => {
                         let generation = model.start_disconnect();
+                        if let Some(product) = &observers.product { product(ProductUpdate::Reset { generation }); }
                         publish(&sink, &model);
                         stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
                         session_identity = None;
                         model.finish_disconnect(generation);
                         publish(&sink, &model);
+                    }
+                    ControllerCommand::Product(command) => {
+                        let connection = command.connection;
+                        let method = command.method;
+                        let params = command.params.clone();
+                        let forwarded = active.as_ref().is_some_and(|active| active.product.try_send(command).is_ok());
+                        if !forwarded && let Some(product) = &observers.product {
+                            product(ProductUpdate::Failed { connection, method, params, definitive: true });
+                        }
                     }
                 }
             }
@@ -468,19 +615,77 @@ async fn stop_attempt(
     }
 }
 
+struct AttemptControl {
+    cancellation: CancellationToken,
+    product_commands: mpsc::Receiver<ProductCommand>,
+}
+
 async fn run_attempt(
     generation: u64,
     request: ConnectRequest,
     identity: Arc<DeviceIdentity>,
-    cancellation: CancellationToken,
+    control: AttemptControl,
     updates: mpsc::Sender<(u64, AttemptUpdate)>,
     observers: AttemptObservers,
     gateway_runtime: Option<GatewayRuntime>,
 ) {
+    let AttemptControl {
+        cancellation,
+        mut product_commands,
+    } = control;
+    let remembered = request.remember_device();
     let (url, token) = request.into_parts();
+    let identity = if remembered {
+        let endpoint = url.as_str().to_owned();
+        let stored = tokio::task::spawn_blocking(move || {
+            let store = claw_platform::identity::native_store()?;
+            let root = claw_platform::identity::native_lock_directory()?;
+            claw_platform::identity::DeviceProfile::new(&endpoint, "desktop", root)?
+                .load_or_create(store.as_ref())
+        });
+        let result = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return,
+            result = stored => result,
+        };
+        let Ok(Ok(identity)) = result else {
+            let _ = send_update(
+                &updates,
+                generation,
+                AttemptUpdate::Failed(UserError::input(
+                    "identity.storage-unavailable",
+                    "The saved device identity could not be loaded safely.",
+                    "Check system credential storage; no temporary identity was substituted.",
+                )),
+            )
+            .await;
+            return;
+        };
+        let _ = send_update(
+            &updates,
+            generation,
+            AttemptUpdate::IdentityCreated(format!(
+                "{} (native credential store)",
+                identity.device_id()
+            )),
+        )
+        .await;
+        Arc::new(identity)
+    } else {
+        identity
+    };
     let mut config = GatewayClientConfig::new(url, identity);
     config.credential = token.map_or(GatewayCredential::None, GatewayCredential::Token);
-    config.scopes = ScopeSet::from_scopes([Scope::OperatorRead]);
+    let product_mode = observers.product.is_some();
+    config.scopes = if product_mode {
+        ScopeSet::from_scopes([
+            Scope::OperatorRead,
+            Scope::OperatorWrite,
+            Scope::OperatorApprovals,
+        ])
+    } else {
+        ScopeSet::from_scopes([Scope::OperatorRead])
+    };
     config.authorization_expectation = AuthorizationExpectation::ExactRequested;
     config.limits = ClientLimits {
         max_in_flight_requests: 4,
@@ -527,14 +732,19 @@ async fn run_attempt(
         updates: &updates,
         cancellation: &cancellation,
         health_success_observer: observers.health_success.as_ref(),
+        product_mode,
+        product: observers.product.as_ref(),
     };
     let mut progress = AttemptProgress {
         last_ready_epoch: None,
+        healthy_epoch: None,
         issued_tokens: Vec::new(),
     };
 
     let mut pending_state = Some(states.borrow_and_update().clone());
     let mut terminal = false;
+    let mut product_tasks = JoinSet::new();
+    let mut product_sequence = 0_u64;
     while !terminal {
         if let Some(state) = pending_state.take() {
             let mut streams = AttemptStreams {
@@ -551,18 +761,95 @@ async fn run_attempt(
             continue;
         }
         tokio::select! {
+            biased;
             () = cancellation.cancelled() => break,
             _ = states.changed() => {
                 pending_state = Some(states.borrow_and_update().clone());
             }
             event = gateway_events.recv(), if event_stream_open => {
+                if let (Some(event), Some(product), Some(epoch)) = (event.as_ref(), observers.product.as_ref(), progress.healthy_epoch) {
+                    let frame = event.frame();
+                    if event.epoch() == epoch
+                        && matches!(frame.event().as_str(), "chat" | "session.operation" | "session.tool" | "exec.approval.requested" | "exec.approval.resolved" | "sessions.changed")
+                        && let Some(payload) = frame.payload().value()
+                        && let Ok(payload) = serde_json::from_str(payload.as_json())
+                    {
+                        product(ProductUpdate::Event { connection: ProductConnection { generation, epoch: event.epoch().get() }, name: frame.event().as_str().to_owned(), payload });
+                    }
+                }
                 observe_gateway_event(
                     event,
                     &mut event_stream_open,
                     observers.gateway_event.as_ref(),
                 );
             }
+            command = product_commands.recv(), if product_mode => {
+                let Some(command) = command else { break };
+                let Some(product) = observers.product.as_ref() else { continue };
+                let connection = command.connection;
+                let epoch = progress.healthy_epoch.filter(|epoch| connection.generation == generation && connection.epoch == epoch.get());
+                let Some(epoch) = epoch.filter(|_| product_tasks.len() < 4 && product_sequence != u64::MAX) else {
+                    product(ProductUpdate::Failed { connection, method: command.method, params: command.params, definitive: true });
+                    continue;
+                };
+                product_sequence += 1;
+                let request_id = RequestId::new(format!("desktop-{generation}-{product_sequence}"), AUTHENTICATED_MAX_FRAME_BYTES).expect("bounded native request identity");
+                let method = GatewayMethodName::Core(resolve_core_method(command.method).expect("closed product command catalog"));
+                let client = client.clone();
+                let product = Arc::clone(product);
+                let history = command.method == "chat.history";
+                let sequence = product_sequence;
+                if history {
+                    product(ProductUpdate::HistoryStarted { connection, request: sequence, session: command.params["sessionKey"].as_str().unwrap_or_default().to_owned() });
+                }
+                product_tasks.spawn(async move {
+                    if command.memory {
+                        let health_id = RequestId::new(format!("desktop-memory-health-{generation}-{sequence}"), AUTHENTICATED_MAX_FRAME_BYTES).expect("bounded memory health identity");
+                        let supported = if remembered {
+                            let health = client.request_for_epoch(epoch, health_id, GatewayMethodName::Core(resolve_core_method("health").expect("health method")), &json!({})).await;
+                            health.ok().filter(claw_protocol::gateway::ResponseFrame::ok)
+                                .and_then(|response| response.payload().value().and_then(|payload| serde_json::from_str::<Value>(payload.as_json()).ok()))
+                                .is_some_and(|health| memory_capabilities_match(&health, memory_action(&command.params).as_deref()))
+                        } else { false };
+                        if !supported {
+                            product(ProductUpdate::Failed { connection, method: command.method, params: command.params, definitive: true });
+                            return;
+                        }
+                    }
+                    let response = client.request_for_epoch(epoch, request_id, method, &command.params).await;
+                    if history {
+                        let payload = response.ok().filter(claw_protocol::gateway::ResponseFrame::ok).and_then(|response| response.payload().value().and_then(|payload| serde_json::from_str::<Value>(payload.as_json()).ok())).filter(Value::is_object);
+                        product(ProductUpdate::HistoryFinished { connection, request: sequence, payload });
+                        return;
+                    }
+                    match response {
+                        Ok(response) if response.ok() => {
+                            if let Some(payload) = response.payload().value().and_then(|payload| serde_json::from_str::<Value>(payload.as_json()).ok()).filter(Value::is_object) {
+                                product(ProductUpdate::Response { connection, method: command.method, params: command.params, payload });
+                            } else {
+                                product(ProductUpdate::Failed { connection, method: command.method, params: command.params, definitive: false });
+                            }
+                        }
+                        response => {
+                            let definitive = match &response {
+                                Ok(response) => response.error().is_some_and(|error| matches!(error.code.as_str(), "INVALID_REQUEST" | "UNAUTHORIZED" | "NOT_FOUND" | "METHOD_NOT_FOUND" | "NOT_IMPLEMENTED")),
+                                Err(GatewayClientError::NotReady | GatewayClientError::Backpressure(_)) => true,
+                                Err(_) => false,
+                            };
+                            product(ProductUpdate::Failed { connection, method: command.method, params: command.params, definitive });
+                        }
+                    }
+                });
+            }
+            completed = product_tasks.join_next(), if !product_tasks.is_empty() => {
+                if completed.is_some_and(|result| result.is_err()) { terminal = true; }
+            }
         }
+    }
+    product_tasks.abort_all();
+    while product_tasks.join_next().await.is_some() {}
+    if let Some(product) = &observers.product {
+        product(ProductUpdate::Unavailable { generation });
     }
     let shutdown = client.shutdown().await;
     if !cancellation.is_cancelled()
@@ -584,6 +871,68 @@ enum StateApplication {
     Terminal,
 }
 
+fn has_direct_tool_line(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.trim_start()
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("!tool"))
+    })
+}
+
+fn memory_action(params: &Value) -> Option<String> {
+    let message = params["message"]
+        .as_str()
+        .filter(|message| message.len() <= 16 * 1024)?;
+    let raw = claw_protocol::gateway::OpaqueJson::from_json_string(
+        message.strip_prefix("!tool ")?.to_owned(),
+    )
+    .ok()?;
+    let envelope: Value = claw_protocol::gateway::Codec::authenticated()
+        .decode_opaque(&raw)
+        .ok()?;
+    if envelope["name"] != "memory_notes"
+        || !envelope["arguments"].is_object()
+        || envelope.as_object()?.len() != 2
+        || params["sessionKey"].as_str().is_none_or(|session| {
+            session.is_empty() || session.len() > 128 || session.chars().any(char::is_control)
+        })
+        || params["idempotencyKey"].as_str().is_none_or(|key| {
+            key.is_empty() || key.len() > 128 || key.chars().any(char::is_control)
+        })
+        || params.as_object()?.len() != 3
+    {
+        return None;
+    }
+    let action = envelope["arguments"]["action"].as_str()?;
+    matches!(
+        action,
+        "list" | "get" | "search" | "save" | "delete" | "export" | "import"
+    )
+    .then(|| action.to_owned())
+}
+
+fn memory_capabilities_match(health: &Value, action: Option<&str>) -> bool {
+    let direct = &health["native"]["directTool"];
+    let memory = &health["native"]["explicitMemory"];
+    action.is_some()
+        && health["ok"] == true
+        && health["protocol"] == 4
+        && health["native"]["schemaVersion"] == 1
+        && direct["version"] == 1
+        && direct["prefix"] == "!tool "
+        && direct["modelInvoked"] == false
+        && direct["authenticated"] == true
+        && direct["durableRuns"] == true
+        && direct["accepting"] == true
+        && direct["approvalPolicy"] == "per-tool"
+        && memory["enabled"] == true
+        && memory["accepting"] == true
+        && memory["requiresApproval"] == true
+        && memory["partition"] == "source/subject/account"
+        && memory["automaticContextInjection"] == false
+        && (!matches!(action, Some("export" | "import")) || memory["archiveSchemaVersion"] == 1)
+}
+
 enum HealthWait {
     Completed(Result<(), GatewayClientError>),
     StateChanged(ConnectionState),
@@ -596,10 +945,13 @@ struct AttemptContext<'a> {
     updates: &'a mpsc::Sender<(u64, AttemptUpdate)>,
     cancellation: &'a CancellationToken,
     health_success_observer: Option<&'a HealthSuccessObserver>,
+    product_mode: bool,
+    product: Option<&'a ProductSink>,
 }
 
 struct AttemptProgress {
     last_ready_epoch: Option<ConnectionEpoch>,
+    healthy_epoch: Option<ConnectionEpoch>,
     issued_tokens: Vec<claw_gateway_client::IssuedDeviceToken>,
 }
 
@@ -616,6 +968,14 @@ async fn apply_client_state(
     progress: &mut AttemptProgress,
     streams: &mut AttemptStreams<'_>,
 ) -> StateApplication {
+    if !matches!(state, ConnectionState::Ready(_)) {
+        progress.healthy_epoch = None;
+        if let Some(product) = context.product {
+            product(ProductUpdate::Unavailable {
+                generation: context.generation,
+            });
+        }
+    }
     let terminal = matches!(
         &state,
         ConnectionState::ResyncRequired(_)
@@ -634,7 +994,15 @@ async fn apply_client_state(
         ConnectionState::Ready(ready) => {
             if progress.last_ready_epoch == Some(ready.epoch) {
                 None
-            } else if !has_exact_read_scope(&ready) {
+            } else if !(if context.product_mode {
+                ready.info.role == "operator"
+                    && ready.info.scopes.len() == 3
+                    && ["operator.read", "operator.write", "operator.approvals"]
+                        .into_iter()
+                        .all(|scope| ready.info.scopes.iter().any(|granted| granted == scope))
+            } else {
+                has_exact_read_scope(&ready)
+            }) {
                 health_failure = true;
                 Some(AttemptUpdate::Failed(UserError::from_gateway(
                     &GatewayClientError::Protocol(
@@ -661,7 +1029,18 @@ async fn apply_client_state(
                     HealthWait::StateChanged(state) => {
                         return StateApplication::ContinueWith(state);
                     }
-                    HealthWait::Completed(Ok(())) => Some(AttemptUpdate::Healthy),
+                    HealthWait::Completed(Ok(())) => {
+                        progress.healthy_epoch = Some(ready.epoch);
+                        if let Some(product) = context.product {
+                            product(ProductUpdate::Ready {
+                                connection: ProductConnection {
+                                    generation: context.generation,
+                                    epoch: ready.epoch.get(),
+                                },
+                            });
+                        }
+                        Some(AttemptUpdate::Healthy)
+                    }
                     HealthWait::Completed(Err(
                         GatewayClientError::DisconnectedNotReplayed
                         | GatewayClientError::ConnectionChanged { .. }
@@ -807,6 +1186,40 @@ async fn send_update(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_memory_health_requires_model_free_approved_durable_identity_scope() {
+        let health = serde_json::json!({"ok":true,"protocol":4,"native":{"schemaVersion":1,"directTool":{"version":1,"prefix":"!tool ","modelInvoked":false,"authenticated":true,"durableRuns":true,"approvalPolicy":"per-tool","accepting":true},"explicitMemory":{"enabled":true,"accepting":true,"requiresApproval":true,"partition":"source/subject/account","automaticContextInjection":false,"archiveSchemaVersion":1}}});
+        assert!(super::memory_capabilities_match(&health, Some("save")));
+        assert!(super::memory_capabilities_match(&health, Some("export")));
+        for field in [
+            "/ok",
+            "/protocol",
+            "/native/schemaVersion",
+            "/native/directTool/version",
+            "/native/directTool/prefix",
+            "/native/directTool/modelInvoked",
+            "/native/directTool/authenticated",
+            "/native/directTool/durableRuns",
+            "/native/directTool/approvalPolicy",
+            "/native/directTool/accepting",
+            "/native/explicitMemory/enabled",
+            "/native/explicitMemory/accepting",
+            "/native/explicitMemory/requiresApproval",
+            "/native/explicitMemory/partition",
+            "/native/explicitMemory/automaticContextInjection",
+            "/native/explicitMemory/archiveSchemaVersion",
+        ] {
+            let mut changed = health.clone();
+            *changed.pointer_mut(field).expect("capability field") = serde_json::Value::Null;
+            assert!(
+                !super::memory_capabilities_match(&changed, Some("export")),
+                "{field}"
+            );
+        }
+        assert!(super::has_direct_tool_line("line\n !TOOL= {}"));
+        assert!(!super::has_direct_tool_line("ordinary message"));
+    }
+
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Barrier;
@@ -1049,6 +1462,380 @@ mod tests {
                 .phase(),
             OnboardingPhase::Disconnected
         );
+        gateway.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn product_gateway_reconnect_rejects_commands_from_the_previous_epoch() {
+        let restart = Arc::new(Notify::new());
+        let request_restart = Arc::clone(&restart);
+        let gateway = TestGateway::spawn(handler(move |mut socket, index| {
+            let restart = Arc::clone(&restart);
+            async move {
+                send_challenge(&mut socket).await;
+                let (connect, params) = receive_connect(&mut socket).await;
+                send_hello(&mut socket, &connect, &params, 4, "reused-product-connection", false).await;
+                let health = receive_request(&mut socket).await;
+                send_health(&mut socket, &health).await;
+                if index == 0 {
+                    restart.notified().await;
+                    socket.write_frame(Frame::close(1012, b"fixture restart")).await.expect("close first epoch");
+                    socket.flush().await.expect("flush close");
+                } else {
+                    let request = receive_request(&mut socket).await;
+                    assert_eq!(request.method().as_str(), "chat.send", "stale approval must not reach the new socket");
+                    send_json(&mut socket, json!({"type": "res", "id": request.id().as_str(), "ok": true, "payload": {"runId": "new-run"}})).await;
+                    send_json(&mut socket, json!({"type": "event", "event": "chat", "seq": 1, "payload": {"runId": "new-run", "sessionId": "native-session", "status": "completed", "text": "new epoch"}})).await;
+                    wait_for_close(&mut socket).await;
+                }
+            }
+        })).await;
+        let (updates, mut observed) = mpsc::channel(32);
+        let controller = DesktopController::spawn_product(
+            |_| {},
+            move |update| {
+                assert!(updates.try_send(update).is_ok(), "test update queue");
+            },
+        )
+        .expect("controller");
+        controller
+            .sender()
+            .connect(request(&gateway.url))
+            .expect("connect");
+        let first = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let ProductUpdate::Ready { connection } =
+                    observed.recv().await.expect("ready update")
+                {
+                    break connection;
+                }
+            }
+        })
+        .await
+        .expect("initial readiness");
+        request_restart.notify_one();
+        let second = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let ProductUpdate::Ready { connection } =
+                    observed.recv().await.expect("reconnect update")
+                {
+                    break connection;
+                }
+            }
+        })
+        .await
+        .expect("reconnected readiness");
+        assert_eq!(first.generation, second.generation);
+        assert!(second.epoch > first.epoch);
+        controller
+            .sender()
+            .product_request(
+                first,
+                "approval.resolve",
+                json!({"id": "approval-1", "decision": "approve"}),
+            )
+            .expect("stale command queued");
+        controller.sender().product_request(second, "chat.send", json!({"sessionKey": "native-session", "message": "new request", "idempotencyKey": "new-1"})).expect("fresh command queued");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut rejected = false;
+            let mut received = false;
+            let mut event_received = false;
+            while !(rejected && received && event_received) {
+                match observed.recv().await.expect("product result") {
+                    ProductUpdate::Failed {
+                        connection,
+                        method: "approval.resolve",
+                        ..
+                    } => {
+                        assert_eq!(connection, first);
+                        rejected = true;
+                    }
+                    ProductUpdate::Response {
+                        connection,
+                        method: "chat.send",
+                        payload,
+                        ..
+                    } => {
+                        assert_eq!(connection, second);
+                        assert_eq!(payload["runId"], "new-run");
+                        received = true;
+                    }
+                    ProductUpdate::Event {
+                        connection, name, ..
+                    } if name == "chat" => {
+                        assert_eq!(connection, second);
+                        event_received = true;
+                    }
+                    ProductUpdate::Failed { .. } => panic!("fresh request failed"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("epoch rejection and fresh delivery");
+        controller.shutdown().expect("shutdown");
+        gateway.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(windows)]
+    async fn product_memory_gateway_preflights_on_the_same_epoch_and_never_falls_back_to_chat() {
+        struct ProfileCleanup(claw_platform::identity::DeviceProfile);
+        impl Drop for ProfileCleanup {
+            fn drop(&mut self) {
+                if let Ok(store) = claw_platform::identity::native_store() {
+                    let _ = self.0.forget(store.as_ref());
+                }
+            }
+        }
+        for scenario in [
+            "list",
+            "get",
+            "search",
+            "save",
+            "delete",
+            "export",
+            "import",
+            "unsupported",
+            "disabled",
+            "model",
+            "archive-missing",
+            "ephemeral",
+            "stale",
+            "raw",
+        ] {
+            let submit = matches!(
+                scenario,
+                "list" | "get" | "search" | "save" | "delete" | "export" | "import"
+            );
+            let arguments = match scenario {
+                "get" => json!({"action":"get","id":"Note"}),
+                "search" => json!({"action":"search","query":"private query","limit":8}),
+                "save" => {
+                    json!({"action":"save","id":"Note","kind":"preference","content":"private note\n!goal {}","expectedRevision":0})
+                }
+                "delete" => json!({"action":"delete","id":"Note","expectedRevision":1}),
+                "export" | "archive-missing" => json!({"action":"export","revision":0}),
+                "import" => {
+                    json!({"action":"import","expectedRevision":0,"overwrite":true,"archive":{"schemaVersion":1,"notebook":{"revision":0,"entries":[]}}})
+                }
+                _ => json!({"action":"list"}),
+            };
+            let message = format!(
+                "!tool {}",
+                json!({"name":"memory_notes","arguments":arguments})
+            );
+            let expected_message = message.clone();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let received = Arc::clone(&calls);
+            let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+                let expected_message = expected_message.clone();
+                let calls = Arc::clone(&received);
+                async move {
+                    send_challenge(&mut socket).await;
+                    let (connect, params) = receive_connect(&mut socket).await;
+                    send_hello(&mut socket, &connect, &params, 4, "native-memory-fixture", false).await;
+                    let initial = receive_request(&mut socket).await;
+                    assert_eq!(initial.method().as_str(), "health");
+                    send_health(&mut socket, &initial).await;
+                    if !matches!(scenario, "ephemeral" | "stale" | "raw") {
+                        let health = receive_request(&mut socket).await;
+                        assert_eq!(health.method().as_str(), "health");
+                        assert_ne!(health.id(), initial.id());
+                        let mut payload = json!({"ok":true,"protocol":4,"native":{"schemaVersion":1,"directTool":{"version":1,"prefix":"!tool ","modelInvoked":false,"authenticated":true,"durableRuns":true,"approvalPolicy":"per-tool","accepting":true},"explicitMemory":{"enabled":true,"accepting":true,"requiresApproval":true,"partition":"source/subject/account","automaticContextInjection":false,"archiveSchemaVersion":1}}});
+                        match scenario {
+                            "unsupported" => payload = json!({"ok":true,"protocol":4}),
+                            "disabled" => payload["native"]["explicitMemory"]["enabled"] = json!(false),
+                            "model" => payload["native"]["directTool"]["modelInvoked"] = json!(true),
+                            "archive-missing" => { let _ = payload["native"]["explicitMemory"].as_object_mut().expect("memory summary").remove("archiveSchemaVersion"); }
+                            _ => {}
+                        }
+                        send_json(&mut socket, json!({"type":"res","id":health.id().as_str(),"ok":true,"payload":payload})).await;
+                    }
+                    if submit {
+                        let request = receive_request(&mut socket).await;
+                        assert_eq!(request.method().as_str(), "chat.send");
+                        let params: Value = serde_json::from_str(request.params().value().expect("send params").as_json()).expect("JSON");
+                        assert_eq!(params, json!({"sessionKey":"memory-session","message":expected_message,"idempotencyKey":"original-memory-key"}));
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        send_json(&mut socket, json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":{"status":"accepted","durable":true,"sessionId":"memory-session","runId":"a".repeat(64),"revision":1,"phase":"queued"}})).await;
+                    }
+                    loop {
+                        match socket.read_frame().await {
+                            Ok(frame) if frame.opcode == fastwebsockets::OpCode::Text => { calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+                            Ok(frame) if frame.opcode == fastwebsockets::OpCode::Close => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+            })).await;
+            let cleanup = ProfileCleanup(
+                claw_platform::identity::DeviceProfile::new(
+                    gateway.url.as_str(),
+                    "desktop",
+                    claw_platform::identity::native_lock_directory()
+                        .expect("native coordination root"),
+                )
+                .expect("test endpoint profile"),
+            );
+            let (updates, mut observed) = mpsc::channel(16);
+            let controller = DesktopController::spawn_product(
+                |_| {},
+                move |update| {
+                    updates.try_send(update).expect("bounded product events");
+                },
+            )
+            .expect("controller");
+            controller
+                .sender()
+                .connect(request(&gateway.url).with_remembered_device(scenario != "ephemeral"))
+                .expect("connect");
+            let connection = tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    if let ProductUpdate::Ready { connection } =
+                        observed.recv().await.expect("ready update")
+                    {
+                        break connection;
+                    }
+                }
+            })
+            .await
+            .expect("memory readiness");
+            let params = json!({"sessionKey":"memory-session","message":message,"idempotencyKey":"original-memory-key"});
+            if scenario == "raw" {
+                assert_eq!(
+                    controller
+                        .sender()
+                        .product_request(connection, "chat.send", params),
+                    Err(CommandRejection::DirectTool)
+                );
+            } else {
+                let connection = if scenario == "stale" {
+                    ProductConnection {
+                        epoch: connection.epoch + 1,
+                        ..connection
+                    }
+                } else {
+                    connection
+                };
+                controller
+                    .sender()
+                    .memory_request(connection, params.clone())
+                    .expect("typed memory enqueue");
+                tokio::time::timeout(Duration::from_secs(4), async {
+                    loop {
+                        match observed.recv().await.expect("memory outcome") {
+                            ProductUpdate::Response {
+                                method: "chat.send",
+                                params: returned,
+                                ..
+                            } => {
+                                assert!(submit, "{scenario}");
+                                assert_eq!(returned, params);
+                                break;
+                            }
+                            ProductUpdate::Failed {
+                                method: "chat.send",
+                                params: returned,
+                                definitive,
+                                ..
+                            } => {
+                                assert!(!submit, "{scenario}");
+                                assert!(definitive);
+                                assert_eq!(returned, params);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .expect("bounded memory outcome");
+            }
+            controller.shutdown().expect("controller shutdown");
+            gateway.shutdown().await;
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(submit),
+                "{scenario}"
+            );
+            drop(cleanup);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn product_gateway_uses_exact_scopes_and_transports_chat_without_local_success() {
+        let gateway = TestGateway::spawn(handler(|mut socket, _| async move {
+            send_challenge(&mut socket).await;
+            let (connect, params) = receive_connect(&mut socket).await;
+            let scopes = params.scopes.as_ref().expect("requested scopes").iter()
+                .map(claw_protocol::gateway::Name::as_str).collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(scopes, std::collections::BTreeSet::from(["operator.read", "operator.write", "operator.approvals"]));
+            send_hello(&mut socket, &connect, &params, 4, "product-gateway", false).await;
+            let health = receive_request(&mut socket).await;
+            send_health(&mut socket, &health).await;
+            let chat = receive_request(&mut socket).await;
+            assert_eq!(chat.method().as_str(), "chat.send");
+            let payload: Value = serde_json::from_str(chat.params().value().expect("params").as_json()).expect("JSON");
+            assert_eq!(payload["message"], "native request");
+            assert_eq!(payload["idempotencyKey"], "client-request-1");
+            send_json(&mut socket, json!({"type": "res", "id": chat.id().as_str(), "ok": true, "payload": {"runId": "run-one", "status": "accepted", "durable": false}})).await;
+            send_json(&mut socket, json!({"type": "event", "event": "chat", "seq": 1, "payload": {"runId": "run-one", "sessionId": "native-session", "status": "completed", "text": "server result"}})).await;
+            wait_for_close(&mut socket).await;
+        })).await;
+        let (updates, mut observed) = mpsc::channel(16);
+        let controller = DesktopController::spawn_product(
+            |_| {},
+            move |update| {
+                assert!(
+                    updates.try_send(update).is_ok(),
+                    "bounded test update queue overflowed"
+                );
+            },
+        )
+        .expect("product controller");
+        controller
+            .sender()
+            .connect(request(&gateway.url))
+            .expect("connect");
+        let connection = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let ProductUpdate::Ready { connection } =
+                    observed.recv().await.expect("controller updates")
+                {
+                    break connection;
+                }
+            }
+        })
+        .await
+        .expect("product readiness deadline");
+        controller.sender().product_request(connection, "chat.send", json!({"sessionKey": "native-session", "message": "native request", "idempotencyKey": "client-request-1"})).expect("send queued");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut response_seen = false;
+            let mut event_seen = false;
+            while !(response_seen && event_seen) {
+                match observed.recv().await.expect("product result") {
+                    ProductUpdate::Response {
+                        method: "chat.send",
+                        payload,
+                        ..
+                    } => {
+                        assert_eq!(payload["runId"], "run-one");
+                        response_seen = true;
+                    }
+                    ProductUpdate::Event { name, payload, .. } if name == "chat" => {
+                        assert_eq!(payload["text"], "server result");
+                        event_seen = true;
+                    }
+                    ProductUpdate::Failed { .. } => panic!("product transport failed"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("product result deadline");
+        controller.shutdown().expect("product controller shutdown");
         gateway.shutdown().await;
     }
 

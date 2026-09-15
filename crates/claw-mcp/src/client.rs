@@ -5,8 +5,16 @@
 )]
 
 use std::{
-    collections::HashMap, ffi::OsString, fmt, future::Future, io, path::PathBuf, pin::Pin,
-    process::Stdio, sync::Arc, time::Duration,
+    collections::{BTreeMap, HashMap},
+    ffi::OsString,
+    fmt,
+    future::Future,
+    io,
+    path::PathBuf,
+    pin::Pin,
+    process::Stdio,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use http::header::AUTHORIZATION;
@@ -44,13 +52,14 @@ use url::Url;
 use crate::{
     error::McpError,
     framing::BoundedIoTransport,
-    http_client::HttpClient,
+    http_client::{HttpClient, HttpClientError},
     sse::{LegacySseConfig, LegacySseTransport},
 };
 
 const CLIENT_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_CANCELLATION_GRACE: Duration = Duration::from_millis(250);
 const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_RESOURCE_SUBSCRIPTIONS: usize = 32;
 
 /// Future returned by an MCP sampling port.
 pub type SamplingFuture<'a> =
@@ -121,6 +130,162 @@ impl ClientEventSink for DiscardEvents {
 struct GtaClientHandler {
     sampling: Arc<dyn SamplingPort>,
     events: Arc<dyn ClientEventSink>,
+    subscriptions: Arc<ResourceSubscriptions>,
+}
+
+#[derive(Clone, Copy)]
+enum SubscriptionState {
+    Subscribing { changed: bool },
+    Active,
+    Unsubscribing,
+    Unknown,
+}
+
+#[derive(Default)]
+struct SubscriptionEntries {
+    closed: bool,
+    entries: BTreeMap<String, SubscriptionState>,
+}
+
+#[derive(Default)]
+struct ResourceSubscriptions(Mutex<SubscriptionEntries>);
+
+impl ResourceSubscriptions {
+    fn begin(
+        self: &Arc<Self>,
+        uri: &str,
+        subscribe: bool,
+    ) -> Result<SubscriptionAttempt, McpError> {
+        let parsed = Url::parse(uri)
+            .map_err(|_| McpError::Protocol("MCP subscription URI must be absolute".into()))?;
+        if uri.len() > 2048
+            || parsed.as_str() != uri
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+            || uri
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+        {
+            return Err(McpError::Protocol(
+                "MCP subscription URI is unsafe or ambiguous".into(),
+            ));
+        }
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| McpError::Protocol("MCP subscription state unavailable".into()))?;
+        if state.closed {
+            return Err(McpError::Protocol(
+                "MCP subscription connection is closed".into(),
+            ));
+        }
+        if subscribe {
+            if state.entries.len() >= MAX_RESOURCE_SUBSCRIPTIONS || state.entries.contains_key(uri)
+            {
+                return Err(McpError::Protocol(
+                    "MCP subscription is duplicate, unresolved or over capacity".into(),
+                ));
+            }
+            state.entries.insert(
+                uri.to_owned(),
+                SubscriptionState::Subscribing { changed: false },
+            );
+        } else {
+            if !matches!(state.entries.get(uri), Some(SubscriptionState::Active)) {
+                return Err(McpError::Protocol("MCP resource subscription is not confirmed active; close an uncertain connection".into()));
+            }
+            state
+                .entries
+                .insert(uri.to_owned(), SubscriptionState::Unsubscribing);
+        }
+        drop(state);
+        Ok(SubscriptionAttempt {
+            owner: Arc::clone(self),
+            uri: uri.to_owned(),
+            subscribe,
+            completed: false,
+        })
+    }
+
+    fn changed(&self, uri: &str) -> bool {
+        let Ok(mut state) = self.0.lock() else {
+            return false;
+        };
+        if state.closed {
+            return false;
+        }
+        match state.entries.get_mut(uri) {
+            Some(SubscriptionState::Subscribing { changed }) => {
+                *changed = true;
+                false
+            }
+            Some(SubscriptionState::Active) => true,
+            Some(SubscriptionState::Unsubscribing | SubscriptionState::Unknown) | None => false,
+        }
+    }
+
+    fn close(&self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.closed = true;
+            state.entries.clear();
+        }
+    }
+}
+
+struct SubscriptionAttempt {
+    owner: Arc<ResourceSubscriptions>,
+    uri: String,
+    subscribe: bool,
+    completed: bool,
+}
+
+impl SubscriptionAttempt {
+    fn confirm(mut self) -> Result<bool, McpError> {
+        let mut state = self
+            .owner
+            .0
+            .lock()
+            .map_err(|_| McpError::Protocol("MCP subscription state unavailable".into()))?;
+        let changed = if self.subscribe {
+            let Some(SubscriptionState::Subscribing { changed }) =
+                state.entries.get(&self.uri).copied()
+            else {
+                return Err(McpError::Protocol(
+                    "MCP subscription changed before confirmation".into(),
+                ));
+            };
+            state
+                .entries
+                .insert(self.uri.clone(), SubscriptionState::Active);
+            changed
+        } else {
+            if !matches!(
+                state.entries.get(&self.uri),
+                Some(SubscriptionState::Unsubscribing)
+            ) {
+                return Err(McpError::Protocol(
+                    "MCP unsubscription changed before confirmation".into(),
+                ));
+            }
+            state.entries.remove(&self.uri);
+            false
+        };
+        drop(state);
+        self.completed = true;
+        Ok(changed)
+    }
+}
+
+impl Drop for SubscriptionAttempt {
+    fn drop(&mut self) {
+        if !self.completed
+            && let Ok(mut state) = self.owner.0.lock()
+            && let Some(entry) = state.entries.get_mut(&self.uri)
+        {
+            *entry = SubscriptionState::Unknown;
+        }
+    }
 }
 
 impl ClientHandler for GtaClientHandler {
@@ -173,7 +338,11 @@ impl ClientHandler for GtaClientHandler {
         params: ResourceUpdatedNotificationParam,
         _context: NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        self.events.emit(McpClientEvent::ResourceUpdated(params));
+        if self.subscriptions.changed(&params.uri) {
+            self.events.emit(McpClientEvent::ResourceUpdated(
+                ResourceUpdatedNotificationParam::new(params.uri),
+            ));
+        }
         std::future::ready(())
     }
 
@@ -197,7 +366,7 @@ impl ClientHandler for GtaClientHandler {
 }
 
 /// Configuration for a child MCP server connected through stdio.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StdioClientConfig {
     /// Executable to spawn.
     pub program: PathBuf,
@@ -213,6 +382,23 @@ pub struct StdioClientConfig {
     pub max_frame_bytes: usize,
 }
 
+impl fmt::Debug for StdioClientConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StdioClientConfig")
+            .field("program", &self.program)
+            .field("argument_count", &self.arguments.len())
+            .field(
+                "environment_keys",
+                &self.environment.keys().collect::<Vec<_>>(),
+            )
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("max_frame_bytes", &self.max_frame_bytes)
+            .finish()
+    }
+}
+
 impl StdioClientConfig {
     /// Creates a stdio client configuration.
     #[must_use]
@@ -225,6 +411,61 @@ impl StdioClientConfig {
             request_timeout: Duration::from_secs(30),
             max_frame_bytes: crate::framing::DEFAULT_MAX_FRAME_BYTES,
         }
+    }
+
+    /// Derives a native-keyring reference for one reviewed executable and environment name.
+    ///
+    /// Environment names are normalized to uppercase to preserve Windows identity.
+    /// This creates no credential and does not inspect or start the executable.
+    ///
+    /// # Errors
+    /// Rejects invalid server IDs, noncanonical SHA-256 digests or environment names.
+    pub fn keyring_reference(
+        server_id: &str,
+        program_sha256: &str,
+        environment_name: &str,
+    ) -> Result<String, McpError> {
+        use sha2::{Digest as _, Sha256};
+
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        if server_id.is_empty()
+            || server_id.len() > 64
+            || !server_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            || program_sha256.len() != 64
+            || !program_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || environment_name.is_empty()
+            || environment_name.len() > 64
+            || !environment_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(McpError::Protocol(
+                "MCP stdio credential binding is invalid".into(),
+            ));
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"gta-claw.mcp-stdio-keyring-binding.v1\0");
+        for component in [
+            server_id,
+            program_sha256,
+            &environment_name.to_ascii_uppercase(),
+        ] {
+            digest.update(component.len().to_string().as_bytes());
+            digest.update(b":");
+            digest.update(component.as_bytes());
+        }
+        let encoded: String = digest
+            .finalize()
+            .iter()
+            .flat_map(|byte| [HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 15)]])
+            .map(char::from)
+            .collect();
+        Ok(format!("keyring://gta-claw.mcp-stdio/{encoded}"))
     }
 }
 
@@ -341,6 +582,14 @@ pub struct McpClient {
     request_timeout: Duration,
     child_pid: Option<u32>,
     stderr_drain: Option<JoinHandle<()>>,
+    subscriptions: Arc<ResourceSubscriptions>,
+    events: Arc<dyn ClientEventSink>,
+}
+
+impl Drop for McpClient {
+    fn drop(&mut self) {
+        self.subscriptions.close();
+    }
 }
 
 impl fmt::Debug for McpClient {
@@ -373,12 +622,63 @@ impl McpClient {
         sampling: Arc<dyn SamplingPort>,
         events: Arc<dyn ClientEventSink>,
     ) -> Result<Self, McpError> {
+        Self::connect_stdio_with_environment(config, sampling, events, false, None).await
+    }
+
+    /// Connects to a configured child with only its explicitly supplied environment.
+    ///
+    /// The host must approve the executable, arguments and environment before this call.
+    ///
+    /// # Errors
+    /// Returns the same spawn, framing and handshake errors as [`Self::connect_stdio`].
+    pub async fn connect_stdio_isolated(
+        config: StdioClientConfig,
+        sampling: Arc<dyn SamplingPort>,
+        events: Arc<dyn ClientEventSink>,
+    ) -> Result<Self, McpError> {
+        Self::connect_stdio_with_environment(config, sampling, events, true, None).await
+    }
+
+    /// Connects to an isolated child in an explicitly approved absolute working directory.
+    ///
+    /// The host owns executable and directory pinning for the duration of this operation.
+    ///
+    /// # Errors
+    /// Rejects relative executable/directory paths before spawn, or returns stdio transport errors.
+    pub async fn connect_stdio_isolated_at(
+        config: StdioClientConfig,
+        directory: PathBuf,
+        sampling: Arc<dyn SamplingPort>,
+        events: Arc<dyn ClientEventSink>,
+    ) -> Result<Self, McpError> {
+        if !config.program.is_absolute() || !directory.is_absolute() {
+            return Err(McpError::Protocol(
+                "isolated MCP child requires absolute executable and working-directory paths"
+                    .into(),
+            ));
+        }
+        Self::connect_stdio_with_environment(config, sampling, events, true, Some(directory)).await
+    }
+
+    async fn connect_stdio_with_environment(
+        config: StdioClientConfig,
+        sampling: Arc<dyn SamplingPort>,
+        events: Arc<dyn ClientEventSink>,
+        clear_environment: bool,
+        directory: Option<PathBuf>,
+    ) -> Result<Self, McpError> {
         if config.max_frame_bytes == 0 {
             return Err(McpError::Protocol(
                 "MCP stdio frame limit must be greater than zero".into(),
             ));
         }
         let mut command = Command::new(&config.program);
+        if clear_environment {
+            command.env_clear();
+        }
+        if let Some(directory) = directory {
+            command.current_dir(directory);
+        }
         command
             .args(&config.arguments)
             .envs(&config.environment)
@@ -409,13 +709,18 @@ impl McpClient {
         });
         let io = BoundedIoTransport::with_max_frame_bytes(stdout, stdin, config.max_frame_bytes);
         let diagnostics = io.diagnostics();
+        let subscriptions = Arc::new(ResourceSubscriptions::default());
         let service = match connect_transport(
             ChildTreeTransport {
                 io,
                 child: Some(child),
             },
             config.connect_timeout,
-            GtaClientHandler { sampling, events },
+            GtaClientHandler {
+                sampling,
+                events: Arc::clone(&events),
+                subscriptions: Arc::clone(&subscriptions),
+            },
         )
         .await
         {
@@ -427,10 +732,14 @@ impl McpClient {
             request_timeout: config.request_timeout,
             child_pid,
             stderr_drain,
+            subscriptions,
+            events,
         })
     }
 
     /// Connects to an MCP server using streamable HTTP.
+    ///
+    /// Session expiry is returned to the caller without reinitializing or replaying a request.
     ///
     /// # Errors
     ///
@@ -446,22 +755,56 @@ impl McpClient {
         sampling: Arc<dyn SamplingPort>,
         events: Arc<dyn ClientEventSink>,
     ) -> Result<Self, McpError> {
+        Self::connect_http_routed(config, None, sampling, events).await
+    }
+
+    /// Connects using an exact enrolled endpoint and route without ambient proxy settings.
+    ///
+    /// # Errors
+    /// Refuses a mismatched endpoint or the same authentication/transport failures as [`Self::connect_http`].
+    pub async fn connect_http_with_route(
+        config: HttpClientConfig,
+        route: crate::HttpRoutePolicy,
+        sampling: Arc<dyn SamplingPort>,
+        events: Arc<dyn ClientEventSink>,
+    ) -> Result<Self, McpError> {
+        if &config.endpoint != route.endpoint() {
+            return Err(McpError::Http(HttpClientError::RoutePolicy));
+        }
+        Self::connect_http_routed(config, Some(route), sampling, events).await
+    }
+
+    async fn connect_http_routed(
+        config: HttpClientConfig,
+        route: Option<crate::HttpRoutePolicy>,
+        sampling: Arc<dyn SamplingPort>,
+        events: Arc<dyn ClientEventSink>,
+    ) -> Result<Self, McpError> {
         if config.bearer_token.is_some() && !crate::endpoint_allows_credentials(&config.endpoint) {
             return Err(McpError::Protocol(
                 "authenticated MCP URLs must use HTTPS unless they are loopback HTTP URLs".into(),
             ));
         }
         let mut transport_config =
-            StreamableHttpClientTransportConfig::with_uri(config.endpoint.as_str().to_owned());
+            StreamableHttpClientTransportConfig::with_uri(config.endpoint.as_str().to_owned())
+                .reinit_on_expired_session(false);
         if let Some(token) = config.bearer_token.as_ref() {
             transport_config = transport_config.auth_header(token.expose_secret().to_owned());
         }
-        let http = HttpClient::new(config.request_timeout)?;
+        let http = match route {
+            Some(route) => HttpClient::with_route(config.request_timeout, route)?,
+            None => HttpClient::new(config.request_timeout)?,
+        };
         let transport = StreamableHttpClientTransport::with_client(http, transport_config);
+        let subscriptions = Arc::new(ResourceSubscriptions::default());
         let service = connect_transport(
             transport,
             config.connect_timeout,
-            GtaClientHandler { sampling, events },
+            GtaClientHandler {
+                sampling,
+                events: Arc::clone(&events),
+                subscriptions: Arc::clone(&subscriptions),
+            },
         )
         .await?;
         Ok(Self {
@@ -469,6 +812,8 @@ impl McpClient {
             request_timeout: config.request_timeout,
             child_pid: None,
             stderr_drain: None,
+            subscriptions,
+            events,
         })
     }
 
@@ -500,10 +845,15 @@ impl McpClient {
         let request_timeout = config.request_timeout;
         let transport = LegacySseTransport::new(config)
             .map_err(|error| McpError::Protocol(error.to_string()))?;
+        let subscriptions = Arc::new(ResourceSubscriptions::default());
         let service = connect_transport(
             transport,
             connect_timeout,
-            GtaClientHandler { sampling, events },
+            GtaClientHandler {
+                sampling,
+                events: Arc::clone(&events),
+                subscriptions: Arc::clone(&subscriptions),
+            },
         )
         .await?;
         Ok(Self {
@@ -511,6 +861,8 @@ impl McpClient {
             request_timeout,
             child_pid: None,
             stderr_drain: None,
+            subscriptions,
+            events,
         })
     }
 
@@ -638,6 +990,11 @@ impl McpClient {
 
     /// Subscribes to a server resource.
     ///
+    /// At most 32 subscriptions are retained per connection. Updates are admitted
+    /// only for confirmed subscriptions; an update received while awaiting success
+    /// is coalesced into one advisory notification. Failed or dropped attempts stay
+    /// unresolved until the connection closes and are never automatically retried.
+    ///
     /// # Errors
     ///
     /// Returns [`McpError::Timeout`] when the server does not acknowledge
@@ -646,18 +1003,40 @@ impl McpClient {
     /// replies with a JSON-RPC error (unknown URI, or subscriptions unsupported),
     /// or it answers with anything other than an empty result.
     pub async fn subscribe(&self, request: SubscribeRequestParams) -> Result<(), McpError> {
+        if !self.server_info().is_some_and(|info| {
+            info.capabilities
+                .resources
+                .as_ref()
+                .is_some_and(|resources| resources.subscribe == Some(true))
+        }) {
+            return Err(McpError::Protocol(
+                "MCP server does not advertise resource subscriptions".into(),
+            ));
+        }
+        let attempt = self.subscriptions.begin(&request.uri, true)?;
+        let uri = request.uri.clone();
         match self
             .cancellable_request(ClientRequest::SubscribeRequest(SubscribeRequest::new(
                 request,
             )))
             .await?
         {
-            ServerResult::EmptyResult(_) => Ok(()),
+            ServerResult::EmptyResult(_) => {
+                if attempt.confirm()? && self.subscriptions.changed(&uri) {
+                    self.events.emit(McpClientEvent::ResourceUpdated(
+                        ResourceUpdatedNotificationParam::new(uri),
+                    ));
+                }
+                Ok(())
+            }
             _ => Err(McpError::Service(ServiceError::UnexpectedResponse)),
         }
     }
 
     /// Unsubscribes from a server resource.
+    ///
+    /// Local updates stop before the remote request is sent. Failure leaves an
+    /// unresolved slot rather than reopening the stream or retrying automatically.
     ///
     /// # Errors
     ///
@@ -667,13 +1046,17 @@ impl McpClient {
     /// replies with a JSON-RPC error (no such subscription), or it answers with
     /// anything other than an empty result.
     pub async fn unsubscribe(&self, request: UnsubscribeRequestParams) -> Result<(), McpError> {
+        let attempt = self.subscriptions.begin(&request.uri, false)?;
         match self
             .cancellable_request(ClientRequest::UnsubscribeRequest(UnsubscribeRequest::new(
                 request,
             )))
             .await?
         {
-            ServerResult::EmptyResult(_) => Ok(()),
+            ServerResult::EmptyResult(_) => {
+                attempt.confirm()?;
+                Ok(())
+            }
             _ => Err(McpError::Service(ServiceError::UnexpectedResponse)),
         }
     }
@@ -757,6 +1140,7 @@ impl McpClient {
     /// closed pipe is still killed by the transport's process guard, so a
     /// [`McpError::Lifecycle`] here reports a slow shutdown, not a leaked child.
     pub async fn close(mut self) -> Result<(), McpError> {
+        self.subscriptions.close();
         let closed = self
             .service
             .close_with_timeout(CLIENT_CLOSE_TIMEOUT)
@@ -842,6 +1226,145 @@ fn cancellable_service_error_to_mcp(error: ServiceError) -> McpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_subscription_state_bounds_and_fences_unconfirmed_notifications() {
+        let subscriptions = Arc::new(ResourceSubscriptions::default());
+        let uri = "gta://fixture/resource";
+        assert!(!subscriptions.changed(uri));
+        let pending = subscriptions
+            .begin(uri, true)
+            .expect("pending subscription");
+        assert!(!subscriptions.changed(uri));
+        assert!(subscriptions.begin(uri, true).is_err());
+        assert!(pending.confirm().expect("confirm subscription"));
+        assert!(subscriptions.changed(uri));
+        assert!(!subscriptions.changed("gta://other/resource"));
+        let ending = subscriptions.begin(uri, false).expect("unsubscribe");
+        assert!(!subscriptions.changed(uri));
+        drop(ending);
+        assert!(!subscriptions.changed(uri));
+        assert!(subscriptions.begin(uri, false).is_err());
+        assert!(subscriptions.begin(uri, true).is_err());
+        for index in 1..MAX_RESOURCE_SUBSCRIPTIONS {
+            drop(
+                subscriptions
+                    .begin(&format!("gta://fixture/{index}"), true)
+                    .expect("bounded pending attempt"),
+            );
+        }
+        assert!(subscriptions.begin("gta://fixture/overflow", true).is_err());
+        subscriptions.close();
+        assert!(subscriptions.0.lock().expect("state").entries.is_empty());
+        assert!(subscriptions.begin(uri, true).is_err());
+    }
+
+    #[test]
+    fn resource_subscription_success_releases_only_the_confirmed_uri() {
+        let subscriptions = Arc::new(ResourceSubscriptions::default());
+        for invalid in [
+            "relative",
+            "gta://user@fixture/resource",
+            "gta://fixture/one/../resource",
+            "gta://fixture/resource#fragment",
+        ] {
+            assert!(subscriptions.begin(invalid, true).is_err());
+        }
+        let uri = "gta://fixture/resource";
+        assert!(
+            !subscriptions
+                .begin(uri, true)
+                .expect("begin")
+                .confirm()
+                .expect("subscribed")
+        );
+        assert!(
+            !subscriptions
+                .begin(uri, false)
+                .expect("end")
+                .confirm()
+                .expect("unsubscribed")
+        );
+        assert!(!subscriptions.changed(uri));
+        let waiting = subscriptions
+            .begin(uri, true)
+            .expect("later explicit subscription");
+        subscriptions.close();
+        assert!(waiting.confirm().is_err());
+    }
+
+    #[test]
+    fn stdio_keyring_reference_binds_server_executable_and_case_insensitive_environment() {
+        let sha256 = "a".repeat(64);
+        let reference = StdioClientConfig::keyring_reference("fixture", &sha256, "API_TOKEN")
+            .expect("bound reference");
+        assert_eq!(
+            reference,
+            "keyring://gta-claw.mcp-stdio/40a283599638f90cecef13594dbcfb48de901969a6ecfaf55a7dacd00887f5f3"
+        );
+        let account = reference
+            .strip_prefix("keyring://gta-claw.mcp-stdio/")
+            .expect("dedicated namespace");
+        assert_eq!(account.len(), 64);
+        assert!(
+            account
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(
+            reference,
+            StdioClientConfig::keyring_reference("fixture", &sha256, "api_token")
+                .expect("same Windows variable")
+        );
+        for (server, digest, variable) in [
+            ("other", sha256.as_str(), "API_TOKEN"),
+            (
+                "fixture",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "API_TOKEN",
+            ),
+            ("fixture", sha256.as_str(), "OTHER_TOKEN"),
+        ] {
+            assert_ne!(
+                reference,
+                StdioClientConfig::keyring_reference(server, digest, variable)
+                    .expect("distinct binding")
+            );
+        }
+        for (server, digest, variable) in [
+            ("", sha256.as_str(), "API_TOKEN"),
+            ("bad/server", sha256.as_str(), "API_TOKEN"),
+            ("fixture", "not-a-sha", "API_TOKEN"),
+            ("fixture", sha256.as_str(), ""),
+            ("fixture", sha256.as_str(), "API=TOKEN"),
+            ("fixture", sha256.as_str(), "API\nTOKEN"),
+        ] {
+            assert!(StdioClientConfig::keyring_reference(server, digest, variable).is_err());
+        }
+    }
+
+    #[test]
+    fn stdio_debug_output_redacts_arguments_and_environment_values() {
+        let mut config = StdioClientConfig::new("owned-fixture");
+        config.arguments.push("private-argument-content".into());
+        config
+            .environment
+            .insert("EXPLICIT_VALUE".into(), "private-environment-value".into());
+        let transport = crate::registry::ServerTransportConfig::Stdio {
+            command: config.program.clone(),
+            arguments: vec!["private-argument-content".to_owned()],
+            environment: std::collections::BTreeMap::from([(
+                "EXPLICIT_VALUE".to_owned(),
+                "private-environment-value".to_owned(),
+            )]),
+        };
+        for rendered in [format!("{config:?}"), format!("{transport:?}")] {
+            assert!(!rendered.contains("private-argument-content"));
+            assert!(!rendered.contains("private-environment-value"));
+            assert!(rendered.contains("EXPLICIT_VALUE"));
+            assert!(rendered.contains("argument_count: 1"));
+        }
+    }
 
     #[test]
     fn http_debug_output_redacts_bearer_token() {

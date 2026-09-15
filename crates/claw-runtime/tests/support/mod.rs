@@ -28,7 +28,9 @@ use claw_application::ports::goal::GoalStorePort;
 use claw_application::ports::provider::{
     PromptMessage, ProviderChunk, ProviderPort, ProviderRequest, ProviderStream,
 };
-use claw_application::ports::state::{SessionSnapshot, StatePort, TurnRecord};
+use claw_application::ports::state::{
+    ProviderRoundJournal, SessionSnapshot, StatePort, TurnRecord,
+};
 use claw_application::ports::tool::{
     ToolDescriptor, ToolInvocation, ToolOutcome, ToolPort, ToolStatus,
 };
@@ -113,6 +115,8 @@ impl ClockPort for FakeClock {
 pub(crate) struct Round {
     chunks: Vec<ProviderChunk>,
     stall_at_end: bool,
+    terminal_error: Option<PortError>,
+    response_report: Option<claw_application::ports::provider::ProviderResponseReport>,
 }
 
 impl Round {
@@ -121,6 +125,8 @@ impl Round {
         Self {
             chunks,
             stall_at_end: false,
+            terminal_error: None,
+            response_report: None,
         }
     }
 
@@ -129,24 +135,54 @@ impl Round {
         Self {
             chunks,
             stall_at_end: true,
+            terminal_error: None,
+            response_report: None,
         }
+    }
+
+    pub(crate) const fn failing(chunks: Vec<ProviderChunk>, error: PortError) -> Self {
+        Self {
+            chunks,
+            stall_at_end: false,
+            terminal_error: Some(error),
+            response_report: None,
+        }
+    }
+
+    pub(crate) fn reported(
+        mut self,
+        report: claw_application::ports::provider::ProviderResponseReport,
+    ) -> Self {
+        self.response_report = Some(report);
+        self
     }
 }
 
 struct ScriptedStream {
     chunks: VecDeque<ProviderChunk>,
     stall_at_end: bool,
+    terminal_error: Option<PortError>,
+    response_report: Option<claw_application::ports::provider::ProviderResponseReport>,
 }
 
 impl ProviderStream for ScriptedStream {
+    fn response_report(&self) -> Option<claw_application::ports::provider::ProviderResponseReport> {
+        self.response_report.clone()
+    }
+
     fn next_chunk(&mut self) -> PortFuture<'_, Result<Option<ProviderChunk>, PortError>> {
         let next = self.chunks.pop_front();
+        let error = if next.is_none() {
+            self.terminal_error.take()
+        } else {
+            None
+        };
         let stall = self.stall_at_end && next.is_none();
         Box::pin(async move {
             if stall {
                 std::future::pending::<()>().await;
             }
-            Ok(next)
+            error.map_or(Ok(next), Err)
         })
     }
 }
@@ -184,6 +220,8 @@ impl ProviderPort for ScriptedProvider {
                 Some(round) => Ok(Box::new(ScriptedStream {
                     chunks: round.chunks.into(),
                     stall_at_end: round.stall_at_end,
+                    terminal_error: round.terminal_error,
+                    response_report: round.response_report,
                 }) as Box<dyn ProviderStream>),
                 None => Err(PortError::Unavailable(
                     "the script ran out of rounds".to_owned(),
@@ -197,6 +235,7 @@ impl ProviderPort for ScriptedProvider {
 struct StateData {
     sessions: HashMap<String, SessionSnapshot>,
     turns: HashMap<(String, u64), TurnRecord>,
+    journals: HashMap<(String, u64), ProviderRoundJournal>,
     history: Vec<SessionSnapshot>,
 }
 
@@ -204,6 +243,8 @@ struct StateData {
 #[derive(Default)]
 pub(crate) struct MemoryState {
     data: Mutex<StateData>,
+    rejected_journal_revision: Mutex<Option<u64>>,
+    provider_journal_gate: Mutex<Option<(Arc<Notify>, Arc<Gate>)>>,
 }
 
 impl MemoryState {
@@ -215,6 +256,17 @@ impl MemoryState {
     /// Returns every snapshot ever written, in write order.
     pub(crate) fn history(&self) -> Vec<SessionSnapshot> {
         guard(&self.data).history.clone()
+    }
+
+    pub(crate) fn reject_provider_journal_at(&self, revision: u64) {
+        *guard(&self.rejected_journal_revision) = Some(revision);
+    }
+
+    pub(crate) fn gate_provider_journal(&self) -> (Arc<Notify>, Arc<Gate>) {
+        let started = Arc::new(Notify::new());
+        let release = Gate::new();
+        *guard(&self.provider_journal_gate) = Some((Arc::clone(&started), Arc::clone(&release)));
+        (started, release)
     }
 
     /// Returns the persisted turn record, if any.
@@ -262,12 +314,95 @@ impl StatePort for MemoryState {
         Box::pin(async move { Ok(next) })
     }
 
+    fn save_provider_journal(
+        &self,
+        mut journal: ProviderRoundJournal,
+    ) -> PortFuture<'_, Result<u64, PortError>> {
+        Box::pin(async move {
+            let gate = guard(&self.provider_journal_gate).clone();
+            if let Some((started, release)) = gate {
+                started.notify_one();
+                release.wait().await;
+            }
+            if *guard(&self.rejected_journal_revision) == Some(journal.revision) {
+                return Err(PortError::Unavailable(
+                    "injected journal write failure".to_owned(),
+                ));
+            }
+            let mut data = guard(&self.data);
+            let key = (
+                journal.session_id.as_str().to_owned(),
+                journal.turn.ordinal(),
+            );
+            if data.turns.contains_key(&key) {
+                return Err(PortError::Conflict("turn already closed".to_owned()));
+            }
+            journal.validate_update(data.journals.get(&key))?;
+            journal.revision = journal
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| PortError::Invalid("journal revision exhausted".to_owned()))?;
+            let revision = journal.revision;
+            data.journals.insert(key, journal);
+            drop(data);
+            Ok(revision)
+        })
+    }
+
+    fn load_provider_journal(
+        &self,
+        session_id: &SessionId,
+        turn: TurnId,
+    ) -> PortFuture<'_, Result<Option<ProviderRoundJournal>, PortError>> {
+        let journal = guard(&self.data)
+            .journals
+            .get(&(session_id.as_str().to_owned(), turn.ordinal()))
+            .cloned();
+        Box::pin(async move { Ok(journal) })
+    }
+
     fn save_turn(&self, record: TurnRecord) -> PortFuture<'_, Result<(), PortError>> {
-        guard(&self.data).turns.insert(
-            (record.session_id.as_str().to_owned(), record.turn.ordinal()),
-            record,
-        );
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            claw_application::ports::provider::ProviderRoundRecord::validate_sequence(
+                &record.provider_rounds,
+            )?;
+            let mut data = guard(&self.data);
+            let key = (record.session_id.as_str().to_owned(), record.turn.ordinal());
+            if let Some(previous) = data.turns.get(&key) {
+                return if previous == &record {
+                    Ok(())
+                } else {
+                    Err(PortError::Conflict("turn result already exists".to_owned()))
+                };
+            }
+            let revision = if let Some(journal) = data.journals.get(&key) {
+                if journal.closed || journal.rounds != record.provider_rounds {
+                    return Err(PortError::Conflict(
+                        "journal differs from terminal reports".to_owned(),
+                    ));
+                }
+                journal
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| PortError::Invalid("journal revision exhausted".to_owned()))?
+            } else {
+                1
+            };
+            data.journals.insert(
+                key.clone(),
+                ProviderRoundJournal {
+                    session_id: record.session_id.clone(),
+                    turn: record.turn,
+                    rounds: record.provider_rounds.clone(),
+                    revision,
+                    closed: true,
+                    updated_at: record.updated_at,
+                },
+            );
+            data.turns.insert(key, record);
+            drop(data);
+            Ok(())
+        })
     }
 
     fn load_turn(
@@ -330,6 +465,21 @@ impl StatePort for GatedLoadState {
 
     fn save_session(&self, snapshot: SessionSnapshot) -> PortFuture<'_, Result<u64, PortError>> {
         self.inner.save_session(snapshot)
+    }
+
+    fn save_provider_journal(
+        &self,
+        journal: ProviderRoundJournal,
+    ) -> PortFuture<'_, Result<u64, PortError>> {
+        self.inner.save_provider_journal(journal)
+    }
+
+    fn load_provider_journal(
+        &self,
+        session_id: &SessionId,
+        turn: TurnId,
+    ) -> PortFuture<'_, Result<Option<ProviderRoundJournal>, PortError>> {
+        self.inner.load_provider_journal(session_id, turn)
     }
 
     fn save_turn(&self, record: TurnRecord) -> PortFuture<'_, Result<(), PortError>> {
@@ -459,6 +609,8 @@ pub(crate) enum ToolBehaviour {
     },
     /// Report a port failure.
     Fail(String),
+    /// Report an effect whose outcome cannot be determined safely.
+    Unknown(String),
     /// Never return, so only cancellation or the deadline can end the call.
     Hang,
     /// Return successfully, but only once the test opens the gate.
@@ -545,7 +697,7 @@ impl ToolPort for RecordingTools {
         let behaviour = guard(&self.behaviours)
             .get(&invocation.call.name)
             .cloned()
-            .unwrap_or(ToolBehaviour::Succeed {
+            .unwrap_or_else(|| ToolBehaviour::Succeed {
                 output: "ok".to_owned(),
                 changed_workspace: false,
             });
@@ -562,6 +714,7 @@ impl ToolPort for RecordingTools {
                     changed_workspace,
                 }),
                 ToolBehaviour::Fail(reason) => Err(PortError::Invalid(reason)),
+                ToolBehaviour::Unknown(reason) => Err(PortError::OutcomeUnknown(reason)),
                 ToolBehaviour::Hang => {
                     std::future::pending::<()>().await;
                     unreachable!("a hanging tool never resolves")
@@ -602,6 +755,8 @@ pub(crate) enum ApprovalRecord {
 #[derive(Default)]
 pub(crate) struct RecordingApprovals {
     records: Mutex<Vec<ApprovalRecord>>,
+    authorities: Mutex<Vec<claw_application::ports::tool::InvocationAuthority>>,
+    binding_sequence: std::sync::atomic::AtomicU64,
 }
 
 impl RecordingApprovals {
@@ -614,9 +769,30 @@ impl RecordingApprovals {
     pub(crate) fn records(&self) -> Vec<ApprovalRecord> {
         guard(&self.records).clone()
     }
+
+    pub(crate) fn authorities(&self) -> Vec<claw_application::ports::tool::InvocationAuthority> {
+        guard(&self.authorities).clone()
+    }
 }
 
 impl ApprovalPort for RecordingApprovals {
+    fn binding_token(&self) -> Result<String, PortError> {
+        Ok(format!(
+            "{:064x}",
+            self.binding_sequence
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    fn present_authorized(
+        &self,
+        request: ApprovalRequest,
+        authority: claw_application::ports::tool::InvocationAuthority,
+    ) -> PortFuture<'_, Result<(), PortError>> {
+        guard(&self.authorities).push(authority);
+        self.present(request)
+    }
+
     fn present(&self, request: ApprovalRequest) -> PortFuture<'_, Result<(), PortError>> {
         guard(&self.records).push(ApprovalRecord::Presented(request.approval_id));
         Box::pin(async move { Ok(()) })
@@ -674,16 +850,34 @@ impl SimpleContext {
         guard(&self.data).bootstraps
     }
 
-    const fn item_bytes(item: &ContextItem) -> usize {
+    fn item_bytes(item: &ContextItem) -> usize {
         match item {
             ContextItem::UserInput { text }
             | ContextItem::AssistantMessage { text }
             | ContextItem::SystemNote { text } => text.len(),
+            ContextItem::AssistantToolCalls { text, tool_calls } => {
+                tool_calls.iter().fold(text.len(), |bytes, call| {
+                    bytes
+                        .saturating_add(call.call_id.as_str().len())
+                        .saturating_add(call.name.len())
+                        .saturating_add(call.arguments.len())
+                })
+            }
             ContextItem::GoalStatement { objective } => objective.len(),
             ContextItem::GoalCleared => 0,
             ContextItem::ToolResult {
                 tool_name, output, ..
             } => tool_name.len() + output.len(),
+            ContextItem::ToolCallResult {
+                call_id,
+                tool_name,
+                output,
+                ..
+            } => call_id
+                .as_str()
+                .len()
+                .saturating_add(tool_name.len())
+                .saturating_add(output.len()),
         }
     }
 
@@ -760,6 +954,20 @@ impl ContextEnginePort for SimpleContext {
                 ContextItem::AssistantMessage { text } => PromptMessage::Assistant {
                     text: text.clone(),
                     tool_calls: Vec::new(),
+                },
+                ContextItem::AssistantToolCalls { text, tool_calls } => PromptMessage::Assistant {
+                    text: text.clone(),
+                    tool_calls: tool_calls.clone(),
+                },
+                ContextItem::ToolCallResult {
+                    call_id,
+                    output,
+                    failed,
+                    ..
+                } => PromptMessage::ToolResult {
+                    call_id: call_id.clone(),
+                    output: output.clone(),
+                    failed: *failed,
                 },
                 ContextItem::SystemNote { text } => PromptMessage::System { text: text.clone() },
                 ContextItem::GoalStatement { objective } => PromptMessage::System {

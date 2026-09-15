@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "stage": "explicit-identity-scoped-memory-and-tool-only-model-rounds",
+  "capturedAtUtc": "2026-09-14T15:11:03.3260733Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceWitness": {
+    "count": 664,
+    "sha256": "c62fb58b9020fb520a0078e1aef4aaed843e4c7918eea6e796743e15dea0cd7f",
+    "inventory": "git ls-files --cached --others --exclude-standard -- *.rs *.toml *.lock; unique ordinal path order",
+    "encoding": "UTF-8 concatenated relative path + NUL + lowercase file SHA256 + LF",
+    "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+    "capturedAfterChecks": true
+  },
+  "checks": [
+    {
+      "command": "cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-memory -p claw-state -p claw-runtime -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result": "passed",
+      "passed": 579,
+      "failed": 0,
+      "ignored": 4,
+      "testBinaries": 23,
+      "log": "target/native-explicit-memory-tests-20260914T150722831Z.log",
+      "sha256": "a9ff66568e6364d7c5c6b32e3d5f02aa82dc6b074503be9406989d8c228cd052"
+    },
+    {
+      "command": "cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p claw-memory -p claw-runtime -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result": "passed",
+      "log": "target/native-explicit-memory-clippy-20260914T150924696Z.log",
+      "sha256": "898115a57941d30adc06eeb3e21a56cc72e6e8bf27f615ebb462504b09069afc"
+    }
+  ],
+  "behaviorEvidence": [
+    "native_memory_schema_matches_action_fields_and_cursor_revisions",
+    "native_memory_policy_rejects_ambiguous_versions_and_fields",
+    "native_memory_saves_searches_and_forgets_only_authenticated_notes",
+    "native_memory_pagination_pins_revisions_and_preserves_unicode",
+    "explicit_memory_concurrent_writes_have_one_revision_winner",
+    "explicit_memory_is_identity_scoped_durable_and_cas_protected",
+    "bound_explicit_memory_requires_approval_and_survives_restart_without_crossing_identities",
+    "bound_explicit_memory_model_calls_keep_notes_scoped_to_the_gateway_device"
+  ],
+  "notes": [
+    "Existing in-progress memory storage, skill implementation and concurrent local changes were retained",
+    "Model calls use the real Rust OpenAI client against an isolated local protocol fixture, not a real model account",
+    "The previously failing tool-only response scenario exposed empty assistant context ingestion before approval; the core fix preserves ordinary response handling",
+    "All memory actions require bound approval and authenticated execution authority; policy is explicit and disabled by default",
+    "Different ingress source, subject and account identities remain isolated",
+    "Deleting a current note does not erase chat history, previously disclosed model data, database free pages or older backups"
+  ],
+  "unverified": [
+    "semantic embedding retrieval and automatic context injection",
+    "complete deletion propagation across history, archives and restored backups",
+    "global notebook quotas and complete memory export/import workflows",
+    "dedicated client memory management workflows",
+    "physical power-loss and cross-platform acceptance",
+    "real model or channel accounts",
+    "complete upstream interoperability and whole-project completion"
+  ]
+}

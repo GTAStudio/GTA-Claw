@@ -602,6 +602,20 @@ impl CompletionRequest {
     }
 }
 
+/// Coverage of primary token counters in a provider response.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UsageReporting {
+    /// No usage object was supplied by the provider.
+    #[default]
+    Unreported,
+    /// Usage was supplied but at least one primary token counter was absent.
+    Partial,
+    /// Both primary input and output token counters were explicitly reported.
+    ///
+    /// This does not prove billing settlement or availability of every pricing detail.
+    Complete,
+}
+
 /// A completed chat-completion response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompletionResponse {
@@ -615,6 +629,8 @@ pub struct CompletionResponse {
     pub finish_reason: FinishReason,
     /// Token accounting.
     pub usage: Usage,
+    /// Whether the primary token counts were actually reported, including explicit zero.
+    pub usage_reporting: UsageReporting,
 }
 
 /// An embeddings request.

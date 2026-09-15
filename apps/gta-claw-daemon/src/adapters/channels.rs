@@ -42,6 +42,182 @@ const DISCORD_REPLY_MAX_ATTEMPTS: u32 = 3;
 const TELEGRAM_READINESS_ATTEMPTS: u32 = 3;
 const TELEGRAM_PERSISTENT_FAILURES: u32 = 3;
 
+struct TelegramPollIdentity {
+    credential: ChannelCredential,
+    binding: String,
+}
+
+impl TelegramPollIdentity {
+    fn new(credential: ChannelCredential, origin: &ApprovedOrigin) -> Result<Self, String> {
+        use sha2::{Digest, Sha256};
+        let binding = credential
+            .expose_for_origin(
+                "telegram",
+                origin.account_id(),
+                CredentialKind::Token,
+                origin,
+                |token| {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    let mut digest = Sha256::new();
+                    digest.update(b"gta-claw/telegram-poll/v1");
+                    for value in [origin.account_id(), &origin.as_str(), token] {
+                        digest.update((value.len() as u64).to_le_bytes());
+                        digest.update(value.as_bytes());
+                    }
+                    let mut encoded = String::with_capacity(64);
+                    for byte in digest.finalize() {
+                        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                        encoded.push(char::from(HEX[usize::from(byte & 15)]));
+                    }
+                    encoded
+                },
+            )
+            .map_err(|_| "Telegram cursor credential binding is invalid".to_owned())?;
+        Ok(Self {
+            credential,
+            binding,
+        })
+    }
+}
+
+struct DiscordResumeProgress {
+    latest: Option<claw_state::DiscordResume>,
+    settled: Option<claw_state::DiscordResume>,
+    pending: std::collections::VecDeque<claw_state::DiscordResume>,
+}
+
+impl DiscordResumeProgress {
+    fn new(resume: Option<claw_state::DiscordResume>) -> Self {
+        Self {
+            latest: resume.clone(),
+            settled: resume,
+            pending: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        resume: Option<claw_state::DiscordResume>,
+        queued: usize,
+    ) -> Result<(), &'static str> {
+        if self.pending.len().saturating_add(queued) > 65
+            || queued > 0 && resume.is_none()
+            || !self.pending.is_empty()
+                && self
+                    .latest
+                    .as_ref()
+                    .map(claw_state::DiscordResume::session_id)
+                    != resume.as_ref().map(claw_state::DiscordResume::session_id)
+            || self
+                .latest
+                .as_ref()
+                .zip(resume.as_ref())
+                .is_some_and(|(old, next)| {
+                    old.session_id() == next.session_id() && next.sequence() < old.sequence()
+                })
+        {
+            return Err("Discord resume progress changed across unresolved messages");
+        }
+        if let Some(resume) = &resume {
+            self.pending
+                .extend(std::iter::repeat_n(resume.clone(), queued));
+        }
+        self.latest = resume;
+        if self.pending.is_empty() {
+            self.settled = self.latest.clone();
+        }
+        Ok(())
+    }
+
+    fn complete(
+        &mut self,
+        resume: &claw_state::DiscordResume,
+        succeeded: bool,
+    ) -> Result<(), &'static str> {
+        if !succeeded || self.pending.front() != Some(resume) {
+            return Err("Discord message did not settle at the expected resume sequence");
+        }
+        self.pending.pop_front();
+        if self.pending.front() != Some(resume) {
+            self.settled = if self.pending.is_empty() {
+                self.latest.clone()
+            } else {
+                Some(resume.clone())
+            };
+        }
+        Ok(())
+    }
+}
+
+struct DiscordResumeCheckpoint {
+    binding: String,
+    revision: u64,
+    saved: Option<claw_state::DiscordResume>,
+    progress: DiscordResumeProgress,
+}
+
+impl DiscordResumeCheckpoint {
+    async fn load(
+        credential: &ChannelCredential,
+        origin: &ApprovedOrigin,
+        gateway_url: &str,
+        intents: u64,
+        runtime: &AgentRuntime,
+    ) -> Result<Self, String> {
+        use sha2::{Digest, Sha256};
+        let binding = credential
+            .expose_for_origin(
+                "discord",
+                origin.account_id(),
+                CredentialKind::Token,
+                origin,
+                |token| {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    let mut digest = Sha256::new();
+                    digest.update(b"gta-claw/discord-resume/v1");
+                    digest.update(intents.to_le_bytes());
+                    for value in [origin.account_id(), gateway_url, token] {
+                        digest.update((value.len() as u64).to_le_bytes());
+                        digest.update(value.as_bytes());
+                    }
+                    let mut encoded = String::with_capacity(64);
+                    for byte in digest.finalize() {
+                        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                        encoded.push(char::from(HEX[usize::from(byte & 15)]));
+                    }
+                    encoded
+                },
+            )
+            .map_err(|_| "Discord resume credential binding is invalid".to_owned())?;
+        let (revision, saved) = runtime
+            .discord_resume(&binding)
+            .await
+            .map_err(|_| "Discord resume checkpoint could not be loaded safely".to_owned())?;
+        Ok(Self {
+            binding,
+            revision,
+            progress: DiscordResumeProgress::new(saved.clone()),
+            saved,
+        })
+    }
+
+    async fn persist(&mut self, runtime: &AgentRuntime) -> Result<(), &'static str> {
+        if self.saved != self.progress.settled {
+            self.revision = runtime
+                .save_discord_resume(&self.binding, self.revision, self.progress.settled.clone())
+                .await
+                .map_err(|_| "Discord resume checkpoint could not be committed")?;
+            self.saved.clone_from(&self.progress.settled);
+        }
+        Ok(())
+    }
+}
+
+struct DiscordInbound {
+    message: InboundMessage,
+    resume: claw_state::DiscordResume,
+}
+
 #[derive(Clone, Copy)]
 enum ConfiguredChannel {
     Telegram,
@@ -352,11 +528,11 @@ impl ChannelSupervisor {
         if let Some(settings) = telegram {
             let request_cancel = Arc::new(Mutex::new(None));
             let transport = TelegramHttpTransport::new(proxy.clone(), Arc::clone(&request_cancel))?;
-            let account = "default";
-            let origin = approved_origin("telegram", account, "api.telegram.org")?;
+            let account = configured_account_id("telegram", &settings.token);
+            let origin = approved_origin("telegram", &account, "api.telegram.org")?;
             let credential = bind_credential(
                 "telegram",
-                account,
+                &account,
                 CredentialKind::Token,
                 origin.clone(),
                 &settings.token,
@@ -384,6 +560,12 @@ impl ChannelSupervisor {
             }
             let inbound_capacity = NonZeroUsize::new(64)
                 .ok_or_else(|| "Telegram inbound capacity must be non-zero".to_owned())?;
+            let identity = TelegramPollIdentity::new(credential, &origin)?;
+            let offset = runtime
+                .telegram_poll_cursor(&identity.binding)
+                .await
+                .map_err(|_| "Telegram poll cursor could not be restored safely".to_owned())?;
+            runtime.register_channel_account("telegram", &account)?;
             let mut channel = TelegramChannel::new(
                 account,
                 origin,
@@ -393,6 +575,9 @@ impl ChannelSupervisor {
                 settings.poll_interval,
             )
             .map_err(|error| error.to_string())?;
+            channel
+                .restore_poll_cursor(offset)
+                .map_err(|error| error.to_string())?;
             channel
                 .start(&mut ChannelDiagnostics(Arc::clone(&diagnostics)))
                 .map_err(|error| error.to_string())?;
@@ -407,7 +592,7 @@ impl ChannelSupervisor {
                 let _guard = TerminationGuard(task_terminated);
                 run_telegram(
                     channel,
-                    credential,
+                    identity,
                     task_runtime,
                     task_authentication,
                     task_diagnostics,
@@ -425,7 +610,7 @@ impl ChannelSupervisor {
         }
 
         if let Some(settings) = discord {
-            let account = "default";
+            let account = configured_account_id("discord", &settings.token);
             let gateway_url =
                 Url::parse(&settings.gateway_url).map_err(|_| "Discord Gateway URL is invalid")?;
             if gateway_url.scheme() != "wss" {
@@ -443,18 +628,18 @@ impl ChannelSupervisor {
             let request_cancel = Arc::new(Mutex::new(None));
             let (transport, commands, event_tx, events) =
                 DiscordTransportAdapter::new(proxy, Arc::clone(&request_cancel))?;
-            let gateway_origin = approved_origin_dynamic("discord", account, gateway_host)?;
-            let rest_origin = approved_origin("discord", account, "discord.com")?;
+            let gateway_origin = approved_origin_dynamic("discord", &account, gateway_host)?;
+            let rest_origin = approved_origin("discord", &account, "discord.com")?;
             let gateway_credential = bind_credential(
                 "discord",
-                account,
+                &account,
                 CredentialKind::Token,
                 gateway_origin.clone(),
                 &settings.token,
             )?;
             let rest_credential = bind_credential(
                 "discord",
-                account,
+                &account,
                 CredentialKind::Token,
                 rest_origin.clone(),
                 &settings.token,
@@ -465,6 +650,15 @@ impl ChannelSupervisor {
                 .ok_or_else(|| "Discord reconnect attempts must be non-zero".to_owned())?;
             let reply_transport = transport.clone();
             let reply_origin = rest_origin.clone();
+            let checkpoint = DiscordResumeCheckpoint::load(
+                &gateway_credential,
+                &gateway_origin,
+                &settings.gateway_url,
+                settings.intents,
+                &runtime,
+            )
+            .await?;
+            runtime.register_channel_account("discord", &account)?;
             let mut channel = DiscordChannel::new(
                 account,
                 settings.gateway_url,
@@ -477,6 +671,18 @@ impl ChannelSupervisor {
                 reconnect_attempts,
             )
             .map_err(|error| error.to_string())?;
+            if let Some(saved) = &checkpoint.saved {
+                channel
+                    .restore_resume_state(
+                        saved.session_id(),
+                        saved.sequence(),
+                        saved.resume_gateway_url(),
+                    )
+                    .map_err(|_| {
+                        "Saved Discord resume state violates current origin or transport policy"
+                            .to_owned()
+                    })?;
+            }
             let started = Instant::now();
             channel
                 .start(
@@ -520,6 +726,7 @@ impl ChannelSupervisor {
                     task_cancel,
                     ready_tx,
                     started,
+                    checkpoint,
                 )
                 .await;
             });
@@ -669,6 +876,24 @@ fn approved_origin_dynamic(
         &origin,
     )
     .map_err(|error| error.to_string())
+}
+
+fn configured_account_id(channel: &str, secret: &SecretString) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut digest = Sha256::new();
+    digest.update(b"gta-claw/configured-channel-account/v1");
+    for value in [channel, secret.expose()] {
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+    let mut account = String::with_capacity(68);
+    account.push_str("bot-");
+    for byte in digest.finalize() {
+        account.push(char::from(HEX[usize::from(byte >> 4)]));
+        account.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    account
 }
 
 fn bind_credential(
@@ -825,7 +1050,7 @@ impl TelegramReadinessProbe for TelegramHttpTransport {
             let (webhook_request, poll_request) = credential
                 .expose_for_origin(
                     "telegram",
-                    "default",
+                    origin.account_id(),
                     CredentialKind::Token,
                     origin,
                     telegram_readiness_requests,
@@ -1211,9 +1436,11 @@ async fn run_discord(
     cancellation: CancellationToken,
     ready: oneshot::Sender<Result<(), String>>,
     started: Instant,
+    mut checkpoint: DiscordResumeCheckpoint,
 ) {
     let mut ready = Some(ready);
     let (inbound_tx, inbound_rx) = mpsc::channel(64);
+    let (settled_tx, mut settled_rx) = mpsc::channel(64);
     let dispatch_cancellation = cancellation.child_token();
     let dispatch_task = ChildTaskGuard::new(tokio::spawn(run_discord_dispatch(
         inbound_rx,
@@ -1224,12 +1451,24 @@ async fn run_discord(
         Arc::clone(&authentication),
         Arc::clone(&diagnostics),
         dispatch_cancellation.clone(),
+        settled_tx,
     )));
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             () = cancellation.cancelled() => break,
+            settled = settled_rx.recv() => {
+                let Some((resume, succeeded)) = settled else { break; };
+                if let Err(error) = checkpoint.progress.complete(&resume, succeeded) {
+                    diagnostics.record(error);
+                    break;
+                }
+                if let Err(error) = checkpoint.persist(&runtime).await {
+                    diagnostics.record(error);
+                    break;
+                }
+            }
             event = events.recv() => {
                 let Some(event) = event else {
                     break;
@@ -1238,11 +1477,14 @@ async fn run_discord(
                     DiscordEvent::Opened => channel.gateway_opened(
                         &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
                     ).map(|()| None),
-                    DiscordEvent::Packet(packet) => channel.handle_gateway_packet(
+                    DiscordEvent::Packet(packet) => channel.handle_gateway_packet_with_admission(
                         &packet,
                         started.elapsed(),
                         &gateway_credential,
                         &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
+                        |message| tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(runtime.admit_channel_message(message))
+                        }).map_err(|_| ChannelError::RemoteRejected { status: 503 }),
                     ).map(Some),
                     DiscordEvent::Closed(close) => channel.gateway_closed_with(
                         started.elapsed(),
@@ -1251,12 +1493,16 @@ async fn run_discord(
                     ).map(|_| None),
                 };
                 readiness.set_discord_state(channel.state(), channel.phase());
+                let became_ready = matches!(&result, Ok(Some(DiscordPacketOutcome::Ready)));
+                if channel.session_id().is_none() && checkpoint.saved.is_some() {
+                    let Ok(revision) = runtime.save_discord_resume(&checkpoint.binding, checkpoint.revision, None).await else {
+                        diagnostics.record("Discord invalidated session could not be cleared durably");
+                        break;
+                    };
+                    checkpoint.revision = revision;
+                    checkpoint.saved = None;
+                }
                 match result {
-                    Ok(Some(DiscordPacketOutcome::Ready)) => {
-                        if let Some(ready) = ready.take() {
-                            let _ = ready.send(Ok(()));
-                        }
-                    }
                     Ok(_) => {}
                     Err(error) if channel.state() == ConnectionState::Closed => {
                         diagnostics.record(format!("Discord event failed terminally: {error}"));
@@ -1267,13 +1513,32 @@ async fn run_discord(
                     }
                     Err(error) => diagnostics.record(format!("Discord event failed: {error}")),
                 }
-                if let Err(error) = enqueue_discord(
+                let resume = channel.session_id().zip(channel.sequence()).map(|(session, sequence)| claw_state::DiscordResume::new(session, sequence, channel.resume_gateway_url())).transpose();
+                let Ok(resume) = resume else {
+                    diagnostics.record("Discord supplied invalid resume checkpoint metadata");
+                    break;
+                };
+                let queued = enqueue_discord(
                     &mut channel,
                     &inbound_tx,
                     &diagnostics,
-                ) {
-                    diagnostics.record(format!("Discord dispatch failed: {error}"));
+                    &runtime,
+                    resume.as_ref(),
+                ).await;
+                let Ok(queued) = queued else {
+                    diagnostics.record("Discord dispatch could not be queued; resume checkpoint was not advanced");
+                    break;
+                };
+                if let Err(error) = checkpoint.progress.observe(resume, queued) {
+                    diagnostics.record(error);
+                    let _ = runtime.save_discord_resume(&checkpoint.binding, checkpoint.revision, None).await;
+                    break;
                 }
+                if let Err(error) = checkpoint.persist(&runtime).await {
+                    diagnostics.record(error);
+                    break;
+                }
+                if became_ready && let Some(ready) = ready.take() { let _ = ready.send(Ok(())); }
             }
             _ = tick.tick() => {
                 let result = channel.tick(
@@ -1290,6 +1555,7 @@ async fn run_discord(
     readiness.set(ConfiguredChannel::Discord, false);
     dispatch_cancellation.cancel();
     drop(inbound_tx);
+    drop(settled_rx);
     if let Err(error) = dispatch_task.join().await {
         diagnostics.record(format!("Discord dispatch task failed: {error}"));
     }
@@ -1299,24 +1565,56 @@ async fn run_discord(
     }
 }
 
-async fn run_telegram(
-    mut channel: TelegramChannel<TelegramHttpTransport, SystemClock>,
-    credential: ChannelCredential,
+async fn run_telegram<T: TelegramTransport>(
+    mut channel: TelegramChannel<T, SystemClock>,
+    identity: TelegramPollIdentity,
     runtime: Arc<AgentRuntime>,
     authentication: Arc<RwLock<Option<String>>>,
     diagnostics: Arc<Diagnostics>,
     readiness: ChannelReadiness,
     cancellation: CancellationToken,
 ) {
+    let TelegramPollIdentity {
+        credential,
+        binding,
+    } = identity;
     let mut consecutive_failures = 0_u32;
     loop {
         if cancellation.is_cancelled() {
             break;
         }
-        let poll_result = channel.poll_once(
+        let Ok(persisted) = runtime.telegram_poll_cursor(&binding).await else {
+            diagnostics
+                .record("Telegram poll cursor could not be checked; worker stopped before polling");
+            break;
+        };
+        if persisted != channel.offset() {
+            if persisted == 0 && channel.rewind_expired_poll_cursor().is_ok() {
+                diagnostics.record("Telegram idle cursor expired; durable message claims remain in force during re-admission");
+            } else {
+                diagnostics.record(
+                    "Telegram poll cursor changed concurrently; worker stopped before polling",
+                );
+                break;
+            }
+        }
+        if cancellation.is_cancelled() {
+            break;
+        }
+        let previous_offset = channel.offset();
+        let poll_result = channel.poll_once_for_processing(
             &credential,
             &mut ChannelDiagnostics(Arc::clone(&diagnostics)),
+            |message| {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(runtime.admit_channel_message(message))
+                })
+                .map_err(|_| ChannelError::RemoteRejected { status: 503 })
+            },
         );
+        let deferred_batch = poll_result.is_ok();
+        let mut processed = deferred_batch;
         let retry_after = match &poll_result {
             Ok(_) => {
                 consecutive_failures = 0;
@@ -1354,28 +1652,114 @@ async fn run_telegram(
                         Ok(segments) => segments,
                         Err(error) => {
                             diagnostics.record(format!("Telegram segmentation failed: {error}"));
+                            processed = false;
                             continue;
                         }
                     };
-                    for segment in segments {
+                    let claim = match runtime.claim_channel_delivery(&message, &reply).await {
+                        Ok(Some(claim)) => claim,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            diagnostics.record(format!(
+                                "Telegram reply claim failed; no send attempted: {error}"
+                            ));
+                            processed = false;
+                            continue;
+                        }
+                    };
+                    let mut confirmed = true;
+                    for (index, segment) in segments.enumerate() {
+                        if index >= 1_024 {
+                            confirmed = false;
+                            break;
+                        }
+                        if cancellation.is_cancelled() {
+                            confirmed = false;
+                            break;
+                        }
                         let segment = match segment {
                             Ok(segment) => segment.into_owned(),
                             Err(error) => {
                                 diagnostics
                                     .record(format!("Telegram segmentation failed: {error}"));
+                                confirmed = false;
                                 break;
                             }
                         };
-                        if let Err(error) =
-                            channel.send_outbound(&outbound(&message, segment), Some(&credential))
-                        {
-                            diagnostics.record(format!("Telegram send failed: {error}"));
-                            break;
+                        let outgoing = outbound(&message, segment);
+                        match channel.send_outbound(&outgoing, Some(&credential)) {
+                            Ok(receipt)
+                                if receipt.state == claw_channel_sdk::DeliveryState::Accepted
+                                    && receipt.remote_message_id.as_ref().is_some_and(|id| {
+                                        id.parse::<u64>().is_ok_and(|id| id > 0)
+                                    }) =>
+                            {
+                                if runtime
+                                    .record_channel_delivery_receipt(
+                                        &message,
+                                        &claim,
+                                        u32::try_from(index).expect("bounded segment index"),
+                                        outgoing.text.as_deref().unwrap_or(""),
+                                        receipt.remote_message_id.as_deref().unwrap_or(""),
+                                    )
+                                    .await
+                                    .is_err()
+                                {
+                                    diagnostics.record("Telegram remote receipt could not be committed; delivery remains unknown");
+                                    confirmed = false;
+                                    break;
+                                }
+                            }
+                            Ok(_) => {
+                                diagnostics.record("Telegram send returned no valid message acknowledgement; delivery remains unknown");
+                                confirmed = false;
+                                break;
+                            }
+                            Err(error) => {
+                                diagnostics.record(format!("Telegram send failed: {error}"));
+                                confirmed = false;
+                                break;
+                            }
                         }
                     }
+                    if let Err(error) = runtime
+                        .finish_channel_delivery(&message, claim, confirmed)
+                        .await
+                    {
+                        diagnostics.record(format!(
+                            "Telegram reply outcome unconfirmed; automatic resend disabled: {error}"
+                        ));
+                        processed = false;
+                    }
+                    processed &= confirmed;
                 }
                 Ok(None) => {}
-                Err(error) => diagnostics.record(format!("Telegram dispatch failed: {error}")),
+                Err(error) => {
+                    diagnostics.record(format!("Telegram dispatch failed: {error}"));
+                    processed = false;
+                }
+            }
+        }
+        if deferred_batch {
+            if let Err(error) =
+                channel.finish_polled_batch(processed && !cancellation.is_cancelled())
+            {
+                diagnostics.record(format!(
+                    "Telegram batch could not be settled; no further poll: {error}"
+                ));
+                break;
+            }
+            if !processed {
+                diagnostics.record("Telegram batch not fully processed; provider offset retained for durable re-admission");
+            }
+            if channel.offset() != previous_offset
+                && runtime
+                    .advance_telegram_poll_cursor(&binding, previous_offset, channel.offset())
+                    .await
+                    .is_err()
+            {
+                diagnostics.record("Telegram poll cursor could not be committed; worker stopped before acknowledging another batch");
+                break;
             }
         }
         tokio::select! {
@@ -1387,42 +1771,68 @@ async fn run_telegram(
     let _ = channel.stop(&mut ChannelDiagnostics(diagnostics));
 }
 
-fn enqueue_discord(
+async fn enqueue_discord(
     channel: &mut DiscordChannel<DiscordTransportAdapter, SystemClock>,
-    inbound: &mpsc::Sender<InboundMessage>,
+    inbound: &mpsc::Sender<DiscordInbound>,
     diagnostics: &Arc<Diagnostics>,
-) -> Result<(), ChannelError> {
-    while let Some(message) = channel.poll_inbound()? {
-        if inbound.try_send(message).is_err() {
-            diagnostics.record("Discord inbound dispatch queue is full");
+    runtime: &AgentRuntime,
+    resume: Option<&claw_state::DiscordResume>,
+) -> Result<usize, ChannelError> {
+    if !matches!(
+        channel.phase(),
+        claw_channels::DiscordGatewayPhase::Ready | claw_channels::DiscordGatewayPhase::Resuming
+    ) {
+        return Ok(0);
+    }
+    let mut queued = 0;
+    while let Some(message) = channel.poll_admitted_inbound()? {
+        if !runtime
+            .admit_channel_message(&message)
+            .await
+            .map_err(|_| ChannelError::RemoteRejected { status: 503 })?
+        {
+            continue;
+        }
+        let resume = resume.cloned().ok_or(ChannelError::Protocol(
+            claw_channel_sdk::ProtocolErrorKind::InvalidField,
+        ))?;
+        if inbound
+            .try_send(DiscordInbound { message, resume })
+            .is_err()
+        {
+            diagnostics.record(
+                "Discord inbound dispatch queue is full; admitted input remains durably queued",
+            );
             return Err(ChannelError::RateLimited {
                 retry_after: Duration::from_millis(250),
             });
         }
+        queued += 1;
     }
-    Ok(())
+    Ok(queued)
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_discord_dispatch(
-    mut inbound: mpsc::Receiver<InboundMessage>,
-    transport: DiscordTransportAdapter,
+async fn run_discord_dispatch<T: DiscordReplyTransport + Send + 'static>(
+    mut inbound: mpsc::Receiver<DiscordInbound>,
+    transport: T,
     origin: claw_channel_sdk::ApprovedOrigin,
     credential: ChannelCredential,
     runtime: Arc<AgentRuntime>,
     authentication: Arc<RwLock<Option<String>>>,
     diagnostics: Arc<Diagnostics>,
     cancellation: CancellationToken,
+    settled: mpsc::Sender<(claw_state::DiscordResume, bool)>,
 ) {
     loop {
         let message = tokio::select! {
             () = cancellation.cancelled() => return,
             message = inbound.recv() => message,
         };
-        let Some(message) = message else {
+        let Some(DiscordInbound { message, resume }) = message else {
             return;
         };
-        match process_inbound(
+        let processed = match process_inbound(
             &message,
             &runtime,
             &authentication,
@@ -1432,7 +1842,8 @@ async fn run_discord_dispatch(
         .await
         {
             Ok(Some(reply)) => {
-                if let Err(error) = send_discord_reply(
+                send_discord_reply_once(
+                    &runtime,
                     &transport,
                     &origin,
                     &credential,
@@ -1441,12 +1852,16 @@ async fn run_discord_dispatch(
                     &cancellation,
                 )
                 .await
-                {
-                    diagnostics.record(format!("Discord reply failed: {error}"));
-                }
             }
-            Ok(None) => {}
-            Err(error) => diagnostics.record(format!("Discord dispatch failed: {error}")),
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = &processed {
+            diagnostics.record(format!("Discord message processing failed: {error}"));
+        }
+        let succeeded = processed.is_ok();
+        if settled.send((resume, succeeded)).await.is_err() || !succeeded {
+            return;
         }
     }
 }
@@ -1473,6 +1888,48 @@ impl DiscordReplyTransport for DiscordTransportAdapter {
     }
 }
 
+async fn send_discord_reply_once<T: DiscordReplyTransport>(
+    runtime: &AgentRuntime,
+    transport: &T,
+    origin: &claw_channel_sdk::ApprovedOrigin,
+    credential: &ChannelCredential,
+    message: &InboundMessage,
+    reply: &str,
+    cancellation: &CancellationToken,
+) -> Result<(), ChannelError> {
+    let claim = runtime
+        .claim_channel_delivery(message, reply)
+        .await
+        .map_err(|_| ChannelError::RemoteRejected { status: 503 })?;
+    let Some(claim) = claim else {
+        return Ok(());
+    };
+    let result = send_discord_reply_recorded(
+        transport,
+        origin,
+        credential,
+        message,
+        reply,
+        cancellation,
+        |segment, content, remote_id| {
+            let claim = &claim;
+            async move {
+                runtime
+                    .record_channel_delivery_receipt(message, claim, segment, &content, &remote_id)
+                    .await
+                    .map_err(|_| ChannelError::RemoteRejected { status: 503 })
+            }
+        },
+    )
+    .await;
+    runtime
+        .finish_channel_delivery(message, claim, result.is_ok())
+        .await
+        .map_err(|_| ChannelError::RemoteRejected { status: 503 })?;
+    result
+}
+
+#[cfg(test)]
 async fn send_discord_reply<T: DiscordReplyTransport>(
     transport: &T,
     origin: &claw_channel_sdk::ApprovedOrigin,
@@ -1481,6 +1938,32 @@ async fn send_discord_reply<T: DiscordReplyTransport>(
     reply: &str,
     cancellation: &CancellationToken,
 ) -> Result<(), ChannelError> {
+    send_discord_reply_recorded(
+        transport,
+        origin,
+        credential,
+        message,
+        reply,
+        cancellation,
+        |_, _, _| async { Ok(()) },
+    )
+    .await
+}
+
+async fn send_discord_reply_recorded<T, F, Receipt>(
+    transport: &T,
+    origin: &claw_channel_sdk::ApprovedOrigin,
+    credential: &ChannelCredential,
+    message: &InboundMessage,
+    reply: &str,
+    cancellation: &CancellationToken,
+    mut record: F,
+) -> Result<(), ChannelError>
+where
+    T: DiscordReplyTransport,
+    F: FnMut(u32, String, String) -> Receipt,
+    Receipt: Future<Output = Result<(), ChannelError>>,
+{
     let route =
         message
             .conversation_id
@@ -1496,7 +1979,13 @@ async fn send_discord_reply<T: DiscordReplyTransport>(
             claw_channel_sdk::ConfigurationError::InvalidAdapterConfiguration,
         )
     })?;
-    for segment in segments {
+    for (index, segment) in segments.enumerate() {
+        let index = u32::try_from(index)
+            .ok()
+            .filter(|index| *index < 1_024)
+            .ok_or(ChannelError::Protocol(
+                claw_channel_sdk::ProtocolErrorKind::InvalidField,
+            ))?;
         let segment = segment
             .map_err(|_| {
                 ChannelError::Configuration(
@@ -1511,7 +2000,7 @@ async fn send_discord_reply<T: DiscordReplyTransport>(
             let response = credential
                 .expose_for_origin(
                     "discord",
-                    "default",
+                    &message.account_id,
                     CredentialKind::Token,
                     origin,
                     |bot_token| {
@@ -1521,7 +2010,31 @@ async fn send_discord_reply<T: DiscordReplyTransport>(
                 .map_err(ChannelError::CredentialBinding)??;
             require_provider_response_bounded(&response)?;
             match response.status() {
-                200..=299 => break,
+                200..=299 => {
+                    #[derive(serde::Deserialize)]
+                    struct ReplyReceipt {
+                        id: String,
+                        channel_id: String,
+                    }
+                    let receipt: ReplyReceipt =
+                        serde_json::from_slice(response.body()).map_err(|_| {
+                            ChannelError::Protocol(
+                                claw_channel_sdk::ProtocolErrorKind::MalformedResponse,
+                            )
+                        })?;
+                    if receipt.channel_id != channel_id
+                        || receipt.id.is_empty()
+                        || receipt.id.len() > 20
+                        || !receipt.id.bytes().all(|byte| byte.is_ascii_digit())
+                        || !receipt.id.parse::<u64>().is_ok_and(|id| id > 0)
+                    {
+                        return Err(ChannelError::Protocol(
+                            claw_channel_sdk::ProtocolErrorKind::InvalidField,
+                        ));
+                    }
+                    record(index, segment.clone(), receipt.id).await?;
+                    break;
+                }
                 401 | 403 => return Err(ChannelError::Authentication),
                 429 => {
                     let retry_after = response
@@ -1552,12 +2065,53 @@ async fn process_inbound(
     diagnostics: &Arc<Diagnostics>,
     cancellation: CancellationToken,
 ) -> Result<Option<String>, ChannelError> {
+    let owned_message = message.clone();
+    let owned_runtime = Arc::clone(runtime);
+    let authentication = Arc::clone(authentication);
+    let diagnostics = Arc::clone(diagnostics);
+    let run = runtime
+        .run_channel_message(message, async move {
+            process_inbound_once(
+                &owned_message,
+                &owned_runtime,
+                &authentication,
+                &diagnostics,
+                cancellation,
+            )
+            .await
+            .map_err(|_| {
+                claw_http_api::PortError::new(
+                    claw_http_api::PortErrorKind::OutcomeUnknown,
+                    "channel dispatch outcome requires reconciliation",
+                )
+            })
+        })
+        .await
+        .map_err(|_| ChannelError::RemoteRejected { status: 503 })?;
+    let result = run
+        .result()
+        .filter(|result| {
+            run.phase() == claw_state::RunPhase::Finished && result.status() == "completed"
+        })
+        .ok_or(ChannelError::RemoteRejected { status: 409 })?;
+    serde_json::from_str(result.text()).map_err(|_| ChannelError::RemoteRejected { status: 503 })
+}
+
+async fn process_inbound_once(
+    message: &InboundMessage,
+    runtime: &Arc<AgentRuntime>,
+    authentication: &Arc<RwLock<Option<String>>>,
+    diagnostics: &Arc<Diagnostics>,
+    cancellation: CancellationToken,
+) -> Result<Option<String>, ChannelError> {
     let text = message.text.as_deref().unwrap_or_default();
     let instructions = authentication
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
-    let mut conversation = runtime.conversation_with_cancellation(cancellation);
+    let mut conversation = runtime
+        .channel_conversation(message, cancellation)
+        .map_err(|_| ChannelError::RemoteRejected { status: 403 })?;
     let outcome = dispatch_incoming(
         runtime.authenticated().then_some(&mut conversation),
         instructions.as_deref().map_or(
@@ -1592,7 +2146,7 @@ async fn process_inbound(
         DispatchOutcome::Ignored => Ok(None),
         DispatchOutcome::Reply { text, .. } => Ok(Some(text)),
         DispatchOutcome::DeferredCommand(invocation) => runtime
-            .channel_command(&message.conversation_id, &invocation.name)
+            .authenticated_channel_command(message, &invocation.name)
             .await
             .map(Some)
             .map_err(|_| ChannelError::RemoteRejected { status: 503 }),
@@ -1725,6 +2279,1545 @@ fn provider_channel_error(error: &claw_provider_sdk::ProviderError) -> ChannelEr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_bot_accounts_are_stable_credential_and_channel_partitions() {
+        let token = SecretString::new("fixture-account-secret");
+        let first = super::configured_account_id("telegram", &token);
+        assert_eq!(first, super::configured_account_id("telegram", &token));
+        assert_ne!(first, super::configured_account_id("discord", &token));
+        assert_ne!(
+            first,
+            super::configured_account_id(
+                "telegram",
+                &SecretString::new("different-account-secret")
+            )
+        );
+        assert_eq!(first.len(), 68);
+        assert!(!first.contains("fixture-account-secret"));
+        let origin = approved_origin("telegram", &first, "api.telegram.org")
+            .expect("partition-bound origin");
+        let credential = bind_credential(
+            "telegram",
+            &first,
+            CredentialKind::Token,
+            origin.clone(),
+            &token,
+        )
+        .expect("partition-bound credential");
+        assert!(
+            credential
+                .expose_for_origin(
+                    "telegram",
+                    "default",
+                    CredentialKind::Token,
+                    &origin,
+                    |_| ()
+                )
+                .is_err()
+        );
+        assert!(
+            credential
+                .expose_for_origin("telegram", &first, CredentialKind::Token, &origin, |_| ())
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discord_segment_receipts_survive_partial_delivery_and_closed_storage_stops_sends() {
+        use crate::adapters::http_api::{
+            EmptyModelTools, OperatorRuntimeStatus, ProviderHistoryConfig, SmokeProvider,
+            SwappableProvider,
+        };
+        use crate::adapters::signed_plugins::PluginToolSurface;
+        use sha2::{Digest, Sha256};
+
+        struct OwnedRoot(std::path::PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        struct Receipts {
+            calls: Arc<AtomicUsize>,
+            mode: &'static str,
+            runtime: Arc<super::AgentRuntime>,
+        }
+        impl super::DiscordReplyTransport for Receipts {
+            fn send_reply_raw(
+                &self,
+                _: &str,
+                channel: &str,
+                _: &str,
+                _: &CancellationToken,
+            ) -> Result<ProviderResponse, ChannelError> {
+                assert_eq!(channel, "room");
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if self.mode == "partial" && call == 2 {
+                    return Err(ChannelError::Transport(
+                        claw_channel_sdk::TransportErrorKind::Io,
+                    ));
+                }
+                if self.mode == "closed-storage" && call == 1 {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(self.runtime.shutdown())
+                    })
+                    .expect("test-owned storage closes before receipt commit");
+                }
+                Ok(ProviderResponse::new(
+                    200,
+                    format!(r#"{{"id":"{call}","channel_id":"room"}}"#),
+                ))
+            }
+        }
+
+        let reply = "private-delivery-segment ".repeat(230);
+        let segments: Vec<String> = claw_channels::segment_outbound_text_iter("discord", &reply)
+            .expect("segments")
+            .map(|segment| segment.expect("valid segment").into_owned())
+            .collect();
+        assert!(segments.len() >= 3);
+        for mode in ["delivered", "partial", "closed-storage"] {
+            let root = OwnedRoot(std::env::temp_dir().join(format!(
+                    "claw-receipt-prefix-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock")
+                        .as_nanos()
+                )));
+            std::fs::create_dir(&root.0).expect("owned state root");
+            let diagnostics = Arc::new(super::Diagnostics::new(32));
+            let provider = Arc::new(SwappableProvider::new(
+                "gpt-4o",
+                "receipt fixture",
+                ProviderHistoryConfig::default(),
+                Arc::new(EmptyModelTools),
+                Arc::new(DependencyReadiness::new(["provider"])),
+            ));
+            provider
+                .activate(Arc::new(
+                    SmokeProvider::new().expect("local fixture provider"),
+                ))
+                .await
+                .expect("activated");
+            let plugins = PluginToolSurface::new(Arc::clone(&diagnostics));
+            let runtime = super::AgentRuntime::new(
+                Arc::clone(&provider),
+                Arc::clone(&plugins),
+                &root.0,
+                "gpt-4o".to_owned(),
+                0,
+                8,
+                Duration::from_secs(60),
+                Arc::clone(&diagnostics),
+            )
+            .expect("actual runtime");
+            let secret = SecretString::new("discord-fixture-secret");
+            let account = super::configured_account_id("discord", &secret);
+            let origin = approved_origin("discord", &account, "discord.com").expect("REST origin");
+            let credential = bind_credential(
+                "discord",
+                &account,
+                CredentialKind::Token,
+                origin.clone(),
+                &secret,
+            )
+            .expect("owned credential");
+            let message = InboundMessage {
+                id: "segment-message".to_owned(),
+                channel_id: "discord".to_owned(),
+                account_id: account.clone(),
+                conversation_id: "discord:room:user".to_owned(),
+                sender_id: "user".to_owned(),
+                text: Some("request".to_owned()),
+                attachments: Vec::new(),
+                received_at_unix_ms: 1,
+            };
+            let retained_reply = reply.clone();
+            let run = runtime
+                .run_channel_message(&message, async move { Ok(Some(retained_reply)) })
+                .await
+                .expect("durable completed reply");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let transport = Receipts {
+                calls: Arc::clone(&calls),
+                mode,
+                runtime: Arc::clone(&runtime),
+            };
+            let mut foreign = message.clone();
+            foreign.account_id = "default".to_owned();
+            assert!(
+                super::send_discord_reply(
+                    &transport,
+                    &origin,
+                    &credential,
+                    &foreign,
+                    &reply,
+                    &CancellationToken::new()
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "foreign account must not expose the configured credential or send bytes"
+            );
+            assert_eq!(
+                super::send_discord_reply_once(
+                    &runtime,
+                    &transport,
+                    &origin,
+                    &credential,
+                    &message,
+                    &reply,
+                    &CancellationToken::new()
+                )
+                .await
+                .is_ok(),
+                mode == "delivered"
+            );
+            let expected_sends = match mode {
+                "delivered" => segments.len(),
+                "partial" => 2,
+                _ => 1,
+            };
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                expected_sends,
+                "{mode} stops at the first unrecorded segment"
+            );
+            let query = serde_json::json!({"nativeRecovery":{"channelId":"discord","accountId":account,"conversationId":"discord:room:user","senderId":"user","runId":run.id()}});
+            let before = if mode == "closed-storage" {
+                None
+            } else {
+                let response = runtime
+                    .dispatch("channels.status", Some(&query), CancellationToken::new())
+                    .await
+                    .expect("live receipt query")
+                    .expect("query result");
+                runtime.shutdown().await.expect("runtime drain");
+                Some(response)
+            };
+            drop(transport);
+            drop(runtime);
+            let reopened = super::AgentRuntime::new(
+                provider,
+                plugins,
+                &root.0,
+                "gpt-4o".to_owned(),
+                0,
+                8,
+                Duration::from_secs(60),
+                diagnostics,
+            )
+            .expect("reopened runtime");
+            let response = reopened
+                .dispatch("channels.status", Some(&query), CancellationToken::new())
+                .await
+                .expect("reopened receipt query")
+                .expect("query result");
+            if let Some(before) = before {
+                assert_eq!(response, before);
+            }
+            assert_eq!(
+                response["delivery"],
+                if mode == "delivered" {
+                    "delivered"
+                } else {
+                    "outcome_unknown"
+                }
+            );
+            let receipts = response["deliveryReceipts"]
+                .as_array()
+                .expect("receipt metadata");
+            assert_eq!(
+                receipts.len(),
+                match mode {
+                    "delivered" => segments.len(),
+                    "partial" => 1,
+                    _ => 0,
+                }
+            );
+            for (index, receipt) in receipts.iter().enumerate() {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let expected: String = Sha256::digest(segments[index].as_bytes())
+                    .into_iter()
+                    .flat_map(|byte| {
+                        [
+                            char::from(HEX[usize::from(byte >> 4)]),
+                            char::from(HEX[usize::from(byte & 15)]),
+                        ]
+                    })
+                    .collect();
+                assert_eq!(receipt["segment"], index);
+                assert_eq!(receipt["remoteMessageId"], (index + 1).to_string());
+                assert_eq!(receipt["contentBytes"], segments[index].len());
+                assert_eq!(receipt["contentSha256"], expected);
+            }
+            assert!(!response.to_string().contains("private-delivery-segment"));
+            assert_eq!(response["contentIncluded"], false);
+            assert_eq!(response["automaticReplay"], false);
+            let mut after = query.clone();
+            after["nativeRecovery"]["deliveryAfter"] = serde_json::json!(0);
+            let page = reopened
+                .dispatch("channels.status", Some(&after), CancellationToken::new())
+                .await
+                .expect("receipt cursor query")
+                .expect("receipt page");
+            assert_eq!(
+                page["deliveryReceipts"].as_array().expect("page").len(),
+                receipts.len().saturating_sub(1)
+            );
+            let mut wrong = query.clone();
+            wrong["nativeRecovery"]["senderId"] = serde_json::json!("foreign");
+            assert!(
+                reopened
+                    .dispatch("channels.status", Some(&wrong), CancellationToken::new())
+                    .await
+                    .is_err()
+            );
+            let retry_transport = Receipts {
+                calls: Arc::clone(&calls),
+                mode,
+                runtime: Arc::clone(&reopened),
+            };
+            assert_eq!(
+                super::send_discord_reply_once(
+                    &reopened,
+                    &retry_transport,
+                    &origin,
+                    &credential,
+                    &message,
+                    &reply,
+                    &CancellationToken::new()
+                )
+                .await
+                .is_ok(),
+                mode == "delivered"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                expected_sends,
+                "restart never replays delivery"
+            );
+            reopened.shutdown().await.expect("reopened runtime drain");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discord_dispatch_checkpoints_only_the_completed_prefix_and_retains_unknown_delivery() {
+        use crate::adapters::http_api::{
+            EmptyModelTools, ProviderHistoryConfig, SmokeProvider, SwappableProvider,
+        };
+        use crate::adapters::signed_plugins::PluginToolSurface;
+        struct OwnedRoot(std::path::PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        struct Replies {
+            calls: Arc<AtomicUsize>,
+            fail_second: bool,
+        }
+        impl super::DiscordReplyTransport for Replies {
+            fn send_reply_raw(
+                &self,
+                _: &str,
+                channel: &str,
+                _: &str,
+                _: &CancellationToken,
+            ) -> Result<ProviderResponse, ChannelError> {
+                assert_eq!(channel, "room");
+                let count = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if self.fail_second && count == 2 {
+                    return Err(ChannelError::Transport(
+                        claw_channel_sdk::TransportErrorKind::Io,
+                    ));
+                }
+                Ok(ProviderResponse::new(
+                    200,
+                    br#"{"id":"42","channel_id":"room"}"#.as_slice(),
+                ))
+            }
+        }
+        for fail_second in [false, true] {
+            let root = OwnedRoot(std::env::temp_dir().join(format!(
+                    "claw-discord-dispatch-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock")
+                        .as_nanos()
+                )));
+            std::fs::create_dir(&root.0).expect("owned state");
+            let diagnostics = Arc::new(super::Diagnostics::new(32));
+            let readiness = Arc::new(DependencyReadiness::new(["provider"]));
+            let provider = Arc::new(SwappableProvider::new(
+                "gpt-4o",
+                "Discord fixture",
+                ProviderHistoryConfig::default(),
+                Arc::new(EmptyModelTools),
+                readiness,
+            ));
+            provider
+                .activate(Arc::new(SmokeProvider::new().expect("fixture provider")))
+                .await
+                .expect("activated");
+            let plugins = PluginToolSurface::new(Arc::clone(&diagnostics));
+            let runtime = super::AgentRuntime::new(
+                Arc::clone(&provider),
+                Arc::clone(&plugins),
+                &root.0,
+                "gpt-4o".to_owned(),
+                0,
+                8,
+                Duration::from_secs(60),
+                Arc::clone(&diagnostics),
+            )
+            .expect("actual runtime");
+            let gateway_origin = approved_origin("discord", "default", "gateway.discord.gg")
+                .expect("gateway origin");
+            let origin = approved_origin("discord", "default", "discord.com").expect("rest origin");
+            let credential = bind_credential(
+                "discord",
+                "default",
+                CredentialKind::Token,
+                gateway_origin.clone(),
+                &SecretString::new("discord-fixture-secret"),
+            )
+            .expect("gateway credential");
+            let reply_credential = bind_credential(
+                "discord",
+                "default",
+                CredentialKind::Token,
+                origin.clone(),
+                &SecretString::new("discord-fixture-secret"),
+            )
+            .expect("reply credential");
+            let mut checkpoint = super::DiscordResumeCheckpoint::load(
+                &credential,
+                &gateway_origin,
+                "wss://gateway.discord.gg/?v=10&encoding=json",
+                32_768,
+                &runtime,
+            )
+            .await
+            .expect("checkpoint");
+            let initial =
+                claw_state::DiscordResume::new("settled-session", 7, None).expect("ready snapshot");
+            checkpoint
+                .progress
+                .observe(Some(initial), 0)
+                .expect("READY");
+            checkpoint.persist(&runtime).await.expect("durable READY");
+            let (inbound, receiver) = tokio::sync::mpsc::channel(2);
+            let (settled, mut observed) = tokio::sync::mpsc::channel(2);
+            let mut messages = Vec::new();
+            for sequence in [8, 9] {
+                let resume = claw_state::DiscordResume::new("settled-session", sequence, None)
+                    .expect("message snapshot");
+                let message = InboundMessage {
+                    id: format!("message-{sequence}"),
+                    channel_id: "discord".to_owned(),
+                    account_id: "default".to_owned(),
+                    conversation_id: "discord:room:user".to_owned(),
+                    sender_id: "user".to_owned(),
+                    text: Some(format!("message {sequence}")),
+                    attachments: Vec::new(),
+                    received_at_unix_ms: 1,
+                };
+                assert!(
+                    runtime
+                        .admit_channel_message(&message)
+                        .await
+                        .expect("durable admission")
+                );
+                checkpoint
+                    .progress
+                    .observe(Some(resume.clone()), 1)
+                    .expect("queued progress");
+                messages.push(message.clone());
+                inbound
+                    .send(super::DiscordInbound { message, resume })
+                    .await
+                    .expect("queued message");
+            }
+            checkpoint
+                .persist(&runtime)
+                .await
+                .expect("unsettled progress cannot advance");
+            assert_eq!(
+                runtime
+                    .discord_resume(&checkpoint.binding)
+                    .await
+                    .expect("checkpoint before dispatch")
+                    .1
+                    .expect("saved")
+                    .sequence(),
+                7
+            );
+            drop(inbound);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let worker = tokio::spawn(super::run_discord_dispatch(
+                receiver,
+                Replies {
+                    calls: Arc::clone(&calls),
+                    fail_second,
+                },
+                origin,
+                reply_credential,
+                Arc::clone(&runtime),
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::clone(&diagnostics),
+                CancellationToken::new(),
+                settled,
+            ));
+            for sequence in [8, 9] {
+                let (resume, succeeded) =
+                    tokio::time::timeout(Duration::from_secs(3), observed.recv())
+                        .await
+                        .expect("processing deadline")
+                        .expect("dispatcher settlement");
+                assert_eq!(resume.sequence(), sequence);
+                assert_eq!(succeeded, !(fail_second && sequence == 9));
+                if succeeded {
+                    checkpoint
+                        .progress
+                        .complete(&resume, true)
+                        .expect("ordered successful settlement");
+                    checkpoint
+                        .persist(&runtime)
+                        .await
+                        .expect("checkpoint after completed effect");
+                } else {
+                    assert!(checkpoint.progress.complete(&resume, false).is_err());
+                }
+            }
+            worker.await.expect("dispatcher joined");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let binding = checkpoint.binding.clone();
+            assert_eq!(
+                runtime
+                    .discord_resume(&binding)
+                    .await
+                    .expect("settled prefix")
+                    .1
+                    .expect("saved prefix")
+                    .sequence(),
+                if fail_second { 8 } else { 9 }
+            );
+            runtime.shutdown().await.expect("runtime drain");
+            drop(runtime);
+            let reopened = super::AgentRuntime::new(
+                provider,
+                plugins,
+                &root.0,
+                "gpt-4o".to_owned(),
+                0,
+                8,
+                Duration::from_secs(60),
+                diagnostics,
+            )
+            .expect("reopened runtime");
+            assert_eq!(
+                reopened
+                    .discord_resume(&binding)
+                    .await
+                    .expect("reopened prefix")
+                    .1
+                    .expect("resume")
+                    .sequence(),
+                if fail_second { 8 } else { 9 }
+            );
+            for message in &messages {
+                assert!(
+                    !reopened
+                        .admit_channel_message(message)
+                        .await
+                        .expect("retained delivered or unknown input must not be sent again")
+                );
+            }
+            reopened.shutdown().await.expect("reopened drain");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discord_actual_worker_persists_ready_resumes_after_restart_and_clears_invalid_session()
+    {
+        use crate::adapters::http_api::{
+            EmptyModelTools, ProviderHistoryConfig, SmokeProvider, SwappableProvider,
+        };
+        use crate::adapters::signed_plugins::PluginToolSurface;
+        struct OwnedRoot(std::path::PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = OwnedRoot(std::env::temp_dir().join(format!(
+                "claw-discord-checkpoint-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            )));
+        std::fs::create_dir(&root.0).expect("owned state root");
+        let diagnostics = Arc::new(super::Diagnostics::new(32));
+        let readiness = Arc::new(DependencyReadiness::new([
+            "provider", "discord", "channels",
+        ]));
+        let provider = Arc::new(SwappableProvider::new(
+            "gpt-4o",
+            "Discord fixture",
+            ProviderHistoryConfig::default(),
+            Arc::new(EmptyModelTools),
+            Arc::clone(&readiness),
+        ));
+        provider
+            .activate(Arc::new(SmokeProvider::new().expect("fixture provider")))
+            .await
+            .expect("activated");
+        let plugins = PluginToolSurface::new(Arc::clone(&diagnostics));
+        let mut saved_revision = 0;
+        for restart in [false, true] {
+            let runtime = super::AgentRuntime::new(
+                Arc::clone(&provider),
+                Arc::clone(&plugins),
+                &root.0,
+                "gpt-4o".to_owned(),
+                0,
+                8,
+                Duration::from_secs(60),
+                Arc::clone(&diagnostics),
+            )
+            .expect("actual runtime");
+            let gateway_origin = approved_origin("discord", "default", "gateway.discord.gg")
+                .expect("gateway origin");
+            let rest_origin =
+                approved_origin("discord", "default", "discord.com").expect("rest origin");
+            let credential = bind_credential(
+                "discord",
+                "default",
+                CredentialKind::Token,
+                gateway_origin.clone(),
+                &SecretString::new("discord-fixture-secret"),
+            )
+            .expect("gateway credential");
+            let rest_credential = bind_credential(
+                "discord",
+                "default",
+                CredentialKind::Token,
+                rest_origin.clone(),
+                &SecretString::new("discord-fixture-secret"),
+            )
+            .expect("reply credential");
+            let checkpoint = super::DiscordResumeCheckpoint::load(
+                &credential,
+                &gateway_origin,
+                "wss://gateway.discord.gg/?v=10&encoding=json",
+                32_768,
+                &runtime,
+            )
+            .await
+            .expect("restore checkpoint");
+            let binding = checkpoint.binding.clone();
+            assert_eq!(checkpoint.saved.is_some(), restart);
+            assert_eq!(checkpoint.revision, saved_revision);
+            let (transport, mut commands, event_sender, events) =
+                DiscordTransportAdapter::new(ProxyPolicy::Disabled, Arc::new(Mutex::new(None)))
+                    .expect("no-network transport command queues");
+            let reply_transport = transport.clone();
+            let mut channel = DiscordChannel::new(
+                "default",
+                "wss://gateway.discord.gg/?v=10&encoding=json",
+                gateway_origin.clone(),
+                rest_origin.clone(),
+                32_768,
+                transport,
+                SystemClock,
+                NonZeroUsize::new(4).expect("queue"),
+                NonZeroU32::new(3).expect("reconnect budget"),
+            )
+            .expect("channel");
+            if let Some(saved) = &checkpoint.saved {
+                channel
+                    .restore_resume_state(
+                        saved.session_id(),
+                        saved.sequence(),
+                        saved.resume_gateway_url(),
+                    )
+                    .expect("validated saved session");
+            }
+            channel.start(Duration::ZERO, &mut ()).expect("start");
+            assert!(matches!(
+                commands.recv().await,
+                Some(DiscordCommand::Open(_))
+            ));
+            let cancellation = CancellationToken::new();
+            let (ready_sender, ready) = tokio::sync::oneshot::channel();
+            let worker = tokio::spawn(super::run_discord(
+                channel,
+                credential,
+                reply_transport,
+                rest_origin,
+                rest_credential,
+                events,
+                Arc::clone(&runtime),
+                Arc::new(std::sync::RwLock::new(None)),
+                Arc::clone(&diagnostics),
+                ChannelReadiness::new(Arc::clone(&readiness), false, true),
+                cancellation.clone(),
+                ready_sender,
+                Instant::now(),
+                checkpoint,
+            ));
+            event_sender
+                .send(super::DiscordEvent::Opened)
+                .await
+                .expect("socket opened");
+            event_sender
+                .send(super::DiscordEvent::Packet(
+                    br#"{"op":10,"s":null,"d":{"heartbeat_interval":60000}}"#.to_vec(),
+                ))
+                .await
+                .expect("hello");
+            let identify = tokio::time::timeout(Duration::from_secs(3), commands.recv())
+                .await
+                .expect("worker handles HELLO");
+            let Some(DiscordCommand::Send(encoded)) = identify else {
+                panic!("identify/resume transport command");
+            };
+            let request: serde_json::Value =
+                serde_json::from_str(&encoded).expect("gateway command");
+            assert_eq!(request["op"], if restart { 6 } else { 2 });
+            if restart {
+                assert_eq!(request["d"]["session_id"], "saved-discord-session");
+                assert_eq!(request["d"]["seq"], 7);
+            }
+            let ready_packet = if restart {
+                br#"{"op":0,"t":"RESUMED","s":8,"d":{}}"#.as_slice()
+            } else {
+                br#"{"op":0,"t":"READY","s":7,"d":{"session_id":"saved-discord-session","resume_gateway_url":"wss://gateway-us-east1-b.discord.gg"}}"#.as_slice()
+            };
+            event_sender
+                .send(super::DiscordEvent::Packet(ready_packet.to_vec()))
+                .await
+                .expect("ready event");
+            tokio::time::timeout(Duration::from_secs(3), ready)
+                .await
+                .expect("worker readiness")
+                .expect("ready sender")
+                .expect("checkpoint committed before readiness");
+            let (revision, saved) = runtime
+                .discord_resume(&binding)
+                .await
+                .expect("persisted readiness");
+            saved_revision = revision;
+            assert_eq!(
+                saved.expect("saved session").sequence(),
+                if restart { 8 } else { 7 }
+            );
+            if restart {
+                event_sender
+                    .send(super::DiscordEvent::Closed(DiscordGatewayClose::websocket(
+                        4010,
+                        "fixture invalid shard",
+                    )))
+                    .await
+                    .expect("terminal session invalidation");
+            } else {
+                cancellation.cancel();
+            }
+            tokio::time::timeout(Duration::from_secs(3), worker)
+                .await
+                .expect("worker drain deadline")
+                .expect("worker joined");
+            if restart {
+                let (revision, cleared) = runtime
+                    .discord_resume(&binding)
+                    .await
+                    .expect("invalid session tombstone");
+                assert!(cleared.is_none());
+                assert!(revision > saved_revision);
+            }
+            let other = bind_credential(
+                "discord",
+                "default",
+                CredentialKind::Token,
+                gateway_origin.clone(),
+                &SecretString::new("different-fixture-secret"),
+            )
+            .expect("different credential");
+            assert!(
+                super::DiscordResumeCheckpoint::load(
+                    &other,
+                    &gateway_origin,
+                    "wss://gateway.discord.gg/?v=10&encoding=json",
+                    32_768,
+                    &runtime
+                )
+                .await
+                .expect("different credential checkpoint")
+                .saved
+                .is_none()
+            );
+            assert!(
+                super::DiscordResumeCheckpoint::load(
+                    &other,
+                    &gateway_origin,
+                    "wss://gateway.discord.gg/?v=10&encoding=json",
+                    1,
+                    &runtime
+                )
+                .await
+                .expect("different intents checkpoint")
+                .saved
+                .is_none()
+            );
+            runtime.shutdown().await.expect("actual runtime drained");
+            drop(runtime);
+        }
+    }
+
+    #[test]
+    fn discord_checkpoint_progress_cannot_pass_unsettled_or_out_of_order_messages() {
+        let initial = claw_state::DiscordResume::new("session", 7, None).expect("initial");
+        let first = claw_state::DiscordResume::new("session", 8, None).expect("first");
+        let second = claw_state::DiscordResume::new("session", 9, None).expect("second");
+        let ignored = claw_state::DiscordResume::new("session", 10, None).expect("ignored");
+        let mut progress = super::DiscordResumeProgress::new(Some(initial.clone()));
+        progress
+            .observe(Some(first.clone()), 1)
+            .expect("queued first");
+        progress
+            .observe(Some(second.clone()), 1)
+            .expect("queued second");
+        progress
+            .observe(Some(ignored.clone()), 0)
+            .expect("later ignored dispatch");
+        assert_eq!(progress.settled, Some(initial));
+        assert!(progress.complete(&second, true).is_err());
+        progress.complete(&first, true).expect("first completed");
+        assert_eq!(progress.settled, Some(first));
+        assert!(progress.complete(&second, false).is_err());
+        assert!(progress.observe(None, 0).is_err());
+        progress.complete(&second, true).expect("second completed");
+        assert_eq!(progress.settled, Some(ignored));
+        progress
+            .observe(None, 0)
+            .expect("invalidated drained session");
+        assert!(progress.settled.is_none());
+        assert!(progress.observe(Some(second.clone()), 66).is_err());
+        progress
+            .observe(Some(second.clone()), 2)
+            .expect("batch replay queued at RESUMED");
+        progress
+            .complete(&second, true)
+            .expect("first replay completed");
+        assert!(
+            progress.settled.is_none(),
+            "batch sequence cannot cross the second unresolved input"
+        );
+        progress
+            .complete(&second, true)
+            .expect("all replay messages completed");
+        assert_eq!(progress.settled, Some(second));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn telegram_processing_loop_retains_failed_delivery_batch_without_resending() {
+        use super::{
+            AgentRuntime, Diagnostics, TelegramChannel, TelegramPollRequest, TelegramSendRequest,
+            TelegramTransport,
+        };
+        use crate::adapters::http_api::{
+            EmptyModelTools, OperatorRuntimeStatus, ProviderHistoryConfig, SmokeProvider,
+            SwappableProvider,
+        };
+        use crate::adapters::signed_plugins::PluginToolSurface;
+        for (interfere, confirmed) in [(false, false), (true, false), (false, true)] {
+            struct OwnedRoot(std::path::PathBuf);
+            impl Drop for OwnedRoot {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            struct PollReplay {
+                offsets: Arc<Mutex<Vec<Option<i64>>>>,
+                sends: Arc<AtomicUsize>,
+                cancellation: CancellationToken,
+                interference: Option<(Arc<AgentRuntime>, String)>,
+                confirmed: bool,
+            }
+            impl TelegramTransport for PollReplay {
+                fn get_updates(
+                    &mut self,
+                    request: &TelegramPollRequest<'_>,
+                ) -> Result<ProviderResponse, ChannelError> {
+                    let mut offsets = self.offsets.lock().expect("recorded polls");
+                    offsets.push(request.offset());
+                    if offsets.len() <= 2 {
+                        Ok(ProviderResponse::new(200, br#"{"ok":true,"result":[{"update_id":10,"message":{"message_id":1,"chat":{"id":-100},"from":{"id":7},"text":"process once"}}]}"#.as_slice()))
+                    } else {
+                        self.cancellation.cancel();
+                        Ok(ProviderResponse::new(
+                            200,
+                            br#"{"ok":true,"result":[]}"#.as_slice(),
+                        ))
+                    }
+                }
+                fn send_message(
+                    &mut self,
+                    _: &TelegramSendRequest<'_>,
+                ) -> Result<ProviderResponse, ChannelError> {
+                    self.sends.fetch_add(1, Ordering::SeqCst);
+                    if let Some((runtime, binding)) = self.interference.take() {
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current()
+                                .block_on(runtime.advance_telegram_poll_cursor(&binding, 0, 12))
+                        })
+                        .expect("concurrent cursor writer");
+                    }
+                    if self.confirmed {
+                        Ok(ProviderResponse::new(
+                            200,
+                            br#"{"ok":true,"result":{"message_id":42}}"#.as_slice(),
+                        ))
+                    } else {
+                        Err(ChannelError::Transport(
+                            claw_channel_sdk::TransportErrorKind::Io,
+                        ))
+                    }
+                }
+            }
+            let root = OwnedRoot(std::env::temp_dir().join(format!(
+                    "claw-telegram-batch-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock")
+                        .as_nanos()
+                )));
+            std::fs::create_dir(&root.0).expect("owned state root");
+            let diagnostics = Arc::new(Diagnostics::new(32));
+            let readiness = Arc::new(DependencyReadiness::new([
+                "provider", "telegram", "channels",
+            ]));
+            let provider = Arc::new(SwappableProvider::new(
+                "gpt-4o",
+                "telegram processing fixture",
+                ProviderHistoryConfig::default(),
+                Arc::new(EmptyModelTools),
+                Arc::clone(&readiness),
+            ));
+            provider
+                .activate(Arc::new(SmokeProvider::new().expect("fixture provider")))
+                .await
+                .expect("activated");
+            let plugins = PluginToolSurface::new(Arc::clone(&diagnostics));
+            let runtime = AgentRuntime::new(
+                Arc::clone(&provider),
+                Arc::clone(&plugins),
+                &root.0,
+                "gpt-4o".to_owned(),
+                0,
+                8,
+                Duration::from_secs(60),
+                Arc::clone(&diagnostics),
+            )
+            .expect("actual runtime");
+            let cancellation = CancellationToken::new();
+            let offsets = Arc::new(Mutex::new(Vec::new()));
+            let sends = Arc::new(AtomicUsize::new(0));
+            let secret = SecretString::new("telegram-secret");
+            let account = super::configured_account_id("telegram", &secret);
+            let origin = approved_origin("telegram", &account, "api.telegram.org")
+                .expect("configured origin");
+            let credential = bind_credential(
+                "telegram",
+                &account,
+                CredentialKind::Token,
+                origin.clone(),
+                &secret,
+            )
+            .expect("configured credential");
+            let identity = super::TelegramPollIdentity::new(credential, &origin)
+                .expect("credential-bound poll identity");
+            let binding = identity.binding.clone();
+            let mut channel = TelegramChannel::new(
+                account.clone(),
+                origin,
+                PollReplay {
+                    offsets: Arc::clone(&offsets),
+                    sends: Arc::clone(&sends),
+                    cancellation: cancellation.clone(),
+                    interference: interfere.then(|| (Arc::clone(&runtime), binding.clone())),
+                    confirmed,
+                },
+                super::SystemClock,
+                std::num::NonZeroUsize::new(2).expect("queue"),
+                Duration::from_millis(1),
+            )
+            .expect("channel");
+            channel
+                .start(&mut super::ChannelDiagnostics(Arc::clone(&diagnostics)))
+                .expect("started");
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                super::run_telegram(
+                    channel,
+                    identity,
+                    Arc::clone(&runtime),
+                    Arc::new(std::sync::RwLock::new(None)),
+                    Arc::clone(&diagnostics),
+                    ChannelReadiness::new(Arc::clone(&readiness), true, false),
+                    cancellation,
+                ),
+            )
+            .await
+            .expect("bounded actual processing loop");
+            assert_eq!(
+                *offsets.lock().expect("observed poll offsets"),
+                if interfere {
+                    vec![None]
+                } else if confirmed {
+                    vec![None, Some(11), Some(11)]
+                } else {
+                    vec![None, None, Some(11)]
+                }
+            );
+            assert_eq!(
+                sends.load(Ordering::SeqCst),
+                1,
+                "unknown delivery must never be attempted twice"
+            );
+            assert_eq!(runtime.operator_status()["sessions"]["managed"], 1);
+            assert_eq!(
+                runtime
+                    .telegram_poll_cursor(&binding)
+                    .await
+                    .expect("saved settled cursor"),
+                if interfere { 12 } else { 11 }
+            );
+            runtime.shutdown().await.expect("owned runtime drain");
+            drop(runtime);
+            let runtime = AgentRuntime::new(
+                provider,
+                plugins,
+                &root.0,
+                "gpt-4o".to_owned(),
+                0,
+                8,
+                Duration::from_secs(60),
+                Arc::clone(&diagnostics),
+            )
+            .expect("reopened actual runtime");
+            let origin = approved_origin("telegram", &account, "api.telegram.org")
+                .expect("same configured origin");
+            let credential = bind_credential(
+                "telegram",
+                &account,
+                CredentialKind::Token,
+                origin.clone(),
+                &secret,
+            )
+            .expect("same configured credential");
+            let identity = super::TelegramPollIdentity::new(credential, &origin)
+                .expect("same credential binding");
+            assert_eq!(identity.binding, binding);
+            let cancellation = CancellationToken::new();
+            let mut channel = TelegramChannel::new(
+                account.clone(),
+                origin.clone(),
+                PollReplay {
+                    offsets: Arc::clone(&offsets),
+                    sends: Arc::clone(&sends),
+                    cancellation: cancellation.clone(),
+                    interference: None,
+                    confirmed,
+                },
+                super::SystemClock,
+                std::num::NonZeroUsize::new(2).expect("queue"),
+                Duration::from_millis(1),
+            )
+            .expect("restarted channel");
+            channel
+                .restore_poll_cursor(
+                    runtime
+                        .telegram_poll_cursor(&binding)
+                        .await
+                        .expect("restored cursor"),
+                )
+                .expect("pre-start cursor restoration");
+            channel
+                .start(&mut super::ChannelDiagnostics(Arc::clone(&diagnostics)))
+                .expect("restarted");
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                super::run_telegram(
+                    channel,
+                    identity,
+                    Arc::clone(&runtime),
+                    Arc::new(std::sync::RwLock::new(None)),
+                    diagnostics,
+                    ChannelReadiness::new(readiness, true, false),
+                    cancellation,
+                ),
+            )
+            .await
+            .expect("restarted actual loop");
+            assert_eq!(
+                *offsets.lock().expect("restarted poll offsets"),
+                if interfere {
+                    vec![None, Some(12), Some(12)]
+                } else if confirmed {
+                    vec![None, Some(11), Some(11), Some(11)]
+                } else {
+                    vec![None, None, Some(11), Some(11)]
+                }
+            );
+            assert_eq!(sends.load(Ordering::SeqCst), 1);
+            let message = InboundMessage {
+                id: "1".to_owned(),
+                channel_id: "telegram".to_owned(),
+                account_id: account.clone(),
+                conversation_id: "telegram:-100".to_owned(),
+                sender_id: "7".to_owned(),
+                text: Some("process once".to_owned()),
+                attachments: Vec::new(),
+                received_at_unix_ms: 0,
+            };
+            let run = runtime
+                .run_channel_message(&message, async {
+                    panic!("retained input must not execute again")
+                })
+                .await
+                .expect("read retained run");
+            let query = serde_json::json!({"nativeRecovery":{"channelId":"telegram","accountId":account,"conversationId":"telegram:-100","senderId":"7","runId":run.id()}});
+            let response = runtime
+                .dispatch("channels.status", Some(&query), CancellationToken::new())
+                .await
+                .expect("Telegram receipt query")
+                .expect("receipt response");
+            assert_eq!(
+                response["delivery"],
+                if confirmed {
+                    "delivered"
+                } else {
+                    "outcome_unknown"
+                }
+            );
+            assert_eq!(
+                response["deliveryReceipts"]
+                    .as_array()
+                    .expect("receipt page")
+                    .len(),
+                usize::from(confirmed)
+            );
+            if confirmed {
+                assert_eq!(response["deliveryReceipts"][0]["remoteMessageId"], "42");
+                assert_eq!(response["deliveryReceipts"][0]["segment"], 0);
+                assert_eq!(
+                    response["deliveryReceipts"][0]["contentSha256"]
+                        .as_str()
+                        .expect("digest")
+                        .len(),
+                    64
+                );
+            }
+            assert!(!response.to_string().contains("process once"));
+            let other_credential = super::bind_credential(
+                "telegram",
+                &account,
+                CredentialKind::Token,
+                origin.clone(),
+                &SecretString::new("different-telegram-secret"),
+            )
+            .expect("different fixture credential");
+            let other = super::TelegramPollIdentity::new(other_credential, &origin)
+                .expect("different binding");
+            assert_ne!(other.binding, binding);
+            assert_eq!(
+                runtime
+                    .telegram_poll_cursor(&other.binding)
+                    .await
+                    .expect("different credential starts independently"),
+                0
+            );
+            runtime.shutdown().await.expect("reopened runtime drained");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authenticated_channel_dispatch_isolates_account_history_and_reset() {
+        use super::{AgentRuntime, Diagnostics, process_inbound, send_discord_reply_once};
+        use crate::adapters::http_api::{
+            EmptyModelTools, OperatorRuntimeStatus, ProviderHistoryConfig, SmokeProvider,
+            SwappableProvider,
+        };
+        use crate::adapters::signed_plugins::PluginToolSurface;
+        use std::sync::RwLock;
+
+        struct OwnedRoot(std::path::PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = OwnedRoot(std::env::temp_dir().join(format!(
+                "claw-channel-runtime-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            )));
+        std::fs::create_dir(&root.0).expect("owned channel state directory");
+        let diagnostics = Arc::new(Diagnostics::new(32));
+        let readiness = Arc::new(DependencyReadiness::new(["provider"]));
+        let provider = Arc::new(SwappableProvider::new(
+            "gpt-4o",
+            "channel fixture role",
+            ProviderHistoryConfig::default(),
+            Arc::new(EmptyModelTools),
+            readiness,
+        ));
+        provider
+            .activate(Arc::new(
+                SmokeProvider::new().expect("isolated smoke provider"),
+            ))
+            .await
+            .expect("fixture provider activation");
+        let plugins = PluginToolSurface::new(Arc::clone(&diagnostics));
+        let runtime = AgentRuntime::new(
+            Arc::clone(&provider),
+            Arc::clone(&plugins),
+            &root.0,
+            "gpt-4o".to_owned(),
+            0,
+            8,
+            Duration::from_secs(60),
+            Arc::clone(&diagnostics),
+        )
+        .expect("real runtime composition");
+        let legacy = claw_http_api::LegacyChannelMessage {
+            channel: "whatsapp",
+            account_id: "phone-one".to_owned(),
+            message_id: "same-message".to_owned(),
+            sender_id: "sender-one".to_owned(),
+            conversation_id: "whatsapp:sender-one".to_owned(),
+            user_name: "untrusted display name".to_owned(),
+            text: "private-whatsapp-first".to_owned(),
+        };
+        let first = claw_http_api::LegacyChannelMessagePort::process_owned(
+            Arc::clone(&runtime),
+            legacy.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("first owned WhatsApp input");
+        let mut renamed = legacy.clone();
+        renamed.user_name = "another display name".to_owned();
+        let replay = claw_http_api::LegacyChannelMessagePort::process_owned(
+            Arc::clone(&runtime),
+            renamed,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("display rename must still read original result");
+        assert_eq!(first, replay);
+        let mut other = legacy.clone();
+        other.account_id = "phone-two".to_owned();
+        other.text = "private-whatsapp-second".to_owned();
+        let second = claw_http_api::LegacyChannelMessagePort::process_owned(
+            Arc::clone(&runtime),
+            other,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("other verified phone account");
+        assert!(
+            second.contains("private-whatsapp-second")
+                && !second.contains("private-whatsapp-first")
+        );
+        let mut malformed = legacy.clone();
+        malformed.sender_id.clear();
+        assert!(
+            claw_http_api::LegacyChannelMessagePort::process_owned(
+                Arc::clone(&runtime),
+                malformed,
+                CancellationToken::new()
+            )
+            .await
+            .is_err()
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            claw_http_api::LegacyChannelMessagePort::process_owned(
+                Arc::clone(&runtime),
+                legacy,
+                cancelled
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(runtime.operator_status()["sessions"]["managed"], 2);
+        let authentication = Arc::new(RwLock::new(None));
+        let first_account = super::configured_account_id(
+            "telegram",
+            &SecretString::new("first-configured-bot-secret"),
+        );
+        let second_account = super::configured_account_id(
+            "telegram",
+            &SecretString::new("second-configured-bot-secret"),
+        );
+        runtime
+            .register_channel_account("telegram", &first_account)
+            .expect("configured first bot");
+        let mut message = InboundMessage {
+            id: "message-1".to_owned(),
+            channel_id: "telegram".to_owned(),
+            account_id: first_account.clone(),
+            conversation_id: "telegram:42:7".to_owned(),
+            sender_id: "7".to_owned(),
+            text: Some("first-account-private-marker".to_owned()),
+            attachments: Vec::new(),
+            received_at_unix_ms: 1,
+        };
+        let first = process_inbound(
+            &message,
+            &runtime,
+            &authentication,
+            &diagnostics,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("first actual channel dispatch")
+        .expect("first reply");
+        assert!(first.contains("first-account-private-marker"));
+        let replay = process_inbound(
+            &message,
+            &runtime,
+            &authentication,
+            &diagnostics,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("duplicate durable input")
+        .expect("retained reply");
+        assert_eq!(
+            replay, first,
+            "same provider message must not repeat the model or append another input"
+        );
+        let mut conflicting = message.clone();
+        conflicting.text = Some("changed body under the same message ID".to_owned());
+        assert!(
+            process_inbound(
+                &conflicting,
+                &runtime,
+                &authentication,
+                &diagnostics,
+                CancellationToken::new()
+            )
+            .await
+            .is_err()
+        );
+        runtime
+            .register_channel_account("telegram", &second_account)
+            .expect("configured replacement bot");
+        let accounts = runtime.operator_status()["configuredChannelAccounts"].clone();
+        assert_eq!(accounts["partitions"]["telegram"], second_account);
+        assert_eq!(accounts["credentialsIncluded"], false);
+        assert_eq!(accounts["automaticHistoryAdoption"], false);
+        assert!(!accounts.to_string().contains("configured-bot-secret"));
+        message.account_id = second_account.clone();
+        message.text = Some("second-account-private-marker".to_owned());
+        let second = process_inbound(
+            &message,
+            &runtime,
+            &authentication,
+            &diagnostics,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("second actual channel dispatch")
+        .expect("second reply");
+        assert!(
+            second.contains("second-account-private-marker")
+                && !second.contains("first-account-private-marker")
+        );
+        assert_eq!(runtime.operator_status()["sessions"]["managed"], 4);
+        message.account_id = first_account;
+        message.id = "message-3".to_owned();
+        message.text = Some("/reset".to_owned());
+        let reset = process_inbound(
+            &message,
+            &runtime,
+            &authentication,
+            &diagnostics,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("own reset")
+        .expect("reset reply");
+        assert_eq!(reset, "Conversation reset.");
+        assert_eq!(
+            process_inbound(
+                &message,
+                &runtime,
+                &authentication,
+                &diagnostics,
+                CancellationToken::new()
+            )
+            .await
+            .expect("duplicate reset reads its retained result")
+            .expect("reset result"),
+            reset
+        );
+        assert_eq!(runtime.operator_status()["sessions"]["managed"], 3);
+        message.account_id = second_account;
+        message.id = "message-4".to_owned();
+        message.text = Some("continue-second-account".to_owned());
+        let retained = process_inbound(
+            &message,
+            &runtime,
+            &authentication,
+            &diagnostics,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("second account continues")
+        .expect("retained reply");
+        assert!(
+            retained.contains("second-account-private-marker")
+                && !retained.contains("first-account-private-marker")
+        );
+        let mut delivery_cases = Vec::new();
+        for confirmed in [true, false] {
+            let response = if confirmed {
+                Ok(ProviderResponse::new(
+                    200,
+                    br#"{"id":"123","channel_id":"room"}"#.to_vec(),
+                ))
+            } else {
+                Err(ChannelError::Transport(TransportErrorKind::Io))
+            };
+            let (transport, origin, credential, mut message) =
+                discord_reply_fixture(VecDeque::from([response]));
+            message.id = format!("delivery-{confirmed}");
+            runtime
+                .run_channel_message(&message, async { Ok(Some("reply".to_owned())) })
+                .await
+                .expect("durable reply before transport");
+            assert_eq!(
+                send_discord_reply_once(
+                    &runtime,
+                    &transport,
+                    &origin,
+                    &credential,
+                    &message,
+                    "reply",
+                    &CancellationToken::new()
+                )
+                .await
+                .is_ok(),
+                confirmed
+            );
+            assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                send_discord_reply_once(
+                    &runtime,
+                    &transport,
+                    &origin,
+                    &credential,
+                    &message,
+                    "reply",
+                    &CancellationToken::new()
+                )
+                .await
+                .is_ok(),
+                confirmed
+            );
+            assert_eq!(
+                transport.calls.load(Ordering::SeqCst),
+                1,
+                "a repeated inbound message cannot repeat its transport attempt"
+            );
+            delivery_cases.push((transport, origin, credential, message, confirmed));
+        }
+        runtime.shutdown().await.expect("owned runtime drained");
+        drop(runtime);
+        let reopened = AgentRuntime::new(
+            provider,
+            plugins,
+            &root.0,
+            "gpt-4o".to_owned(),
+            0,
+            8,
+            Duration::from_secs(60),
+            diagnostics,
+        )
+        .expect("reopened real runtime");
+        for (transport, origin, credential, message, confirmed) in delivery_cases {
+            reopened
+                .run_channel_message(&message, async {
+                    panic!("a persisted message must not execute again after restart");
+                })
+                .await
+                .expect("retained execution result");
+            assert_eq!(
+                send_discord_reply_once(
+                    &reopened,
+                    &transport,
+                    &origin,
+                    &credential,
+                    &message,
+                    "reply",
+                    &CancellationToken::new()
+                )
+                .await
+                .is_ok(),
+                confirmed
+            );
+            assert_eq!(
+                transport.calls.load(Ordering::SeqCst),
+                1,
+                "reopening cannot resend a confirmed or unknown reply"
+            );
+            let query = serde_json::json!({"nativeRecovery":{"channelId":message.channel_id,"accountId":message.account_id,"conversationId":message.conversation_id,"senderId":message.sender_id}});
+            let status = reopened
+                .dispatch("channels.status", Some(&query), CancellationToken::new())
+                .await
+                .expect("read-only native recovery")
+                .expect("recovery response");
+            assert_eq!(status["contentIncluded"], false);
+            assert_eq!(status["automaticReplay"], false);
+            assert_eq!(
+                status["pendingResults"]
+                    .as_array()
+                    .expect("pending statuses")
+                    .len(),
+                1
+            );
+            assert_eq!(status["pendingResults"][0]["delivery"], "outcome_unknown");
+            let mut wrong = query.clone();
+            wrong["nativeRecovery"]["senderId"] = serde_json::json!("another-sender");
+            wrong["nativeRecovery"]["runId"] = status["pendingResults"][0]["runId"].clone();
+            assert!(
+                reopened
+                    .dispatch("channels.status", Some(&wrong), CancellationToken::new())
+                    .await
+                    .is_err()
+            );
+        }
+        reopened.shutdown().await.expect("reopened runtime drained");
+        drop(reopened);
+    }
+
     use std::collections::VecDeque;
     use std::num::{NonZeroU32, NonZeroUsize};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2207,7 +4300,10 @@ mod tests {
                 Vec::new(),
                 Some(retry_after),
             )),
-            Ok(ProviderResponse::new(200, Vec::new())),
+            Ok(ProviderResponse::new(
+                200,
+                br#"{"id":"123","channel_id":"room"}"#.to_vec(),
+            )),
         ]));
         let started = Instant::now();
 
@@ -2224,6 +4320,40 @@ mod tests {
 
         assert!(started.elapsed() >= retry_after);
         assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn discord_reply_requires_a_real_message_receipt_not_only_http_success() {
+        for body in [
+            b"".as_slice(),
+            b"{}",
+            br#"{"id":"123","channel_id":"other"}"#,
+            br#"{"id":"0","channel_id":"room"}"#,
+            br#"{"id":"not-a-snowflake","channel_id":"room"}"#,
+        ] {
+            let (transport, origin, credential, message) =
+                discord_reply_fixture(VecDeque::from([Ok(ProviderResponse::new(
+                    200,
+                    body.to_vec(),
+                ))]));
+            assert!(
+                send_discord_reply(
+                    &transport,
+                    &origin,
+                    &credential,
+                    &message,
+                    "reply",
+                    &CancellationToken::new()
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                transport.calls.load(Ordering::SeqCst),
+                1,
+                "unconfirmed success must not be retried"
+            );
+        }
     }
 
     #[tokio::test]

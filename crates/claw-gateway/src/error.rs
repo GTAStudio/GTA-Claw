@@ -371,6 +371,11 @@ pub enum DispatchError {
     },
     /// The persistence port failed.
     Store(StoreError),
+    /// Work or a storage commit may have started; a new execution must not be retried blindly.
+    OutcomeUnknown {
+        /// Operation whose outcome requires an explicit durable lookup.
+        method: String,
+    },
     /// The connection attempted to re-run the handshake.
     HandshakeAlreadyComplete,
 }
@@ -387,6 +392,7 @@ impl DispatchError {
             | Self::HandshakeAlreadyComplete
             | Self::Store(StoreError::Conflict { .. }) => "INVALID_REQUEST",
             Self::NotFound { .. } => "NOT_FOUND",
+            Self::OutcomeUnknown { .. } => "OUTCOME_UNKNOWN",
             Self::ResourceExhausted { .. }
             | Self::Store(StoreError::CapacityExceeded { .. } | StoreError::Backend(_)) => {
                 "UNAVAILABLE"
@@ -425,6 +431,7 @@ impl Display for DispatchError {
                 write!(formatter, "{resource} limit of {limit} is exhausted")
             }
             Self::Store(error) => Display::fmt(error, formatter),
+            Self::OutcomeUnknown { method } => write!(formatter, "outcome of `{method}` is unknown; query the existing run or reuse its original idempotency key, never create a replacement execution"),
             Self::HandshakeAlreadyComplete => {
                 formatter.write_str("`connect` is only valid once, before the hello response")
             }

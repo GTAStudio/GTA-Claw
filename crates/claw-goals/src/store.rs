@@ -371,7 +371,11 @@ fn sync_directory_entries(directory: &Path) -> std::io::Result<bool> {
 
 /// Reports that no directory synchronization exists on this target.
 #[cfg(not(unix))]
-fn sync_directory_entries(_directory: &Path) -> std::io::Result<bool> {
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Portable commit result; Ok(false) explicitly reports that no directory flush is available on this platform"
+)]
+const fn sync_directory_entries(_directory: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
 

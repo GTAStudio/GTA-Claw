@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "stage": "typed-http-partial-results-and-runtime-partial-persistence",
+  "capturedAtUtc": "2026-09-15T05:09:33.9282891Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-http-api/src/ports.rs","sha256":"05875c89ab1e4998b2971ce7f650f2f64029dc8006b468acfdd2f90d495578cd"},
+    {"path":"crates/claw-http-api/src/lib.rs","sha256":"a72fab29e0048ef2efc8449f96a4593b07f27310eaf76d96a8272a5034483303"},
+    {"path":"crates/claw-http-api/src/deterministic.rs","sha256":"2d06210c994993d9a73f683bffe113d7475388163d6ee5343e3930eb2fb2a1f0"},
+    {"path":"crates/claw-http-api/src/openai.rs","sha256":"c476543daff7ee3e5daee1c0bdba89f0d744bfb82a0d8e633f623c17a84ae931"},
+    {"path":"crates/claw-http-api/tests/e2e.rs","sha256":"c736e4707e900576c36b3ed9b84db77c3f23b0c778a30730ea13132332d42e82"},
+    {"path":"crates/claw-http-api/tests/openai_support/mod.rs","sha256":"b56057b91403e425fc730bddd1472cc92e757ded20a62038124ecdc224f7a4d4"},
+    {"path":"apps/gta-claw-daemon/src/adapters/http_api.rs","sha256":"9cebbe02701848300eca800744be40690e8706fe309258eef9a7e2409f794bad"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"1d3e3e8c2ba3c2e2741d71c4181a65047283e439518a64c0aa2fef80913f4fea"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"b70a7abc84ce0b0635b4088c7e231519b57970218a323005e738e5a59b1d2b07"},
+    {"path":"crates/claw-runtime/src/runtime.rs","sha256":"d0a3e6f865618d0c95ecdf4cb802780396d65a62f74e798609d46ab74e2bb0b6"},
+    {"path":"crates/claw-runtime/tests/support/mod.rs","sha256":"795963a750739bce83f4a48c0ddf2e347a72dda9865ed44fc8963da951a6c066"},
+    {"path":"crates/claw-runtime/tests/session_lifecycle.rs","sha256":"16e7a5e5ba4617d0198b9efb8b7475d7771530fe8c321a117731053d83f45f41"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-runtime -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":585, "failed":0, "ignored":4, "testBinaries":30,
+      "log":"target/native-partial-generation-tests-20260915T050506754Z.log",
+      "sha256":"7624b4dec78a4e7e43ea76af5c4f76b042d2aab9fba719903b85a3fbdc3c67a0"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-runtime -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-partial-generation-clippy-20260915T050427692Z.log",
+      "sha256":"94b3fff4a172e56e9444a972f3702fae5989adc8266d5f334be9f940e61cd05c"
+    },
+    {
+      "command":"cargo +stable check --manifest-path D:/GTA-Claw/Cargo.toml --workspace --all-targets --locked --offline",
+      "result":"passed",
+      "log":"target/native-partial-generation-workspace-check-20260915T050841589Z.log",
+      "sha256":"66909859686841961cca6ad1e730082278489f85d31674c05182bf91b5f1dd67"
+    }
+  ],
+  "retainedFailures": [
+    {"log":"target/native-partial-generation-clippy-20260915T044744427Z.log","sha256":"0d89fbc1a7be7667f51f11cd47ddb9799c44310a68cb9bdc5de0a4efe861c00a","reason":"HTTP nested conditional and const mapping lint; corrected"},
+    {"log":"target/native-partial-generation-clippy-20260915T044814363Z.log","sha256":"ef091aeedcb73b34c92d3b16e081fad1a2eeb7ee81294e3de14181651b57fa10","reason":"Equivalent adapter match arms; merged"},
+    {"log":"target/native-partial-generation-clippy-20260915T050310873Z.log","sha256":"48febc87eabf7483ee4452561d18de79ba6be20bfc82c51812e82367dacf54a3","reason":"Similar runtime local names; clarified"},
+    {"log":"target/native-partial-generation-clippy-20260915T050331028Z.log","sha256":"4f549d4218cb546efeba769b5e6907e78f9890d094b833f8f33a00aec1739eb9","reason":"Fixture optional-error branch lint; simplified"},
+    {"log":"target/native-partial-generation-clippy-20260915T050355527Z.log","sha256":"6f45fd0af0b62535893ae43ccfccf1f10e46db9ac67b7b9e581d3707605cd528","reason":"Fixture Gateway event permit retained after copying payload; released at last use"}
+  ],
+  "behaviorEvidence": [
+    "partial_generation_serializers_preserve_finish_text_and_usage_without_tools",
+    "known_partial_outputs_preserve_text_usage_and_terminal_on_all_http_surfaces",
+    "provider_adapter_preserves_partial_status_and_rejects_unknown_or_partial_tools",
+    "provider_adapter_holds_tools_until_complete_and_does_not_remember_failed_turns",
+    "runtime_provider_preserves_partial_text_without_synthesizing_message_end",
+    "provider_failure_and_unmarked_eof_persist_partial_without_dispatching_tools",
+    "bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection"
+  ],
+  "localProbeObservations": [
+    "The initial GenerationSummary compile probe identified nine old HTTP consumers; all direct production/test consumers were migrated and final root all-target compilation passed",
+    "The runtime partial test initially expected join success; existing failed join semantics were retained and the test instead checks the persisted TurnRecord",
+    "The real Gateway test initially expected failed and turn ordinal one; actual settlement keeps runtime errors outcome_unknown and TurnId::FIRST is ordinal zero. The test now uses those existing contracts without weakening production protection"
+  ],
+  "notes": [
+    "GenerationOutput carries GenerationFinishReason and ProviderPort::stream returns GenerationSummary; ordinary complete response shapes retain their existing compatibility behavior",
+    "Known no-tool Length/ContentFilter preserve HTTP text and usage as Chat finish reasons or Responses incomplete details, including streamed terminal event and empty text",
+    "Required-tool and JSON-object completion constraints do not fabricate success from incomplete output; partial results with completed tools are refused before tool events reach clients",
+    "Native adapter keeps partial output out of complete history and still rejects unknown/cancelled/inconsistent tool terminals",
+    "Runtime bridge emits known partial text then a nonretryable error, never synthetic MessageEnd. Runtime saves partial for provider errors, malformed chunks and unmarked EOF using the existing state schema",
+    "Real daemon Chat/Responses/Anthropic fixtures cover HTTP partial results plus two Gateway runs per mode, idempotent replay with nine exact provider requests, clean process exit and redb reopening with partial text and no complete message/tools",
+    "Gateway runtime join errors remain outcome_unknown to protect possible earlier external effects; no automatic inference retry or partial promotion was introduced",
+    "This supersedes the previous blanket 503 gate for known no-tool partial HTTP outcomes; its historical record is retained unchanged",
+    "No dependencies, real accounts, browser execution, production proxy/process changes, devices, deployment or Git writes"
+  ],
+  "unverified": [
+    "Runtime usage/finish provenance and monetary accounting are not persisted with partial text; failed run result remains a generic unknown-effect result",
+    "Full partial-result retrieval UX, signed/opaque reasoning continuation and provider/account configuration transitions",
+    "Real-provider/platform/MSRV acceptance and root causes of the two earlier native-credential anomalies",
+    "Complete build manifests, release and whole-project acceptance"
+  ]
+}

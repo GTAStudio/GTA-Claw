@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-observed-provider-token-stop-threshold",
+  "capturedAtUtc": "2026-09-15T08:36:16.3758998Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-runtime/src/runtime.rs","sha256":"812fe017b7d446eb01fb1b066fb8f64cbeed8a71f90216d9acd1ade61034ec94"},
+    {"path":"crates/claw-runtime/tests/session_lifecycle.rs","sha256":"38cc9e616f01d0a319b86114b89cb932427d0179b37806cb41d5f5c800d79b79"},
+    {"path":"apps/gta-claw-daemon/src/production/native_provider.rs","sha256":"f2dd5a58c7fc94e04930abcf520e00735f62513aa9a671e9db963432ebaa54d5"},
+    {"path":"apps/gta-claw-daemon/src/production.rs","sha256":"3f6995cc729c26b81774973d216562ad92dec1495ce9ffa3ec44aad2aefd1b4f"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"69efcfb605bde842856653ededee7fe98b64e8be5a027979b3329f29b9bb84ad"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"f32a30e0ebecccbf8bee17ad91ed07a3649141422dad5c46054489d4b1f27240"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-runtime -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":475, "failed":0, "ignored":4, "testBinaries":20,
+      "log":"target/native-observed-budget-tests-20260915T083350734Z.log",
+      "sha256":"41bff9aa0f5b030fed026b27e5cdf7305207d93fba9fc1ee215fe792f62ed37c"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-runtime -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-observed-budget-clippy-20260915T083324912Z.log",
+      "sha256":"4c156cc4b9d48e6083c73961c4dc8b771ba0ea16222f1eead71a5f11c5ac38da"
+    },
+    {
+      "command":"cargo +stable check --manifest-path D:/GTA-Claw/Cargo.toml --workspace --all-targets --locked --offline",
+      "result":"passed",
+      "log":"target/native-observed-budget-workspace-check-20260915T083557067Z.log",
+      "sha256":"b107d05feef35eb989b0ec3d216defd8bfbb74c9e7be34e9b3826d6481233b21"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --test production_composition native_observed_usage_budget_is_applied_before_gateway_inference --locked --offline -- --exact --nocapture",
+      "result":"passed", "passed":1, "failed":0, "ignored":0, "testBinaries":1,
+      "log":"target/native-observed-budget-composition-20260915T083054025Z.log",
+      "sha256":"09e7c57510478bb88456fcef72a2ca67cfc48df4759b713a1f1e8b58f1a2bb13",
+      "scopeNote":"Focused real daemon test, also included in the final full related cohort"
+    }
+  ],
+  "retainedFailures": [
+    {"log":"target/native-observed-budget-clippy-20260915T083251455Z.log","sha256":"595ef7e8a22726d524e870f40b7edaefdd6900e9bd60d84eb17021a99ccc21a8","reason":"Missing semicolon on a test-server unit statement; fixed without behavior changes"}
+  ],
+  "behaviorEvidence": [
+    "observed_provider_budget_stops_new_rounds_and_never_estimates_missing_usage",
+    "native_provider_observed_budget_is_optional_typed_and_allows_explicit_zero",
+    "native_observed_usage_budget_is_applied_before_gateway_inference"
+  ],
+  "notes": [
+    "Optional default-off runtime threshold uses complete previously observed primary counters before a new round, with checked sum and no double counting cache/reasoning subsets",
+    "Zero prevents the first model call; equality blocks further rounds; missing/partial usage or overflow refuses another budgeted request before intent journaling",
+    "Native maxObservedTurnTokens is an unsigned startup-policy value for OpenAI/Anthropic, including the OpenAI Responses dialect, captured before policy consumption; old runtime constructor keeps no threshold",
+    "Three isolated daemon configurations absent/zero/one each receive two distinct Gateway turns and same-key resubmissions; zero performs no inference, the other settings each allow a seven-token response per turn without replay",
+    "A one-token threshold permitting a seven-token single response is intentional: this is a stop threshold for subsequent rounds, not a hard per-request or monetary limit",
+    "Prior approved tools are not rolled back, separate turns have independent allowance, and direct tools/standalone HTTP generation are not limited by this setting",
+    "All prior native-credential, stdio lock, MCP SessionExpired and OAuth generation-verification failures remain unresolved; this pass is not a fix for them",
+    "No dependency download, lock change, production/proxy action, real account/browser/device migration, deployment or Git write occurred"
+  ],
+  "unverified": [
+    "Hard per-request token reservations, actual monetary budgets/pricing, rolling/global quotas, invoices and remote reconciliation",
+    "Exact provider token prediction, automatic standalone HTTP limits and budget policy hot reload",
+    "Runtime boundary tests use deterministic adapters; actual process threshold coverage is native Chat, while Anthropic/Responses policy and existing unbounded protocol fixtures remain separately verified",
+    "Previously retained credential/MCP/stdio root causes, real accounts/platforms, complete frozen manifests, release and whole-project acceptance"
+  ]
+}

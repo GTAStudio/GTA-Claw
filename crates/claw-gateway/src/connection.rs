@@ -255,11 +255,12 @@ async fn dispatch_loop(
 ) -> ConnectionClose {
     let timeouts = *services.config.timeouts();
     let max_unanswered = services.config.limits().max_unanswered_pings;
-    let mut subscription = services.events.subscribe(
+    let mut subscription = services.events.subscribe_for_device(
         id,
         session.role,
         session.scopes.clone(),
         Arc::clone(&session.filter),
+        &session.device_id,
     );
     let codec = Codec::authenticated();
     let mut broadcast_seq: u64 = 0;
@@ -535,6 +536,9 @@ fn error_shape(error: &DispatchError) -> Result<ErrorShape, EncodeError> {
         })),
         DispatchError::Unauthorized(denial) => Some(json!({ "reason": denial.to_string() })),
         DispatchError::NotFound { kind, id } => Some(json!({ "kind": kind, "id": id })),
+        DispatchError::OutcomeUnknown { method } => {
+            Some(json!({ "method": method, "delivery": "unknown", "automaticReplay": false }))
+        }
         DispatchError::ResourceExhausted { resource, limit } => {
             Some(json!({ "resource": resource, "limit": limit }))
         }

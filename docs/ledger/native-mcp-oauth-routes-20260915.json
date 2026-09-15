@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "stage": "mcp-oauth-explicit-http-route-enrollment",
+  "capturedAtUtc": "2026-09-15T00:33:45.6514892Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-mcp/src/oauth.rs","sha256":"7eed08a56e18343d526665916f25e24d19e67e596ebd3326a4d2dbf5dd5d7e55"}
+  ],
+  "cargoLockSha256": "7b7fbedc4a9eb99b780bca28c2cfaf789b7e55fcd40101d67359ac4e5b5ccaf1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":82, "failed":0, "ignored":0, "testBinaries":6,
+      "log":"target/native-mcp-oauth-routes-tests-20260915T003302280Z.log",
+      "sha256":"16f4aff4ce9d11a72102baf5e91459715fc108c6b287cd445af0980fffa69f98"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-oauth-routes-clippy-20260915T003250794Z.log",
+      "sha256":"0574aab4d7be86cb4e99b4245e9574f10496c453091736df1d7f3921867293cd"
+    }
+  ],
+  "behaviorEvidence": [
+    "explicit_oauth_routes_refuse_unenrolled_targets_before_network",
+    "explicit_oauth_discovery_cannot_enroll_replaced_authorization_or_token_endpoints",
+    "explicit_oauth_https_exchange_uses_only_the_owned_connect_proxy_without_secrets",
+    "local_authorization_server_covers_registration_exchange_and_refresh"
+  ],
+  "notes": [
+    "New with_routes uses at most sixteen exact URLs and explicit native HttpRoutePolicy clients",
+    "Every HTTP operation and discovered/browser authorization target is checked before use; metadata cannot expand the allowlist",
+    "The compatibility new/default constructor retains its previous environment-proxy behavior",
+    "Actual enrolled loopback discovery/registration/exchange/refresh and negative target substitution pass",
+    "Owned CONNECT proxy fixture verifies no OAuth secrets on the proxy hop; no real HTTPS authorization success is claimed",
+    "No new dependencies, lock changes, production proxy changes or real authorization-server contact"
+  ],
+  "unverified": [
+    "Product public-address approval, issuer/resource relationship enrollment and proxy DNS assurance",
+    "Full browser callback workflow and issuer/client-bound native TokenStore persistence",
+    "Restart-durable refresh uncertainty, cross-platform/live OAuth acceptance and deployment",
+    "Whole-project completion and a complete frozen build input manifest"
+  ]
+}

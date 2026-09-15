@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-daemon-mcp-oauth-fresh-generation-enrollment",
+  "capturedAtUtc": "2026-09-15T02:05:17.5492471Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-mcp/src/oauth.rs","sha256":"ef7d766bd2da8a86f00a6006f0c83cf6f4367734ad82dafad755329609d10256"},
+    {"path":"apps/gta-claw-daemon/src/adapters/native_mcp.rs","sha256":"c228acd37d727c94567198eefca985c124a75eed1a944077819cce42c8118cc9"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"995bf32bfeabeaa6c06e58d72bfd79412026a6291fb37c4b45e98da382a33efc"}
+  ],
+  "cargoLockSha256": "5955c2233d8cad3f8d4c72b61bdfef396f609c5a2b90c50fb56c69e8ba262b1e",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":398, "failed":0, "ignored":5, "testBinaries":20,
+      "log":"target/native-mcp-oauth-daemon-tests-20260915T020238211Z.log",
+      "sha256":"a2a36b094a19572a1f9b7b3ea91a94f1cdc510b2d1b909f81ef9930c8047dc18"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-oauth-daemon-clippy-20260915T020144361Z.log",
+      "sha256":"9cde0acfecbef824aa0d0387933e3f3329cfe956d64e82546d9013c64cfb38e3"
+    }
+  ],
+  "behaviorEvidence": [
+    "fresh_oauth_snapshots_require_original_authority_and_never_refresh_expired_tokens",
+    "native_mcp_oauth_records_require_original_fresh_generation_without_automatic_refresh",
+    "bound_native_mcp_tools_require_exact_approval_and_never_auto_publish_or_replay"
+  ],
+  "notes": [
+    "Explicit oauth policy is exclusive with static token sources and binds original issuer/public client/full resource authority",
+    "Complete generation fingerprints bind refresh token, scope, type and expiry even when access token text is unchanged",
+    "Startup only reads native storage; approved calls recheck freshness and generation before connection and after discovery",
+    "Seven actual native OAuth mutation scenarios verify refusal and durable review revocation without automatic refresh",
+    "Real daemon approval/resource/prompt/restart scenarios pass in both static keyring and actual OAuth-code-exchange modes",
+    "No dependency/lock changes, real accounts, production proxy changes or browser execution"
+  ],
+  "unverified": [
+    "Automatic or explicit product refresh scheduling and concurrent-process/native-store coordination",
+    "Real issuer/MCP service acceptance, macOS runtime and confidential clients",
+    "Atomic native-store/network actions and cancellation of already-issued requests",
+    "Deployment, complete frozen build manifests and whole-project completion"
+  ]
+}

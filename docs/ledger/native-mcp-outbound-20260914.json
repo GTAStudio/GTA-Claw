@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-reviewed-loopback-mcp-tools-and-nonreplay-transport",
+  "capturedAtUtc": "2026-09-14T22:28:40.4590587Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-daemon/src/adapters/native_mcp.rs","sha256":"e93e21b7a162ae4af000b1803756f8406bcd6b78a438d07a7342355d1ffaf703"},
+    {"path":"apps/gta-claw-daemon/src/adapters/mod.rs","sha256":"43a20ecffa6dbbf922c284e4b9e34c79cbe7a825464c022130cb56454e6dca04"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"0685c59a78f2942910cc1f63c40622bd4a26afdd55ea3f1399711d47bc469068"},
+    {"path":"apps/gta-claw-daemon/src/production.rs","sha256":"e8ba396126ac50e466c0f864d2661ef075756dd03f6abc282dec70b8059ff158"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"80e6a57cc636f436b652e69fb3e079a657d35c1be80c076855154f8d7daf9177"},
+    {"path":"apps/gta-claw-daemon/Cargo.toml","sha256":"f1afbf0cbc22bc7010fb6070c7812f41441e3d6cd7a453e9005d4539dd7558c5"},
+    {"path":"crates/claw-mcp/src/client.rs","sha256":"63f9ce10285126921872a6f1739bf5b2dc0c35fdd1d715f2d71c47859d769a6a"},
+    {"path":"crates/claw-mcp/src/registry.rs","sha256":"8ca6f01213f1a93d957c81fbfa0e19934dd8c70fbe0bd2628100d362c1301639"},
+    {"path":"crates/claw-mcp/tests/http_interop.rs","sha256":"978838b5973defc7f20ca190593103dc1020d817bbb93a7ed03f0c5214874953"},
+    {"path":"crates/claw-mcp/tests/stdio_interop.rs","sha256":"1e5a478c911e73e8b59807937d17f7c2432ef3074d429309fe4c5ab282e58d16"},
+    {"path":"crates/claw-mcp/tests/fixtures/mcp_fixture.rs","sha256":"3c25af9dfe455216c3ec5c92acef3a78b24e4f5f3e444910cc54d42761aa2bc7"},
+    {"path":"crates/claw-tools/src/exec.rs","sha256":"e1a14cf40a7862813bf1eaef0e670c32674deae0afc79e5b3d4f3be644f80b23"}
+  ],
+  "cargoLockSha256": "35d6c486d9f786555694093b3131f1da1fbe4c95985d3d9d0909bd2d07c04254",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-tools -p claw-mcp -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":560, "failed":0, "ignored":6, "testBinaries":31,
+      "log":"target/native-mcp-outbound-tests-20260914T222435012Z.log",
+      "sha256":"53a24e736122973db5ffd3b940881d6d47e5786d3f250889ad6ad738c0178178"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-tools -p claw-mcp -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-outbound-clippy-20260914T222749734Z.log",
+      "sha256":"9145beb2844d00ac5a8aa1332396e1cdaa3413d1d532ef35ed8ed2322f0384b0"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --test production_composition --locked --offline bound_native_mcp_tools_require_exact_approval_and_never_auto_publish_or_replay",
+      "result":"passed", "passed":1, "failed":0, "ignored":0,
+      "log":"target/native-mcp-outbound-production-20260914T222810936Z.log",
+      "sha256":"8c5d2a2e4c60f354347e7a2f001a4c47917f558a6d4dca4fe08813a2cb3c23f4"
+    }
+  ],
+  "behaviorEvidence": [
+    "native_mcp_policy_pins_only_reviewed_loopback_tools_and_offline_schemas",
+    "native_mcp_invokes_only_exact_reviewed_descriptors_once_and_audits_outcomes",
+    "bound_native_mcp_tools_require_exact_approval_and_never_auto_publish_or_replay",
+    "expired_http_session_never_reinitializes_or_replays_an_inflight_tool",
+    "isolated_stdio_only_receives_explicit_environment_without_changing_the_host",
+    "stdio_debug_output_redacts_arguments_and_environment_values",
+    "trusted_program_handle_prevents_write_delete_and_ancestor_replacement"
+  ],
+  "notes": [
+    "Default-off reviewed loopback HTTP MCP tools share model/HTTP/MCP approval, authority and durable audit",
+    "No connection before approval; changed/duplicate/missing descriptors and list notifications prevent tool dispatch",
+    "HTTP session expiry no longer automatically reinitializes or repeats the in-flight request",
+    "Eleven actual local-server cases exercise results, failures, cancellation, caller drop and shutdown with paired audit records",
+    "Stdio environment isolation and retained executable handles are tested prerequisites, not complete product launch authorization",
+    "Existing MCP fixture async lint errors are fixed; historical failure logs remain unchanged",
+    "Final test-only counting cleanup was revalidated with the separate production test; current root lock hash is unchanged"
+  ],
+  "unverified": [
+    "remote HTTPS/proxy/OAuth, stdio product launch authorization and working-directory controls",
+    "durable catalog revocation, automatic discovery, complete resources/prompts and ACP",
+    "real external accounts, cross-platform/power-loss acceptance and whole-project completion"
+  ]
+}

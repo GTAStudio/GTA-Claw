@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-chat-response-choice-and-function-identity",
+  "capturedAtUtc": "2026-09-15T03:59:36.5972539Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-providers/src/openai_compatible.rs","sha256":"fd21fd06990b051792d9b06022851aff0810f5085bd7207be806d993c6f359f0"},
+    {"path":"crates/claw-providers/tests/wire.rs","sha256":"fbb8caa535418b008ba085dc6071e6fe0aa8a4547cbbe82242c1a049ec2067f8"},
+    {"path":"apps/gta-claw-daemon/src/adapters/native_mcp.rs","sha256":"7956d1c415b03a80ce1e7d8dba27165d4218c20614f41bdd94ee1c0c4686e77c"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-provider-sdk -p claw-providers -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":697, "failed":0, "ignored":5, "testBinaries":17,
+      "log":"target/native-chat-identity-tests-20260915T035607582Z.log",
+      "sha256":"a18a46fd06632ba0c617c111fd5a4514ad87dfc49a314e763a0278d6b4fdc944"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-providers -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-chat-identity-clippy-20260915T035854517Z.log",
+      "sha256":"bf3ed094246e64b147b28a24cb89e48fd22d1978f062e96ac73b25cae55cde7a"
+    }
+  ],
+  "retainedObservations": [
+    {
+      "result":"failed",
+      "log":"target/native-chat-identity-tests-20260915T035023805Z.log",
+      "sha256":"259c6c11013f6217424523a3b056f3551ba5ca5da694ca7581d0e25c245388f3",
+      "test":"adapters::native_mcp::tests::native_mcp_keyring_rotation_and_deletion_revoke_before_connecting",
+      "detail":"Initial joint regression stopped in daemon unit tests: native lookup returned MCP stdio native credential is unavailable. This masked error does not establish whether the entry was absent or native access failed. Root cause remains unconfirmed."
+    },
+    {
+      "result":"passed",
+      "log":"target/native-chat-identity-keyring-recheck-20260915T035232104Z.log",
+      "sha256":"8b69cfafd842a6c96586b9a6ee1d33b298bf9210d55da19f9bd48edac6bd7870",
+      "detail":"The original unmodified failing test passed in isolation, before adding diagnostics; no retry policy, sleep or weaker assertion was introduced."
+    }
+  ],
+  "behaviorEvidence": [
+    "chat_completion_rejects_duplicate_function_ids_and_unrequested_choices",
+    "chat_stream_rejects_changed_identity_choice_and_function_ids",
+    "chat_stream_identity_errors_close_the_socket_without_completing_or_replaying_tools",
+    "native_mcp_keyring_rotation_and_deletion_revoke_before_connecting"
+  ],
+  "notes": [
+    "Chat accepts only the requested choice zero, with one buffered choice and at most one per stream frame",
+    "Stream response/model identity is bound at the first frame; later omission is compatible but replacement and post-finish choice data fail",
+    "Function IDs must remain stable per index, cannot be shared by different indexes and must be valid at completion; out-of-range tool indexes fail before assembly",
+    "Buffered and streamed function rounds reject invalid identifiers and inconsistent stop reasons without publishing partial completed calls",
+    "The first narrow check caught a changed empty-choices error string; the existing exact contract and test were retained and the implementation corrected",
+    "Six real held-open HTTP scenarios verify protocol failure, socket close and one request with no completed tool set",
+    "Native MCP edits are test-only immediate readback, exact reference and static error-category diagnostics; production credential handling is unchanged",
+    "Final related regression includes the preceding Responses implementation; earlier source witnesses remain historical, not a frozen current manifest",
+    "No dependencies, production services, real accounts, browser execution, deployment or Git writes changed"
+  ],
+  "unverified": [
+    "Root causes of this native credential failure and the earlier separate OAuth status absent result; passing reruns do not establish a fix",
+    "Opaque/encrypted Responses reasoning continuation, assistant phase replay and real-provider interoperability",
+    "Complete provider capability/configuration/account workflows and durable paid-request unknown/billing outcomes",
+    "Whole-project, platform/MSRV and release acceptance"
+  ]
+}

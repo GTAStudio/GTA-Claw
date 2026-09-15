@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "stage": "tui-typed-memory-commands-and-connection-bound-preflight",
+  "capturedAtUtc": "2026-09-14T17:10:51.9423655Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-tui/src/gateway.rs","sha256":"b6c203e3d17e487de73f114105d0d6f800e0056eda6603ca0397f51a079f7690"},
+    {"path":"apps/gta-claw-tui/src/lib.rs","sha256":"8a3e6797e184d6ab998afd376cac877d314227f2987377788e94ddfcc0c4ec13"},
+    {"path":"apps/gta-claw-tui/src/model.rs","sha256":"276f8002aad3575bdd5818ee15c7ffc3d783df4abfb6cb11cd1c12f90d2bfe2c"},
+    {"path":"apps/gta-claw-tui/src/render.rs","sha256":"8324002fa7625d930405769c3b8eaedf4f33003b037a09c7f089ed56c269ed97"},
+    {"path":"apps/gta-claw-tui/src/terminal.rs","sha256":"a7499b17ab81d3d9175fbea74c10ae534f65c8f2e411dcc382c0f9c92f6a4bb8"},
+    {"path":"apps/gta-claw-tui/tests/gateway_double.rs","sha256":"25fc7878c765f1fc4b2eac87d8bb754ba022ecbaa28c496ba8867dbaf6e80185"},
+    {"path":"apps/gta-claw-tui/tests/rendering.rs","sha256":"432f60fb31f913f3310eb47482877b11c93737cb540eeb523d15a8d4034a095d"}
+  ],
+  "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-tui --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":62, "failed":0, "ignored":0, "testBinaries":5,
+      "log":"target/native-memory-tui-tests-20260914T170925833Z.log",
+      "sha256":"fd6673b31fb2cceccc7e752c51ddb76e60a10ecb278e67ff276ab275edd90ac9"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-tui --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-memory-tui-clippy-20260914T171006743Z.log",
+      "sha256":"93e3bae0ab09e2e0c9e9f74877d38bbe44512b422290897e66252ceff405fa94"
+    }
+  ],
+  "behaviorEvidence": [
+    "memory_palette_keeps_case_data_revisions_and_unknown_retry_identity",
+    "memory_drafts_are_session_bound_and_paste_never_submits_or_truncates",
+    "memory_commands_validate_utf8_cursors_closed_archives_and_encoded_limits",
+    "native_tui_memory_preflights_capabilities_and_preserves_exact_submission",
+    "composer_tail_keeps_latest_wide_character_input_visible_at_small_widths"
+  ],
+  "notes": [
+    "Fifteen actual WebSocket/owned OS-profile scenarios cover seven actions and eight refusal/unknown cases",
+    "Typed commands share approvals, durable run results, reconciliation and exact ACK with native messages",
+    "Pre-send refusal cannot erase uncertainty from an earlier attempt; original command and key are retained",
+    "Bracketed-paste event handling is data-only and bounded, not a guarantee for unsupported physical terminals",
+    "Source witnesses were collected after tests and lint; the worktree and dependencies are not frozen",
+    "No dependency or protected compatibility policy changes; existing Cargo.lock witness retained"
+  ],
+  "unverified": [
+    "actual interactive-terminal and non-Windows protected-profile acceptance",
+    "durable client draft and unconfirmed-key crash recovery",
+    "automatic archive-page collection, encrypted local export and staged large imports",
+    "complete memory management pages, Slint integration and full provenance/deletion propagation",
+    "real accounts, external models, deployment and whole-project completion"
+  ]
+}

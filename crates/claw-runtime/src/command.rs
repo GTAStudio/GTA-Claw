@@ -822,6 +822,8 @@ pub enum DirectiveError {
     UnexpectedValue(String),
     /// The same directive appeared twice.
     Duplicate(String),
+    /// A directive value or combination violates its bounded native contract.
+    InvalidValue(String),
     /// A registry contained a blank or duplicated token.
     Malformed(String),
 }
@@ -835,12 +837,80 @@ impl Display for DirectiveError {
                 write!(formatter, "directive !{name} does not take a value")
             }
             Self::Duplicate(name) => write!(formatter, "directive !{name} appeared twice"),
+            Self::InvalidValue(name) => write!(
+                formatter,
+                "directive !{name} has invalid contents or cannot be combined with other input"
+            ),
             Self::Malformed(token) => write!(formatter, "malformed directive registry: {token}"),
         }
     }
 }
 
 impl Error for DirectiveError {}
+
+/// One explicit authenticated tool call that does not consult a model.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DirectTool {
+    name: String,
+    arguments: String,
+}
+
+impl fmt::Debug for DirectTool {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DirectTool")
+            .field("name", &self.name)
+            .field("arguments", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl DirectTool {
+    /// Decodes a bounded native tool envelope, retaining the original argument JSON.
+    ///
+    /// # Errors
+    /// Refuses invalid names, non-object arguments, ambiguous envelopes and excess size.
+    pub fn parse(encoded: &str) -> Result<Self, DirectiveError> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Envelope {
+            name: String,
+            arguments: Box<serde_json::value::RawValue>,
+        }
+        let invalid = || DirectiveError::InvalidValue("tool".to_owned());
+        if encoded.len() > 16 * 1024 {
+            return Err(invalid());
+        }
+        let envelope: Envelope = serde_json::from_str(encoded).map_err(|_| invalid())?;
+        if envelope.name.is_empty()
+            || envelope.name.len() > 128
+            || !envelope
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            || !serde_json::from_str::<serde_json::Value>(envelope.arguments.get())
+                .is_ok_and(|value| value.is_object())
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            name: envelope.name,
+            arguments: envelope.arguments.get().to_owned(),
+        })
+    }
+
+    /// Returns the exact requested tool name, without granting permission.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns unchanged JSON for the tool owner's final validation.
+    #[must_use]
+    pub fn arguments(&self) -> &str {
+        &self.arguments
+    }
+}
 
 /// Per-turn behaviour selected by directives.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -853,6 +923,10 @@ pub struct TurnOptions {
     pub quiet: bool,
     /// A durable goal to record before the turn runs.
     pub goal: Option<String>,
+    /// A single explicit tool command, mutually exclusive with model input/directives.
+    pub direct_tool: Option<DirectTool>,
+    /// Claims supplied by the authenticated host, never by an inline directive.
+    pub authority: Option<claw_application::ports::tool::InvocationAuthority>,
 }
 
 impl Default for TurnOptions {
@@ -862,6 +936,8 @@ impl Default for TurnOptions {
             tools_enabled: true,
             quiet: false,
             goal: None,
+            direct_tool: None,
+            authority: None,
         }
     }
 }
@@ -926,6 +1002,11 @@ impl DirectiveRegistry {
             DirectiveSpec::new(
                 "goal",
                 "Record a durable goal before running",
+                DirectiveValue::Required,
+            ),
+            DirectiveSpec::new(
+                "tool",
+                "Run one authenticated, policy-bound tool without a model",
                 DirectiveValue::Required,
             ),
         ])
@@ -1007,6 +1088,11 @@ impl DirectiveRegistry {
                 body_lines[first..=last].join("\n")
             });
 
+        if directives.iter().any(|directive| directive.name == "tool")
+            && (directives.len() != 1 || !body.is_empty())
+        {
+            return Err(DirectiveError::InvalidValue("tool".to_owned()));
+        }
         Ok(DirectiveScan { directives, body })
     }
 
@@ -1029,6 +1115,15 @@ impl DirectiveRegistry {
                 "no-tools" => options.tools_enabled = false,
                 "quiet" => options.quiet = true,
                 "goal" => options.goal.clone_from(&directive.value),
+                "tool" => {
+                    if directives.len() != 1 {
+                        return Err(DirectiveError::InvalidValue("tool".to_owned()));
+                    }
+                    options.direct_tool =
+                        Some(DirectTool::parse(directive.value.as_deref().ok_or_else(
+                            || DirectiveError::MissingValue("tool".to_owned()),
+                        )?)?);
+                }
                 _ => {}
             }
         }
@@ -1577,6 +1672,55 @@ mod tests {
     }
 
     #[test]
+    fn explicit_tool_directive_is_bounded_redacted_and_not_mixed_with_chat() {
+        let registry = DirectiveRegistry::builtin();
+        let input = r#"!tool {"name":"memory_notes","arguments":{"action":"save","content":"private-direct-tool\n!goal remains data"}}"#;
+        let scan = registry.scan(input).expect("direct tool input");
+        assert!(scan.body.is_empty());
+        let options = registry.apply(&scan.directives).expect("direct options");
+        let tool = options.direct_tool.as_ref().expect("direct tool");
+        assert_eq!(tool.name(), "memory_notes");
+        assert!(tool.arguments().contains("private-direct-tool"));
+        assert!(!format!("{options:?}").contains("private-direct-tool"));
+        assert!(options.authority.is_none());
+        for encoded in [
+            r#"{"name":"memory_notes","name":"other","arguments":{}}"#,
+            r#"{"name":"memory_notes","arguments":[],"owner":true}"#,
+            r#"{"name":"memory_notes","arguments":[]}"#,
+            r#"{"name":"../tool","arguments":{}}"#,
+        ] {
+            assert!(super::DirectTool::parse(encoded).is_err());
+        }
+        assert!(
+            super::DirectTool::parse(&format!(
+                "{}{{\"name\":\"memory_notes\",\"arguments\":{{}}}}",
+                " ".repeat(16 * 1024)
+            ))
+            .is_err()
+        );
+        for suffix in [
+            "\nchat text",
+            "\n!goal forbidden",
+            "\n!quiet",
+            "\n!no-tools",
+        ] {
+            assert!(registry.scan(&format!("{input}{suffix}")).is_err());
+        }
+        assert!(
+            registry
+                .scan(&format!("\\{input}"))
+                .expect("escaped input")
+                .directives
+                .is_empty()
+        );
+        let repeated = super::DirectTool::parse(
+            r#"{"name":"memory_notes","arguments":{"action":"list","action":"save"}}"#,
+        )
+        .expect("inner parameters stay raw for strict tool validation");
+        assert_eq!(repeated.arguments().matches("\"action\"").count(), 2);
+    }
+
+    #[test]
     fn directives_are_lifted_out_of_the_body() {
         let registry = DirectiveRegistry::builtin();
         let scan = registry
@@ -1717,6 +1861,8 @@ mod tests {
                 tools_enabled: false,
                 quiet: true,
                 goal: Some("finish the crate".to_owned()),
+                direct_tool: None,
+                authority: None,
             }
         );
         assert_eq!(scan.body, "run it");
@@ -1735,6 +1881,8 @@ mod tests {
                 tools_enabled: true,
                 quiet: false,
                 goal: None,
+                direct_tool: None,
+                authority: None,
             }
         );
         assert_eq!(scan.body, "just do it");

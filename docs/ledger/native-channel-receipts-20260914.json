@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "stage": "immutable-per-segment-channel-receipts-and-read-only-recovery-pages",
+  "capturedAtUtc": "2026-09-14T19:12:53.9635051Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-state/src/lib.rs","sha256":"dde6e26d10c2b0cd31f5bd99ea4158bf4b9cad176336552150a157d0275375a3"},
+    {"path":"crates/claw-state/src/runs.rs","sha256":"fe3f2be85e3aff65f987de69aa96ea9d44b3313130cbfd345ab8fcfceac3cc48"},
+    {"path":"apps/gta-claw-daemon/src/adapters/channels.rs","sha256":"93fbd70745b833da0d5c80410a5a0d1bd2faf819f2a499196f77fc7bd798cff6"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"07a852465c83eebdf79ff0bd1850be9a84f536b8965dcc69079c7f0d2d08401a"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"31968b81cdbf8bfa3172b4927027d8f2ddacfa9483c935f89d6d77c70d48bf6c"}
+  ],
+  "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p claw-channels -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":321, "failed":0, "ignored":4, "testBinaries":17,
+      "log":"target/native-channel-receipts-tests-20260914T191122293Z.log",
+      "sha256":"6209cc11b951c32df13619c221927d0118f3bd8738e4d90f87a4b72515d2aa5f"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-channel-receipts-clippy-20260914T191241068Z.log",
+      "sha256":"11c45644dac8fffbb2b9a9c1a6041c725926360c446d0e86660c1a7d32661e74"
+    }
+  ],
+  "behaviorEvidence": [
+    "delivery_segment_receipts_are_ordered_immutable_owned_and_survive_unknown_restart",
+    "process_exit_at_each_run_boundary_never_replays_claimed_work_or_loses_unacked_results",
+    "discord_segment_receipts_survive_partial_delivery_and_closed_storage_stops_sends",
+    "telegram_processing_loop_retains_failed_delivery_batch_without_resending",
+    "bound_native_workspace_tools_require_bound_approval_and_record_safe_audit"
+  ],
+  "notes": [
+    "Each remote acknowledgement is committed under the exact sending claim before the next segment",
+    "Receipt contents are metadata only: remote ID, segment number, byte count and raw UTF-8 SHA-256",
+    "Partial or failed storage cannot authorize replay; missing receipts do not prove absence of external effects",
+    "Eight independent process-exit boundaries include a committed segment receipt before overall settlement",
+    "Read-only channels.status uses exact owner/run and a bounded deliveryAfter cursor",
+    "No new dependencies or changes to the existing Cargo.lock witness"
+  ],
+  "unverified": [
+    "real channel accounts, remote cryptographic proof or external exactly-once delivery",
+    "full remote reconciliation and bulk receipt-export workflows",
+    "dormant-queue approved recovery beyond provider retention and complete account lifecycle",
+    "physical power-loss, cross-platform acceptance, deployment and whole-project completion"
+  ]
+}

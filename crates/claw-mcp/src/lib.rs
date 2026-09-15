@@ -15,7 +15,7 @@ mod secure_random;
 pub mod server;
 pub mod sse;
 
-pub use http_client::HttpClientError;
+pub use http_client::{HttpClientError, HttpRoutePolicy};
 pub use rmcp::model;
 
 pub(crate) fn is_literal_loopback_host(host: &str) -> bool {

@@ -70,6 +70,78 @@ impl SecretStore for WindowsCredentialManagerStore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn independent_native_handles_isolate_concurrent_credential_lifecycles() {
+        use std::sync::{Arc, Barrier};
+
+        struct OwnedCredential {
+            store: WindowsCredentialManagerStore,
+            key: CredentialKey,
+        }
+
+        impl Drop for OwnedCredential {
+            fn drop(&mut self) {
+                let _ = self.store.delete(&self.key);
+            }
+        }
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("fixture clock")
+            .as_nanos();
+        let barriers: [Arc<Barrier>; 3] = std::array::from_fn(|_| Arc::new(Barrier::new(4)));
+        let credentials: Vec<_> = (0..4)
+            .map(|ordinal| {
+                let owned = OwnedCredential {
+                    store: WindowsCredentialManagerStore::new().expect("owned native store"),
+                    key: CredentialKey::new(
+                        "gta-claw.test.concurrent-native",
+                        format!("owned-{}-{nonce}-{ordinal}", std::process::id()),
+                    )
+                    .expect("unique owned key"),
+                };
+                let reader = WindowsCredentialManagerStore::new().expect("independent reader");
+                assert!(
+                    owned
+                        .store
+                        .get(&owned.key)
+                        .expect("unique key preflight")
+                        .is_none()
+                );
+                (owned, reader)
+            })
+            .collect();
+        std::thread::scope(|threads| {
+            let mut workers = Vec::new();
+            for (ordinal, (owned, reader)) in credentials.into_iter().enumerate() {
+                let barriers = barriers.clone();
+                workers.push(threads.spawn(move || {
+                    let mut stages = Vec::new();
+                    for generation in 0..4 {
+                        let value = SecretString::new(format!("owned-synthetic-{ordinal}-{generation}"));
+                        let set = owned.store.set(&owned.key, &value);
+                        barriers[0].wait();
+                        let same = owned.store.get(&owned.key);
+                        let independent = reader.get(&owned.key);
+                        barriers[1].wait();
+                        stages.push(set.is_ok()
+                            && same.as_ref().is_ok_and(|observed| observed.as_ref() == Some(&value))
+                            && independent.as_ref().is_ok_and(|observed| observed.as_ref() == Some(&value)));
+                    }
+                    let deleted = owned.store.delete(&owned.key);
+                    barriers[2].wait();
+                    let absent = reader.get(&owned.key);
+                    assert!(stages.iter().all(|stage| *stage), "native handle write/readback mismatch for owned fixture {ordinal}: {stages:?}");
+                    assert!(matches!(deleted, Ok(true)), "owned fixture deletion {ordinal}: {deleted:?}");
+                    assert!(matches!(absent, Ok(None)), "owned fixture deletion readback {ordinal}, presence or static error: {:?}", absent.map(|value| value.is_some()));
+                }));
+            }
+            for worker in workers {
+                worker.join().expect("owned credential worker");
+            }
+        });
+    }
+
     /// Exercises the real Credential Manager round trip.
     ///
     /// The key is namespaced to this test and removed afterwards, so the run

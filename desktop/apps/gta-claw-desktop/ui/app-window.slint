@@ -62,6 +62,7 @@ export component AppWindow inherits Window {
     in-out property <bool> token-reset-selector: false;
     in-out property <bool> token-preserve-focus: false;
     in-out property <bool> consent-checked: false;
+    in-out property <bool> remember-device: false;
     in property <length> layout-width: root.width;
     out property <bool> narrow-layout: root.layout-width < 900px;
     out property <string> connection-focused-action: "";
@@ -166,6 +167,12 @@ export component AppWindow inherits Window {
     in property <string> session-detail: "";
     in property <int> session-tone: 0;
     in property <bool> can-approve: false;
+    in property <bool> can-abort: false;
+    in property <bool> can-send-message: true;
+    in property <string> memory-binding: "";
+    in property <bool> can-retry-memory: false;
+    in property <string> memory-result: "";
+    in-out property <bool> memory-open: false;
     in property <bool> can-answer: false;
     in property <string> approval-prompt: "";
     in property <string> approval-scope: "";
@@ -210,6 +217,9 @@ export component AppWindow inherits Window {
     callback approval-requested(bool);
     callback answer-requested(string);
     callback message-submitted(string);
+    callback memory-submitted(string, int, string, int, string, string, string, bool);
+    callback memory-retry-requested(string);
+    callback abort-requested;
     callback file-selected(int);
     callback schedule-create-requested();
     callback schedule-toggled(int);
@@ -376,6 +386,7 @@ export component AppWindow inherits Window {
         token-reset-selector: root.token-reset-selector;
         token-preserve-focus: root.token-preserve-focus;
         consent-checked <=> root.consent-checked;
+        remember-device <=> root.remember-device;
         connect-requested(endpoint, token, consent) => {
             root.connect-requested(endpoint, token, consent);
         }
@@ -423,6 +434,12 @@ export component AppWindow inherits Window {
         session-detail: root.session-detail;
         session-tone: root.session-tone;
         can-approve: root.can-approve;
+        can-abort: root.can-abort;
+        can-send-message: root.can-send-message;
+        memory-binding: root.memory-binding;
+        can-retry-memory: root.can-retry-memory;
+        memory-result: root.memory-result;
+        memory-open <=> root.memory-open;
         can-answer: root.can-answer;
         approval-prompt: root.approval-prompt;
         approval-scope: root.approval-scope;
@@ -465,6 +482,9 @@ export component AppWindow inherits Window {
         approval-requested(approved) => { root.approval-requested(approved); }
         answer-requested(answer) => { root.answer-requested(answer); }
         message-submitted(message) => { root.message-submitted(message); }
+        memory-submitted(binding, action, id, kind, revision, offset, content, overwrite) => { root.memory-submitted(binding, action, id, kind, revision, offset, content, overwrite); }
+        memory-retry-requested(binding) => { root.memory-retry-requested(binding); }
+        abort-requested => { root.abort-requested(); }
         file-selected(index) => { root.file-selected(index); }
         schedule-create-requested => { root.schedule-create-requested(); }
         schedule-toggled(index) => { root.schedule-toggled(index); }

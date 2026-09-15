@@ -267,6 +267,7 @@ struct EnvelopeInner {
     payload: OpaqueJson,
     encoded_len: usize,
     audience: EventAudience,
+    device_id: Option<String>,
     visibility: EventVisibility,
     session_id: Option<String>,
     state_version: Option<StateVersion>,
@@ -340,6 +341,7 @@ pub struct EventDraft {
     payload: OpaqueJson,
     encoded_len: usize,
     audience: EventAudience,
+    device_id: Option<String>,
     visibility: EventVisibility,
     session_id: Option<String>,
     state_version: Option<StateVersion>,
@@ -357,6 +359,26 @@ impl EventDraft {
     /// serialize to JSON.
     pub fn broadcast<T: Serialize>(event: &str, payload: &T) -> Result<Self, EventError> {
         Self::build(event, payload, EventAudience::Broadcast)
+    }
+
+    /// Creates a scope-filtered publication for every current connection of one verified device.
+    ///
+    /// The routing identity is host metadata and is never added to the wire payload.
+    ///
+    /// # Errors
+    /// Returns the failures from [`Self::broadcast`], or [`EventError::InvalidDevice`] for an
+    /// empty, oversized or control-bearing identity.
+    pub fn for_device<T: Serialize>(
+        event: &str,
+        payload: &T,
+        device_id: &str,
+    ) -> Result<Self, EventError> {
+        if !valid_device_id(device_id) {
+            return Err(EventError::InvalidDevice);
+        }
+        let mut draft = Self::broadcast(event, payload)?;
+        draft.device_id = Some(device_id.to_owned());
+        Ok(draft)
     }
 
     /// Creates a draft addressed to exactly one connection.
@@ -395,6 +417,7 @@ impl EventDraft {
             payload,
             encoded_len,
             audience,
+            device_id: None,
             visibility,
             session_id: None,
             state_version: None,
@@ -425,6 +448,8 @@ impl EventDraft {
 /// A publication or catalog failure.
 #[derive(Clone, Debug)]
 pub enum EventError {
+    /// A device-scoped event has no valid bounded routing identity.
+    InvalidDevice,
     /// The identity is outside the frozen 33-event catalog.
     UnknownEvent(String),
     /// The identity is only emitted by the pre-authentication handshake.
@@ -436,6 +461,7 @@ pub enum EventError {
 impl std::fmt::Display for EventError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidDevice => formatter.write_str("invalid gateway event device identity"),
             Self::UnknownEvent(name) => write!(formatter, "unknown gateway event `{name}`"),
             Self::HandshakeOnly(name) => {
                 write!(formatter, "`{name}` is only emitted during the handshake")
@@ -485,6 +511,7 @@ impl LagState {
 #[derive(Debug)]
 struct Subscriber {
     id: ConnectionId,
+    device_id: Option<String>,
     role: Role,
     scopes: Vec<OperatorScope>,
     filter: Arc<Mutex<TopicFilter>>,
@@ -545,6 +572,38 @@ impl EventBus {
         scopes: Vec<OperatorScope>,
         filter: Arc<Mutex<TopicFilter>>,
     ) -> EventSubscription {
+        self.subscribe_bound(id, role, scopes, filter, None)
+    }
+
+    /// Registers a verified device connection for matching device-scoped publications.
+    ///
+    /// An invalid host-supplied identity receives no device-scoped events. Catalog scope checks
+    /// and topic filters still apply; binding an identity does not grant authorization.
+    pub fn subscribe_for_device(
+        &self,
+        id: ConnectionId,
+        role: Role,
+        scopes: Vec<OperatorScope>,
+        filter: Arc<Mutex<TopicFilter>>,
+        device_id: &str,
+    ) -> EventSubscription {
+        self.subscribe_bound(
+            id,
+            role,
+            scopes,
+            filter,
+            valid_device_id(device_id).then(|| device_id.to_owned()),
+        )
+    }
+
+    fn subscribe_bound(
+        &self,
+        id: ConnectionId,
+        role: Role,
+        scopes: Vec<OperatorScope>,
+        filter: Arc<Mutex<TopicFilter>>,
+        device_id: Option<String>,
+    ) -> EventSubscription {
         let (sender, receiver) = mpsc::channel(self.inner.queue_capacity);
         let lag = Arc::new(LagState {
             first_missed: AtomicU64::new(0),
@@ -554,6 +613,7 @@ impl EventBus {
         subscribers.retain(|subscriber| subscriber.id != id);
         subscribers.push(Subscriber {
             id,
+            device_id,
             role,
             scopes,
             filter,
@@ -633,6 +693,7 @@ impl EventBus {
                 payload: draft.payload,
                 encoded_len: draft.encoded_len,
                 audience: draft.audience,
+                device_id: draft.device_id,
                 visibility: draft.visibility,
                 session_id: draft.session_id,
                 state_version: draft.state_version,
@@ -643,6 +704,14 @@ impl EventBus {
         let mut subscribers = self.subscribers();
         let mut lagged = Vec::new();
         for subscriber in subscribers.iter() {
+            if envelope
+                .inner
+                .device_id
+                .as_ref()
+                .is_some_and(|device| subscriber.device_id.as_ref() != Some(device))
+            {
+                continue;
+            }
             if let EventAudience::Connection(target) = envelope.audience()
                 && target != subscriber.id
             {
@@ -688,6 +757,10 @@ impl EventBus {
         drop(subscribers);
         ordinal
     }
+}
+
+fn valid_device_id(device_id: &str) -> bool {
+    !device_id.is_empty() && device_id.len() <= 256 && !device_id.chars().any(char::is_control)
 }
 
 /// One delivery observed by a subscribed connection.
@@ -1095,6 +1168,72 @@ mod tests {
     }
 
     #[test]
+    fn device_scoped_events_reach_only_matching_authorized_connections() {
+        let bus = EventBus::new(8, 16 * 1024);
+        let filter = || Arc::new(Mutex::new(TopicFilter::default()));
+        let mut first = bus.subscribe_for_device(
+            ConnectionId::new(1),
+            Role::Operator,
+            vec![OperatorScope::Read],
+            filter(),
+            "owner",
+        );
+        let mut second = bus.subscribe_for_device(
+            ConnectionId::new(2),
+            Role::Operator,
+            vec![OperatorScope::Read],
+            filter(),
+            "owner",
+        );
+        let mut other = bus.subscribe_for_device(
+            ConnectionId::new(3),
+            Role::Operator,
+            vec![OperatorScope::Admin],
+            filter(),
+            "other",
+        );
+        let mut unbound = bus.subscribe(
+            ConnectionId::new(4),
+            Role::Operator,
+            vec![OperatorScope::Admin],
+            filter(),
+        );
+        let mut no_scope = bus.subscribe_for_device(
+            ConnectionId::new(5),
+            Role::Operator,
+            Vec::new(),
+            filter(),
+            "owner",
+        );
+        bus.publish(
+            EventDraft::for_device("chat", &serde_json::json!({"runId":"private-run"}), "owner")
+                .expect("device draft"),
+        );
+        bus.publish(
+            EventDraft::broadcast("tick", &serde_json::json!({})).expect("public control event"),
+        );
+        for subscription in [&mut first, &mut second] {
+            let Some(Delivery::Event(envelope)) = subscription.try_recv() else {
+                panic!("owner event missing");
+            };
+            assert_eq!(envelope.name(), "chat");
+        }
+        for subscription in [&mut other, &mut unbound, &mut no_scope] {
+            let Some(Delivery::Event(envelope)) = subscription.try_recv() else {
+                panic!("control event missing");
+            };
+            assert_eq!(
+                envelope.name(),
+                "tick",
+                "another device or missing scope cannot receive private event"
+            );
+            assert!(subscription.try_recv().is_none());
+        }
+        assert!(EventDraft::for_device("chat", &serde_json::json!({}), "").is_err());
+        assert!(EventDraft::for_device("chat", &serde_json::json!({}), "invalid\n").is_err());
+    }
+
+    #[test]
     fn topic_filter_default_admits_every_group() {
         let filter = TopicFilter::default();
         assert!(filter.sessions().is_empty());
@@ -1108,6 +1247,7 @@ mod tests {
                 payload: draft.payload,
                 encoded_len: draft.encoded_len,
                 audience: draft.audience,
+                device_id: draft.device_id,
                 visibility: draft.visibility,
                 session_id: draft.session_id,
                 state_version: draft.state_version,

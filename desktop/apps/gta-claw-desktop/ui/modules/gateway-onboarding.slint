@@ -92,6 +92,7 @@ component ConnectionForm {
     in property <bool> token-reset-selector;
     in property <bool> token-preserve-focus;
     in-out property <bool> consent-checked;
+    in-out property <bool> remember-device;
     in property <bool> busy;
     in property <bool> can-connect;
     in property <bool> can-disconnect;
@@ -169,8 +170,14 @@ component ConnectionForm {
         }
 
         CheckBox {
-            text: "I consent to a new ephemeral device identity for this diagnostic session.";
+            text: "I consent to device identity, Gateway chat and approval access.";
             checked <=> root.consent-checked;
+            enabled: !root.busy && !root.can-disconnect;
+        }
+
+        CheckBox {
+            text: @tr("Remember this device");
+            checked <=> root.remember-device;
             enabled: !root.busy && !root.can-disconnect;
         }
 
@@ -320,6 +327,7 @@ export component GatewayOnboardingSurface inherits FocusScope {
     in property <bool> token-reset-selector;
     in property <bool> token-preserve-focus;
     in-out property <bool> consent-checked;
+    in-out property <bool> remember-device;
     out property <bool> narrow-layout: root.available-width < 900px;
     out property <bool> endpoint-has-focus: connection-form.endpoint-has-focus;
     out property <bool> token-has-focus: connection-form.token-has-focus;
@@ -523,6 +531,7 @@ export component GatewayOnboardingSurface inherits FocusScope {
                         token-reset-selector: root.token-reset-selector;
                         token-preserve-focus: root.token-preserve-focus;
                         consent-checked <=> root.consent-checked;
+                        remember-device <=> root.remember-device;
                         busy: root.busy;
                         can-connect: root.can-connect;
                         can-disconnect: root.can-disconnect;

@@ -19,6 +19,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -215,11 +216,26 @@ pub enum WriteMode {
 }
 
 /// Confinement root for every filesystem tool.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Sandbox {
     root: PathBuf,
     limits: SandboxLimits,
+    root_pin: Option<Arc<DirectoryPin>>,
 }
+
+impl PartialEq for Sandbox {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.limits == other.limits
+            && match (&self.root_pin, &other.root_pin) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for Sandbox {}
 
 impl Sandbox {
     /// Canonicalizes and adopts an existing directory as the workspace root.
@@ -239,7 +255,40 @@ impl Sandbox {
         Ok(Self {
             root: canonical,
             limits,
+            root_pin: None,
         })
+    }
+
+    /// Adopts a root whose original directory and canonical ancestors remain pinned.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::new`] or refuses ancestors that cannot be safely opened.
+    pub fn new_pinned(root: &Path, limits: SandboxLimits) -> Result<Self, SandboxError> {
+        let mut sandbox = Self::new(root, limits)?;
+        let ancestors: Vec<_> = sandbox.root.ancestors().collect();
+        if ancestors.len() > 128 {
+            return Err(SandboxError::TooManyComponents);
+        }
+        let mut levels = Vec::with_capacity(ancestors.len());
+        for ancestor in ancestors.into_iter().rev() {
+            levels.push(pin_directory(ancestor)?);
+        }
+        let pin = DirectoryPin { levels };
+        pin.verify()?;
+        sandbox.root_pin = Some(Arc::new(pin));
+        sandbox.validate_root()?;
+        Ok(sandbox)
+    }
+
+    /// Revalidates the original root identity before binding a resource for approval.
+    ///
+    /// # Errors
+    /// Rejects disappeared, replaced or redirected pinned roots and ancestors.
+    pub fn validate_root(&self) -> Result<(), SandboxError> {
+        if let Some(pin) = &self.root_pin {
+            pin.verify()?;
+        }
+        self.verify_canonical(&self.root, &[])
     }
 
     /// Returns the canonical workspace root.
@@ -465,6 +514,40 @@ impl Sandbox {
         Ok(buffer)
     }
 
+    /// Creates an exclusive read/write output handle without replacing any existing object.
+    ///
+    /// The caller owns stream byte limits and durable flushing, and must retain this pinned sandbox
+    /// until publication. This is for bounded host-owned streaming, not an unbounded tool grant.
+    ///
+    /// # Errors
+    /// Refuses existing targets, links, unsafe ancestors or changed file identities before content
+    /// is written. New Unix files are owner-only; Windows files inherit the trusted parent ACL.
+    pub fn create_new_file(&self, path: &RelativePath) -> Result<File, SandboxError> {
+        let prepared = self.prepare_write(path, WriteMode::CreateNew)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        apply_no_follow(&mut options);
+        let file = options
+            .open(&prepared.absolute)
+            .map_err(|error| map_io(&error))?;
+        let verified = verify_handle_is_not_reparse_point(&file)
+            .and_then(|()| verify_single_link(&file))
+            .and_then(|()| self.verify_canonical(&prepared.absolute, &path.components))
+            .and_then(|()| prepared.pin.verify())
+            .and_then(|()| verify_handle_matches_path(&file, &prepared.absolute));
+        if let Err(error) = verified {
+            drop(file);
+            remove_own_empty_file(&prepared.absolute);
+            return Err(error);
+        }
+        Ok(file)
+    }
+
     /// Writes a whole file, refusing links, escapes, and oversized content.
     ///
     /// Ordering is the security property. The target is opened with no
@@ -513,6 +596,7 @@ impl Sandbox {
             .open(&prepared.absolute)
             .map_err(|error| map_io(&error))?;
         let verified = verify_handle_is_not_reparse_point(&file)
+            .and_then(|()| verify_single_link(&file))
             .and_then(|()| self.verify_canonical(&prepared.absolute, &path.components))
             .and_then(|()| prepared.pin.verify())
             .and_then(|()| verify_handle_matches_path(&file, &prepared.absolute));
@@ -633,6 +717,40 @@ impl Sandbox {
     /// [`SandboxError::RaceDetected`] when an ancestor or the opened handle
     /// stopped matching the validated path between check and use.
     pub fn open_no_follow(&self, resolved: &ResolvedPath) -> Result<File, SandboxError> {
+        self.open_existing_handle(resolved, false, false)
+    }
+
+    /// Opens an existing read/write host file without creation, truncation or path redirection.
+    ///
+    /// The caller owns transaction semantics and must retain this pinned sandbox through the I/O.
+    ///
+    /// # Errors
+    /// Applies the same file identity, hard-link and ancestor checks as [`Self::open_no_follow`].
+    pub fn open_existing_for_update(&self, resolved: &ResolvedPath) -> Result<File, SandboxError> {
+        self.open_existing_handle(resolved, true, false)
+    }
+
+    /// Opens a verified host coordination file for read/write and later advisory locking.
+    ///
+    /// On Windows, the handle prevents rename/deletion until closed. Other platforms
+    /// retain the ordinary no-follow identity checks and require a trusted lock directory.
+    /// The caller must retain this pinned sandbox and must not remove live lock files.
+    ///
+    /// # Errors
+    /// Applies the same identity, hard-link and ancestor checks as [`Self::open_no_follow`].
+    pub fn open_existing_for_coordination(
+        &self,
+        resolved: &ResolvedPath,
+    ) -> Result<File, SandboxError> {
+        self.open_existing_handle(resolved, true, true)
+    }
+
+    fn open_existing_handle(
+        &self,
+        resolved: &ResolvedPath,
+        writable: bool,
+        stable_path: bool,
+    ) -> Result<File, SandboxError> {
         let components = &resolved.relative.components;
         let Some(leaf) = components.last() else {
             return Err(SandboxError::NotAFile);
@@ -640,10 +758,17 @@ impl Sandbox {
         let pin = self.pin_ancestors(&components[..components.len() - 1])?;
         let absolute = pin.path().join(leaf);
         let mut options = OpenOptions::new();
-        options.read(true);
+        options.read(true).write(writable);
         apply_no_follow(&mut options);
+        #[cfg(windows)]
+        if stable_path {
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
+        #[cfg(not(windows))]
+        let _ = stable_path;
         let file = options.open(&absolute).map_err(|error| map_io(&error))?;
         verify_handle_is_not_reparse_point(&file)?;
+        verify_single_link(&file)?;
         self.verify_canonical(&absolute, components)?;
         pin.verify()?;
         // Last, because it is the only check that can see an ancestor swap
@@ -686,8 +811,19 @@ impl Sandbox {
         if components.len() > self.limits.max_path_components {
             return Err(SandboxError::TooManyComponents);
         }
+        if let Some(pin) = &self.root_pin {
+            pin.verify()?;
+        }
         let mut levels = Vec::with_capacity(components.len() + 1);
-        levels.push(pin_directory(&self.root)?);
+        let root = pin_directory(&self.root)?;
+        #[cfg(unix)]
+        if let Some(pin) = &self.root_pin
+            && root.identity
+                != identity_of(&pin.handle()?.metadata().map_err(|error| map_io(&error))?)
+        {
+            return Err(SandboxError::RaceDetected);
+        }
+        levels.push(root);
         let mut absolute = self.root.clone();
         for component in components {
             absolute.push(component);
@@ -985,6 +1121,25 @@ fn verify_handle_is_not_reparse_point(file: &File) -> Result<(), SandboxError> {
     }
 }
 
+fn verify_single_link(file: &File) -> Result<(), SandboxError> {
+    #[cfg(unix)]
+    let links = {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata().map_err(|error| map_io(&error))?.nlink()
+    };
+    #[cfg(windows)]
+    let links = winapi_util::file::information(file)
+        .map_err(|error| map_io(&error))?
+        .number_of_links();
+    #[cfg(not(any(unix, windows)))]
+    let links = 0;
+    if links == 1 {
+        Ok(())
+    } else {
+        Err(SandboxError::HardLinksForbidden)
+    }
+}
+
 #[cfg(not(windows))]
 fn verify_handle_is_not_reparse_point(file: &File) -> Result<(), SandboxError> {
     let metadata = file.metadata().map_err(|error| map_io(&error))?;
@@ -1028,7 +1183,11 @@ fn verify_handle_matches_path(file: &File, absolute: &Path) -> Result<(), Sandbo
 /// detection, and it is why no identity comparison is needed here; Windows also
 /// exposes no stable file identity on stable Rust.
 #[cfg(not(unix))]
-fn verify_handle_matches_path(_file: &File, _absolute: &Path) -> Result<(), SandboxError> {
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "The shared fallible signature matches Unix; Windows pins ancestors without delete sharing."
+)]
+const fn verify_handle_matches_path(_file: &File, _absolute: &Path) -> Result<(), SandboxError> {
     Ok(())
 }
 
@@ -1319,6 +1478,8 @@ pub enum SandboxError {
     TrailingDotOrSpace,
     /// A symbolic link, junction, or reparse point was on the path.
     SymlinkForbidden,
+    /// A file had multiple hard links or its link count could not be trusted.
+    HardLinksForbidden,
     /// An ancestor directory changed identity between validation and use.
     RaceDetected,
     /// The resolved path left the workspace root.
@@ -1370,6 +1531,9 @@ impl Display for SandboxError {
                 "leading or trailing spaces and trailing dots are forbidden"
             }
             Self::SymlinkForbidden => "links, junctions, and reparse points are forbidden",
+            Self::HardLinksForbidden => {
+                "files with multiple or unverified hard links are forbidden"
+            }
             Self::RaceDetected => "a directory on the path changed between validation and use",
             Self::EscapesRoot => "path escapes the workspace root",
             Self::CaseMismatch => "path casing does not match the on-disk name",

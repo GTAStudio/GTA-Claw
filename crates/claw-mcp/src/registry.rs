@@ -218,7 +218,7 @@ impl fmt::Debug for ServerTransportConfig {
             } => formatter
                 .debug_struct("Stdio")
                 .field("command", command)
-                .field("arguments", arguments)
+                .field("argument_count", &arguments.len())
                 .field(
                     "environment",
                     &environment.keys().map(String::as_str).collect::<Vec<_>>(),

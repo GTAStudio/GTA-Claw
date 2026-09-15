@@ -1,9 +1,9 @@
-//! Process-level checks for unsupported CLI commands.
+//! Process-level checks for incomplete native CLI commands.
 
 use std::process::Command;
 
 #[test]
-fn send_exits_nonzero_without_claiming_acceptance() {
+fn send_without_connection_options_exits_nonzero_without_claiming_acceptance() {
     let output = Command::new(env!("CARGO_BIN_EXE_gta-claw-cli"))
         .args(["send", "session-9", "hello"])
         .output()
@@ -13,6 +13,6 @@ fn send_exits_nonzero_without_claiming_acceptance() {
     assert!(output.stdout.is_empty());
 
     let error = String::from_utf8(output.stderr).expect("stderr is UTF-8");
-    assert!(error.contains("unsupported operation: message transport is not configured"));
+    assert!(error.contains("send requires an explicit --idempotency-key"));
     assert!(!error.contains("accepted"));
 }

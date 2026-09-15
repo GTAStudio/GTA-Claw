@@ -603,6 +603,10 @@ impl AuthorizationSource for GatewayPairingAuthorization {
     fn current_grant(&self, device_wire_id: &str) -> Option<Grant> {
         self.runtime.devices.current_grant(device_wire_id)
     }
+
+    fn current_lease(&self, device_wire_id: &str) -> Option<claw_gateway::AuthorizationLease> {
+        self.runtime.devices.current_lease(device_wire_id)
+    }
 }
 
 /// Authentication adapter that turns verified unpaired devices into durable
@@ -1398,22 +1402,25 @@ mod tests {
 
     #[cfg(windows)]
     fn windows_short_path(path: &Path) -> Option<PathBuf> {
+        use std::os::windows::process::CommandExt;
+
         let display = path.to_string_lossy();
-        let command_path = if let Some(path) = display.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{path}")
-        } else {
-            display
-                .strip_prefix(r"\\?\")
-                .unwrap_or(display.as_ref())
-                .to_owned()
-        };
+        let command_path = display.strip_prefix(r"\\?\UNC\").map_or_else(
+            || {
+                display
+                    .strip_prefix(r"\\?\")
+                    .unwrap_or_else(|| display.as_ref())
+                    .to_owned()
+            },
+            |path| format!(r"\\{path}"),
+        );
         assert!(
-            !command_path.contains('"'),
-            "pairing test path must not contain a quote"
+            !command_path.contains(['"', '%', '\r', '\n']),
+            "pairing test path must not contain command interpolation characters"
         );
         let output = Command::new("cmd.exe")
-            .args(["/D", "/S", "/C"])
-            .arg(format!(r#"for %I in ("{command_path}") do @echo %~sI"#))
+            .args(["/D", "/U", "/V:OFF", "/C"])
+            .raw_arg(format!(r#"for %I in ("{command_path}") do @echo %~sI"#))
             .output()
             .expect("short-name query starts");
         assert!(
@@ -1421,7 +1428,16 @@ mod tests {
             "short-name query failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let short = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let (pairs, trailing) = output.stdout.as_chunks::<2>();
+        assert!(trailing.is_empty(), "short-name output must be UTF-16");
+        let units = pairs
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect::<Vec<_>>();
+        let short = String::from_utf16(&units)
+            .expect("UTF-16 short-name output")
+            .trim()
+            .to_owned();
         if short.is_empty() || short.eq_ignore_ascii_case(&command_path) {
             return None;
         }

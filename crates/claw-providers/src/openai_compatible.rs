@@ -8,7 +8,7 @@
 //! behaviour in this module is tested against recorded byte fixtures without a
 //! network.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::pin::Pin;
 
 use bytes::Bytes;
@@ -42,6 +42,7 @@ pub const DONE_SENTINEL: &str = "[DONE]";
 
 /// Providers known to require `stream_options.include_usage` for stream usage.
 const STREAM_USAGE_OPT_IN: [&str; 1] = ["openai"];
+const MAX_COMPLETION_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// How the API key is presented to the service.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +53,26 @@ pub enum AuthStyle {
     Header(String),
     /// The service takes no credential.
     None,
+}
+
+/// Explicitly selected completion wire protocol; no endpoint fallback is attempted.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionDialect {
+    /// The default `chat/completions` protocol.
+    #[default]
+    ChatCompletions,
+    /// Stateless `responses` requests with server-side storage disabled.
+    Responses,
+}
+
+impl CompletionDialect {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat/completions",
+            Self::Responses => "responses",
+        }
+    }
 }
 
 /// Configuration of one OpenAI-compatible endpoint.
@@ -95,6 +116,7 @@ pub struct OpenAiCompatible {
     extra_headers: Vec<(String, String)>,
     capabilities: CapabilitySet,
     stream_usage: bool,
+    completion_dialect: CompletionDialect,
     runtime: ProviderRuntime,
 }
 
@@ -152,6 +174,7 @@ impl OpenAiCompatible {
             extra_headers: config.extra_headers,
             capabilities: config.capabilities,
             stream_usage: config.stream_usage,
+            completion_dialect: CompletionDialect::default(),
             runtime,
         })
     }
@@ -342,6 +365,19 @@ impl OpenAiCompatible {
         &self.auth
     }
 
+    /// Selects the completion dialect without changing the enrolled credential origin.
+    #[must_use]
+    pub const fn with_completion_dialect(mut self, dialect: CompletionDialect) -> Self {
+        self.completion_dialect = dialect;
+        self
+    }
+
+    /// Returns the explicitly selected completion protocol.
+    #[must_use]
+    pub const fn completion_dialect(&self) -> CompletionDialect {
+        self.completion_dialect
+    }
+
     /// Replaces the reliability runtime.
     ///
     /// This is the seam tests use to drive retry and circuit policies with a
@@ -457,8 +493,13 @@ impl Provider for OpenAiCompatible {
         Box::pin(async move {
             self.check_capability(Capability::Completion, Operation::Complete)?;
             validate(self.id.as_str(), request, Operation::Complete)?;
-            let url = self.endpoint("chat/completions")?;
-            let body = encode_completion(request, false, false)?;
+            let url = self.endpoint(self.completion_dialect.path())?;
+            let body = match self.completion_dialect {
+                CompletionDialect::ChatCompletions => encode_completion(request, false, false)?,
+                CompletionDialect::Responses => {
+                    crate::responses::encode_completion(self.id.as_str(), request, false)?
+                }
+            };
             self.runtime
                 .execute_decoded(
                     Operation::Complete,
@@ -468,7 +509,14 @@ impl Provider for OpenAiCompatible {
                             .request(Method::Post, url.clone())?
                             .body(Body::Json(body.clone())))
                     },
-                    |response| decode_completion(self.id.as_str(), response.body()),
+                    |response| match self.completion_dialect {
+                        CompletionDialect::ChatCompletions => {
+                            decode_completion(self.id.as_str(), response.body())
+                        }
+                        CompletionDialect::Responses => {
+                            crate::responses::decode_completion(self.id.as_str(), response.body())
+                        }
+                    },
                 )
                 .await
         })
@@ -482,8 +530,16 @@ impl Provider for OpenAiCompatible {
         Box::pin(async move {
             self.check_capability(Capability::Streaming, Operation::StreamCompletion)?;
             validate(self.id.as_str(), request, Operation::StreamCompletion)?;
-            let url = self.endpoint("chat/completions")?;
-            let body = encode_completion(request, true, self.stream_usage)?;
+            let dialect = self.completion_dialect;
+            let url = self.endpoint(dialect.path())?;
+            let body = match dialect {
+                CompletionDialect::ChatCompletions => {
+                    encode_completion(request, true, self.stream_usage)?
+                }
+                CompletionDialect::Responses => {
+                    crate::responses::encode_completion(self.id.as_str(), request, true)?
+                }
+            };
             let cancel = context.cancel().clone();
             let provider = self.id.as_str().to_owned();
             let events = self
@@ -495,7 +551,12 @@ impl Provider for OpenAiCompatible {
                         .body(Body::Json(body.clone())))
                 })
                 .await?
-                .decode(move |chunks| event_stream(provider, chunks));
+                .decode(move |chunks| match dialect {
+                    CompletionDialect::ChatCompletions => event_stream(provider, chunks),
+                    CompletionDialect::Responses => {
+                        crate::responses::event_stream(provider, chunks)
+                    }
+                });
             Ok(CompletionStream::new(self.id.as_str(), cancel, events))
         })
     }
@@ -877,9 +938,10 @@ pub fn encode_embeddings(request: &EmbeddingsRequest) -> Result<String, Provider
 #[derive(Debug, Deserialize)]
 struct WireUsage {
     #[serde(default)]
-    prompt_tokens: u64,
+    prompt_tokens: Option<u64>,
     #[serde(default)]
-    completion_tokens: u64,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
     #[serde(default)]
     prompt_tokens_details: Option<WirePromptDetails>,
     #[serde(default)]
@@ -889,27 +951,61 @@ struct WireUsage {
 #[derive(Debug, Deserialize)]
 struct WirePromptDetails {
     #[serde(default)]
-    cached_tokens: u64,
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct WireCompletionDetails {
     #[serde(default)]
-    reasoning_tokens: u64,
+    reasoning_tokens: Option<u64>,
 }
 
-impl From<WireUsage> for Usage {
-    fn from(usage: WireUsage) -> Self {
-        Self {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            cached_input_tokens: usage
-                .prompt_tokens_details
-                .map_or(0, |details| details.cached_tokens),
-            reasoning_tokens: usage
-                .completion_tokens_details
-                .map_or(0, |details| details.reasoning_tokens),
+impl WireUsage {
+    const fn reporting(&self) -> claw_provider_sdk::model::UsageReporting {
+        if self.prompt_tokens.is_some() && self.completion_tokens.is_some() {
+            claw_provider_sdk::model::UsageReporting::Complete
+        } else {
+            claw_provider_sdk::model::UsageReporting::Partial
         }
+    }
+
+    fn validated(
+        self,
+        previous: Usage,
+        provider: &str,
+        operation: Operation,
+    ) -> Result<Usage, ProviderError> {
+        let usage = Usage {
+            input_tokens: self.prompt_tokens.unwrap_or(previous.input_tokens),
+            output_tokens: self.completion_tokens.unwrap_or(previous.output_tokens),
+            cached_input_tokens: self
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens)
+                .unwrap_or(previous.cached_input_tokens),
+            reasoning_tokens: self
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens)
+                .unwrap_or(previous.reasoning_tokens),
+        };
+        let total = usage.input_tokens.checked_add(usage.output_tokens);
+        if total.is_none()
+            || self
+                .total_tokens
+                .is_some_and(|reported| Some(reported) != total)
+            || usage.cached_input_tokens > usage.input_tokens
+            || usage.reasoning_tokens > usage.output_tokens
+            || usage.input_tokens < previous.input_tokens
+            || usage.output_tokens < previous.output_tokens
+            || usage.cached_input_tokens < previous.cached_input_tokens
+            || usage.reasoning_tokens < previous.reasoning_tokens
+        {
+            return Err(protocol_error(
+                provider,
+                operation,
+                "completion usage is inconsistent, regressed or overflowing",
+            ));
+        }
+        Ok(usage)
     }
 }
 
@@ -944,6 +1040,8 @@ struct WireResponseMessage {
 #[derive(Debug, Deserialize)]
 struct WireChoice {
     #[serde(default)]
+    index: usize,
+    #[serde(default)]
     message: WireResponseMessage,
     #[serde(default)]
     finish_reason: Option<String>,
@@ -962,6 +1060,14 @@ struct WireCompletionResponse {
 
 fn protocol_error(provider: &str, operation: Operation, detail: &str) -> ProviderError {
     ProviderError::new(ErrorKind::Protocol, provider, operation, detail)
+}
+
+fn valid_wire_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= claw_provider_sdk::stream::MAX_TOOL_NAME_BYTES
+        && !value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
 }
 
 /// Maps an `OpenAI` `finish_reason` onto the portable enumeration.
@@ -983,6 +1089,13 @@ pub fn finish_reason(raw: &str) -> FinishReason {
 /// Returns [`ErrorKind::Protocol`] when the document does not match the dialect
 /// or a tool call carries arguments that are not a JSON object.
 pub fn decode_completion(provider: &str, body: &[u8]) -> Result<CompletionResponse, ProviderError> {
+    if body.len() > MAX_COMPLETION_BODY_BYTES {
+        return Err(protocol_error(
+            provider,
+            Operation::Complete,
+            "completion body exceeds its byte limit",
+        ));
+    }
     let wire: WireCompletionResponse = serde_json::from_slice(body).map_err(|error| {
         protocol_error(
             provider,
@@ -990,6 +1103,13 @@ pub fn decode_completion(provider: &str, body: &[u8]) -> Result<CompletionRespon
             &format!("the completion response could not be parsed: {error}"),
         )
     })?;
+    if wire.choices.len() > 1 || wire.choices.first().is_some_and(|choice| choice.index != 0) {
+        return Err(protocol_error(
+            provider,
+            Operation::Complete,
+            "completion must contain exactly the requested choice zero",
+        ));
+    }
     let choice = wire.choices.into_iter().next().ok_or_else(|| {
         protocol_error(
             provider,
@@ -997,12 +1117,58 @@ pub fn decode_completion(provider: &str, body: &[u8]) -> Result<CompletionRespon
             "the completion response carried no choices",
         )
     })?;
+    if choice.message.tool_calls.len() > claw_provider_sdk::stream::MAX_TOOL_CALLS {
+        return Err(protocol_error(
+            provider,
+            Operation::Complete,
+            "completion function count exceeds its limit",
+        ));
+    }
+    let reasoning = choice
+        .message
+        .reasoning_content
+        .or(choice.message.reasoning)
+        .filter(|text| !text.is_empty());
+    let mut output_bytes = choice
+        .message
+        .content
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(reasoning.as_ref().map_or(0, String::len));
+    if output_bytes > claw_provider_sdk::stream::MAX_TOTAL_TOOL_ARGUMENT_BYTES {
+        return Err(protocol_error(
+            provider,
+            Operation::Complete,
+            "completion output exceeds its aggregate byte limit",
+        ));
+    }
     let mut content = Vec::new();
     if let Some(text) = choice.message.content.filter(|text| !text.is_empty()) {
         content.push(ContentPart::Text(text));
     }
     let mut tool_calls = Vec::with_capacity(choice.message.tool_calls.len());
+    let mut call_ids = BTreeSet::new();
     for call in choice.message.tool_calls {
+        output_bytes = output_bytes.saturating_add(call.function.arguments.len());
+        if output_bytes > claw_provider_sdk::stream::MAX_TOTAL_TOOL_ARGUMENT_BYTES
+            || call.function.arguments.len() > claw_provider_sdk::stream::MAX_TOOL_ARGUMENT_BYTES
+        {
+            return Err(protocol_error(
+                provider,
+                Operation::Complete,
+                "completion function arguments exceed their byte limit",
+            ));
+        }
+        if !valid_wire_identifier(&call.id)
+            || !valid_wire_identifier(&call.function.name)
+            || !call_ids.insert(call.id.clone())
+        {
+            return Err(protocol_error(
+                provider,
+                Operation::Complete,
+                "completion function identities are invalid or duplicated",
+            ));
+        }
         tool_calls.push(ToolCall {
             id: call.id,
             name: call.function.name,
@@ -1020,20 +1186,33 @@ pub fn decode_completion(provider: &str, body: &[u8]) -> Result<CompletionRespon
         .finish_reason
         .as_deref()
         .map_or(FinishReason::Stop, finish_reason);
+    if (!tool_calls.is_empty() && !matches!(finish, FinishReason::Stop | FinishReason::ToolCalls))
+        || (tool_calls.is_empty() && finish == FinishReason::ToolCalls)
+    {
+        return Err(protocol_error(
+            provider,
+            Operation::Complete,
+            "completion finish reason is inconsistent with its function calls",
+        ));
+    }
     Ok(CompletionResponse {
         id: wire.id,
         model,
         message: AssistantMessage {
             content,
-            reasoning: choice
-                .message
-                .reasoning_content
-                .or(choice.message.reasoning)
-                .filter(|text| !text.is_empty()),
+            reasoning,
             tool_calls,
         },
         finish_reason: finish,
-        usage: wire.usage.map(Usage::from).unwrap_or_default(),
+        usage_reporting: wire.usage.as_ref().map_or(
+            claw_provider_sdk::model::UsageReporting::Unreported,
+            WireUsage::reporting,
+        ),
+        usage: wire
+            .usage
+            .map(|usage| usage.validated(Usage::default(), provider, Operation::Complete))
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 
@@ -1096,7 +1275,11 @@ pub fn decode_embeddings(provider: &str, body: &[u8]) -> Result<EmbeddingsRespon
                 vector: entry.embedding,
             })
             .collect(),
-        usage: wire.usage.map(Usage::from).unwrap_or_default(),
+        usage: wire
+            .usage
+            .map(|usage| usage.validated(Usage::default(), provider, Operation::Embed))
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 
@@ -1178,6 +1361,8 @@ struct WireDelta {
 #[derive(Debug, Deserialize)]
 struct WireStreamChoice {
     #[serde(default)]
+    index: usize,
+    #[serde(default)]
     delta: WireDelta,
     #[serde(default)]
     finish_reason: Option<String>,
@@ -1195,6 +1380,12 @@ struct WireStreamChunk {
     usage: Option<WireUsage>,
 }
 
+#[derive(Debug, Default)]
+struct PrimaryUsageFields {
+    input: bool,
+    output: bool,
+}
+
 /// Turns `OpenAI` stream chunks into portable [`StreamEvent`] values.
 ///
 /// The decoder is a pure state machine over already-framed SSE events, so it can
@@ -1204,9 +1395,15 @@ pub struct OpenAiStreamDecoder {
     provider: String,
     assembler: ToolCallAssembler,
     started: bool,
+    response_id: String,
+    response_model: String,
+    call_ids: BTreeMap<usize, String>,
+    output_bytes: usize,
     usage: Usage,
+    usage_fields: PrimaryUsageFields,
     finish_reason: Option<FinishReason>,
     completed: bool,
+    done_seen: bool,
 }
 
 impl OpenAiStreamDecoder {
@@ -1217,9 +1414,15 @@ impl OpenAiStreamDecoder {
             provider: provider.into(),
             assembler: ToolCallAssembler::new(),
             started: false,
+            response_id: String::new(),
+            response_model: String::new(),
+            call_ids: BTreeMap::new(),
+            output_bytes: 0,
             usage: Usage::default(),
+            usage_fields: PrimaryUsageFields::default(),
             finish_reason: None,
             completed: false,
+            done_seen: false,
         }
     }
 
@@ -1237,7 +1440,15 @@ impl OpenAiStreamDecoder {
             return Ok(Vec::new());
         }
         if data == DONE_SENTINEL {
-            return Ok(self.finish());
+            if !self.started {
+                return Err(protocol_error(
+                    &self.provider,
+                    Operation::StreamCompletion,
+                    "completion ended before a response was identified",
+                ));
+            }
+            self.done_seen = true;
+            return self.finish_checked();
         }
         let chunk: WireStreamChunk = serde_json::from_str(data).map_err(|error| {
             protocol_error(
@@ -1246,20 +1457,62 @@ impl OpenAiStreamDecoder {
                 &format!("a stream chunk could not be parsed: {error}"),
             )
         })?;
+        if chunk.choices.len() > 1
+            || chunk.choices.iter().any(|choice| choice.index != 0)
+            || (self.finish_reason.is_some() && !chunk.choices.is_empty())
+        {
+            return Err(protocol_error(
+                &self.provider,
+                Operation::StreamCompletion,
+                "completion stream changed or repeated its finished choice",
+            ));
+        }
+        if self.started {
+            if (!chunk.id.is_empty() && chunk.id != self.response_id)
+                || (!chunk.model.is_empty() && chunk.model != self.response_model)
+            {
+                return Err(protocol_error(
+                    &self.provider,
+                    Operation::StreamCompletion,
+                    "completion stream response identity changed",
+                ));
+            }
+        } else if !valid_wire_identifier(&chunk.id) || ModelId::new(chunk.model.clone()).is_err() {
+            return Err(protocol_error(
+                &self.provider,
+                Operation::StreamCompletion,
+                "completion stream did not identify a valid response and model",
+            ));
+        }
         let mut events = Vec::new();
-        if !self.started && !chunk.id.is_empty() {
+        if !self.started {
             self.started = true;
+            self.response_id.clone_from(&chunk.id);
+            self.response_model.clone_from(&chunk.model);
             events.push(StreamEvent::Started {
                 id: chunk.id,
                 model: chunk.model,
             });
         }
         if let Some(usage) = chunk.usage {
-            self.usage = Usage::from(usage);
-            events.push(StreamEvent::UsageUpdate(self.usage));
+            let input_reported = usage.prompt_tokens.is_some();
+            let output_reported = usage.completion_tokens.is_some();
+            self.usage =
+                usage.validated(self.usage, &self.provider, Operation::StreamCompletion)?;
+            self.usage_fields.input |= input_reported;
+            self.usage_fields.output |= output_reported;
+            events.push(StreamEvent::UsageReported {
+                usage: self.usage,
+                reporting: if self.usage_fields.input && self.usage_fields.output {
+                    claw_provider_sdk::model::UsageReporting::Complete
+                } else {
+                    claw_provider_sdk::model::UsageReporting::Partial
+                },
+            });
         }
         for choice in chunk.choices {
             if let Some(text) = choice.delta.content.filter(|text| !text.is_empty()) {
+                self.add_output_bytes(text.len())?;
                 events.push(StreamEvent::TextDelta(text));
             }
             if let Some(text) = choice
@@ -1268,12 +1521,40 @@ impl OpenAiStreamDecoder {
                 .or(choice.delta.reasoning)
                 .filter(|text| !text.is_empty())
             {
+                self.add_output_bytes(text.len())?;
                 events.push(StreamEvent::ReasoningDelta(text));
             }
             for call in choice.delta.tool_calls {
+                if call.index >= claw_provider_sdk::stream::MAX_TOOL_CALLS {
+                    return Err(protocol_error(
+                        &self.provider,
+                        Operation::StreamCompletion,
+                        "completion stream function index exceeds its limit",
+                    ));
+                }
+                if let Some(id) = call.id.as_deref().filter(|id| !id.is_empty()) {
+                    if !valid_wire_identifier(id)
+                        || self
+                            .call_ids
+                            .get(&call.index)
+                            .is_some_and(|previous| previous != id)
+                        || self
+                            .call_ids
+                            .iter()
+                            .any(|(index, previous)| *index != call.index && previous == id)
+                    {
+                        return Err(protocol_error(
+                            &self.provider,
+                            Operation::StreamCompletion,
+                            "completion stream function identity changed or was duplicated",
+                        ));
+                    }
+                    self.call_ids.insert(call.index, id.to_owned());
+                }
                 let (name, arguments) = call
                     .function
                     .map_or((None, None), |function| (function.name, function.arguments));
+                self.add_output_bytes(arguments.as_ref().map_or(0, String::len))?;
                 events.extend(self.assembler.accept(
                     call.index,
                     call.id.as_deref(),
@@ -1291,23 +1572,80 @@ impl OpenAiStreamDecoder {
     /// Emits the terminal events for a stream that ended.
     ///
     /// Pending tool calls are finalized here, because a provider signals the
-    /// last argument fragment only by ending the stream.
+    /// last argument fragment only by ending the stream. Legacy direct callers
+    /// receive an `incomplete_stream` terminal on error; live and recorded streams
+    /// surface typed protocol errors instead.
     #[must_use]
     pub fn finish(&mut self) -> Vec<StreamEvent> {
+        self.finish_checked().unwrap_or_else(|_| {
+            vec![StreamEvent::Completed {
+                finish_reason: FinishReason::Other("incomplete_stream".to_owned()),
+                usage: self.usage,
+            }]
+        })
+    }
+
+    fn add_output_bytes(&mut self, bytes: usize) -> Result<(), ProviderError> {
+        self.output_bytes = self.output_bytes.saturating_add(bytes);
+        if self.output_bytes > claw_provider_sdk::stream::MAX_TOTAL_TOOL_ARGUMENT_BYTES {
+            return Err(protocol_error(
+                &self.provider,
+                Operation::StreamCompletion,
+                "completion stream exceeds its aggregate output byte limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish_checked(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
         if self.completed {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         self.completed = true;
+        if !self.started || (!self.done_seen && self.finish_reason.is_none()) {
+            return Err(protocol_error(
+                &self.provider,
+                Operation::StreamCompletion,
+                "completion stream ended without a finish reason or DONE marker",
+            ));
+        }
         let mut events = Vec::new();
         let pending = self.assembler.len();
+        if pending == 0 && self.finish_reason == Some(FinishReason::ToolCalls) {
+            return Err(protocol_error(
+                &self.provider,
+                Operation::StreamCompletion,
+                "completion stream requested functions without any calls",
+            ));
+        }
+        if pending > 0
+            && self.finish_reason.as_ref().is_some_and(|reason| {
+                !matches!(reason, FinishReason::Stop | FinishReason::ToolCalls)
+            })
+        {
+            return Err(protocol_error(
+                &self.provider,
+                Operation::StreamCompletion,
+                "completion stream stopped before its function calls completed",
+            ));
+        }
         for index in 0..pending {
-            let Ok(event) = self.assembler.complete(index) else {
-                events.push(StreamEvent::Completed {
-                    finish_reason: FinishReason::Other("incomplete_tool_call".to_owned()),
-                    usage: self.usage,
-                });
-                return events;
-            };
+            let event = self.assembler.complete(index).map_err(|_| {
+                protocol_error(
+                    &self.provider,
+                    Operation::StreamCompletion,
+                    "completion stream contains an invalid or incomplete function call",
+                )
+            })?;
+            if let StreamEvent::ToolCallCompleted { call, .. } = &event
+                && (!valid_wire_identifier(&call.id) || !valid_wire_identifier(&call.name))
+            {
+                return Err(protocol_error(
+                    &self.provider,
+                    Operation::StreamCompletion,
+                    "completion stream function identity is invalid",
+                ));
+            }
             events.push(event);
         }
         let finish = self.finish_reason.clone().unwrap_or(if pending > 0 {
@@ -1319,7 +1657,11 @@ impl OpenAiStreamDecoder {
             finish_reason: finish,
             usage: self.usage,
         });
-        events
+        Ok(events)
+    }
+
+    fn end_of_input(&mut self) -> Result<Vec<StreamEvent>, ProviderError> {
+        self.finish_checked()
     }
 
     /// Returns the usage seen so far.
@@ -1360,7 +1702,7 @@ pub fn decode_event_stream(provider: &str, body: &[u8]) -> Result<Vec<StreamEven
     for event in tail {
         events.extend(decoder.accept(&event)?);
     }
-    events.extend(decoder.finish());
+    events.extend(decoder.end_of_input()?);
     Ok(events)
 }
 
@@ -1374,7 +1716,7 @@ struct StreamState {
     chunks: ChunkStream,
     sse: SseDecoder,
     decoder: OpenAiStreamDecoder,
-    pending: VecDeque<StreamEvent>,
+    pending: VecDeque<Result<StreamEvent, ProviderError>>,
     exhausted: bool,
 }
 
@@ -1391,7 +1733,7 @@ pub(crate) fn event_stream(provider: String, chunks: ChunkStream) -> EventStream
         |(mut state, provider)| async move {
             loop {
                 if let Some(event) = state.pending.pop_front() {
-                    return Some((Ok(event), (state, provider)));
+                    return Some((event, (state, provider)));
                 }
                 if state.exhausted {
                     return None;
@@ -1401,10 +1743,17 @@ pub(crate) fn event_stream(provider: String, chunks: ChunkStream) -> EventStream
                         Ok(framed) => {
                             for event in framed {
                                 match state.decoder.accept(&event) {
-                                    Ok(events) => state.pending.extend(events),
+                                    Ok(events) => {
+                                        state.pending.extend(events.into_iter().map(Ok));
+                                        if state.decoder.completed {
+                                            state.exhausted = true;
+                                            break;
+                                        }
+                                    }
                                     Err(error) => {
                                         state.exhausted = true;
-                                        return Some((Err(error), (state, provider)));
+                                        state.pending.push_back(Err(error));
+                                        break;
                                     }
                                 }
                             }
@@ -1429,9 +1778,12 @@ pub(crate) fn event_stream(provider: String, chunks: ChunkStream) -> EventStream
                             Ok(framed) => {
                                 for event in framed {
                                     match state.decoder.accept(&event) {
-                                        Ok(events) => state.pending.extend(events),
+                                        Ok(events) => {
+                                            state.pending.extend(events.into_iter().map(Ok));
+                                        }
                                         Err(error) => {
-                                            return Some((Err(error), (state, provider)));
+                                            state.pending.push_back(Err(error));
+                                            break;
                                         }
                                     }
                                 }
@@ -1445,8 +1797,12 @@ pub(crate) fn event_stream(provider: String, chunks: ChunkStream) -> EventStream
                                 return Some((Err(error), (state, provider)));
                             }
                         }
-                        let tail = state.decoder.finish();
-                        state.pending.extend(tail);
+                        if !state.pending.iter().any(Result::is_err) {
+                            match state.decoder.end_of_input() {
+                                Ok(tail) => state.pending.extend(tail.into_iter().map(Ok)),
+                                Err(error) => state.pending.push_back(Err(error)),
+                            }
+                        }
                     }
                 }
             }
@@ -1831,12 +2187,15 @@ mod tests {
                 },
                 StreamEvent::TextDelta("Hei".to_owned()),
                 StreamEvent::TextDelta(" der".to_owned()),
-                StreamEvent::UsageUpdate(Usage {
-                    input_tokens: 9,
-                    output_tokens: 2,
-                    cached_input_tokens: 0,
-                    reasoning_tokens: 0,
-                }),
+                StreamEvent::UsageReported {
+                    usage: Usage {
+                        input_tokens: 9,
+                        output_tokens: 2,
+                        cached_input_tokens: 0,
+                        reasoning_tokens: 0,
+                    },
+                    reporting: claw_provider_sdk::model::UsageReporting::Complete,
+                },
                 StreamEvent::Completed {
                     finish_reason: FinishReason::Stop,
                     usage: Usage {
@@ -1973,6 +2332,53 @@ mod tests {
     }
 
     #[test]
+    fn unmarked_eof_and_empty_done_do_not_fabricate_completed_answers_or_tools() {
+        for body in [
+            "",
+            "data: [DONE]\n\n",
+            "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
+            "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"mutate\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        ] {
+            let error = decode_event_stream("openai", body.as_bytes())
+                .expect_err("missing completion witness");
+            assert_eq!(error.kind(), ErrorKind::Protocol);
+            assert!(!error.detail().contains("partial answer"));
+        }
+        let mut decoder = OpenAiStreamDecoder::new("openai");
+        assert!(
+            matches!(decoder.finish().as_slice(), [StreamEvent::Completed { finish_reason: FinishReason::Other(reason), .. }] if reason == "incomplete_stream")
+        );
+    }
+
+    #[tokio::test]
+    async fn live_stream_preserves_partial_text_but_rejects_unmarked_eof() {
+        let body = Bytes::from_static(b"data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n");
+        let mut events = events_from_chunks(
+            "openai",
+            CancelToken::new(),
+            Box::pin(futures_util::stream::iter([Ok(body)])),
+        );
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(StreamEvent::Started { .. }))
+        ));
+        assert_eq!(
+            events.next().await.expect("partial text").expect("text"),
+            StreamEvent::TextDelta("partial answer".to_owned())
+        );
+        assert_eq!(
+            events
+                .next()
+                .await
+                .expect("terminal error")
+                .expect_err("not a completed answer")
+                .kind(),
+            ErrorKind::Protocol
+        );
+        assert!(events.next().await.is_none());
+    }
+
+    #[test]
     fn every_chunk_split_of_a_recorded_stream_yields_identical_events() {
         let body = concat!(
             "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"alpha\"}}]}\n\n",
@@ -1999,12 +2405,366 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn live_stream_rejects_incomplete_tool_rounds_without_publishing_partial_calls() {
+        for (arguments, finish) in [
+            ("{", "tool_calls"),
+            ("{}", "length"),
+            ("{}", "content_filter"),
+        ] {
+            let chunk = serde_json::json!({"id":"owned-response","model":"owned-model","choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"first","function":{"name":"read","arguments":"{}"}},
+                {"index":1,"id":"second","function":{"name":"write","arguments":arguments}}
+            ]},"finish_reason":finish}]});
+            let body = Bytes::from(format!("data: {chunk}\n\ndata: [DONE]\n\n"));
+            let mut stream = events_from_chunks(
+                "openai",
+                CancelToken::new(),
+                Box::pin(futures_util::stream::iter([Ok(body)])),
+            );
+            let mut failed = false;
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(StreamEvent::ToolCallCompleted { .. } | StreamEvent::Completed { .. }) => {
+                        panic!("incomplete round must not publish completion")
+                    }
+                    Err(error) => {
+                        assert_eq!(error.kind(), ErrorKind::Protocol);
+                        failed = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(failed);
+        }
+    }
+
     #[test]
     fn a_malformed_chunk_is_reported_as_a_protocol_error() {
         let error = decode_event_stream("openai", b"data: {not json}\n\n").expect_err("malformed");
         assert_eq!(error.kind(), ErrorKind::Protocol);
         assert_eq!(error.operation(), Operation::StreamCompletion);
         assert_eq!(error.provider(), "openai");
+    }
+
+    #[test]
+    fn chat_completion_rejects_duplicate_function_ids_and_unrequested_choices() {
+        let base = serde_json::json!({"id":"owned-response","model":"owned-model","choices":[{"index":0,"finish_reason":"tool_calls","message":{"tool_calls":[
+            {"id":"first","function":{"name":"lookup","arguments":"{}"}},
+            {"id":"second","function":{"name":"lookup","arguments":"{}"}}
+        ]}}]});
+        assert!(decode_completion("openai", base.to_string().as_bytes()).is_ok());
+        for (pointer, value) in [
+            (
+                "/choices/0/message/tool_calls/1/id",
+                serde_json::json!("first"),
+            ),
+            ("/choices/0/message/tool_calls/1/id", serde_json::json!("")),
+            (
+                "/choices/0/message/tool_calls/1/function/name",
+                serde_json::json!("invalid name"),
+            ),
+            ("/choices/0/finish_reason", serde_json::json!("length")),
+            ("/choices/0/index", serde_json::json!(1)),
+        ] {
+            let mut changed = base.clone();
+            *changed.pointer_mut(pointer).expect("field") = value;
+            assert_eq!(
+                decode_completion("openai", changed.to_string().as_bytes())
+                    .expect_err("inconsistent completion")
+                    .kind(),
+                ErrorKind::Protocol
+            );
+        }
+        let mut changed = base;
+        let duplicate = changed["choices"][0].clone();
+        changed["choices"]
+            .as_array_mut()
+            .expect("choices")
+            .push(duplicate);
+        assert!(decode_completion("openai", changed.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn chat_stream_rejects_changed_identity_choice_and_function_ids() {
+        let first = serde_json::json!({"id":"owned-response","model":"owned-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-owned","function":{"name":"lookup","arguments":"{"}}]}}]});
+        let second = serde_json::json!({"id":"owned-response","model":"owned-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]},"finish_reason":"tool_calls"}]});
+        let encode = |second: &serde_json::Value| {
+            format!("data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n")
+        };
+        assert!(decode_event_stream("openai", encode(&second).as_bytes()).is_ok());
+        for (pointer, value) in [
+            ("/id", serde_json::json!("foreign-response")),
+            ("/model", serde_json::json!("foreign-model")),
+            ("/choices/0/index", serde_json::json!(1)),
+            (
+                "/choices/0/delta/tool_calls/0/index",
+                serde_json::json!(claw_provider_sdk::stream::MAX_TOOL_CALLS),
+            ),
+        ] {
+            let mut changed = second.clone();
+            *changed.pointer_mut(pointer).expect("field") = value;
+            assert_eq!(
+                decode_event_stream("openai", encode(&changed).as_bytes())
+                    .expect_err("stream identity mismatch")
+                    .kind(),
+                ErrorKind::Protocol
+            );
+        }
+        for index in [0, 1] {
+            let mut changed = second.clone();
+            changed["choices"][0]["delta"]["tool_calls"][0]["id"] =
+                serde_json::json!(if index == 0 {
+                    "changed-id"
+                } else {
+                    "call-owned"
+                });
+            changed["choices"][0]["delta"]["tool_calls"][0]["index"] = serde_json::json!(index);
+            assert!(decode_event_stream("openai", encode(&changed).as_bytes()).is_err());
+        }
+        let repeated =
+            format!("data: {first}\n\ndata: {second}\n\ndata: {second}\n\ndata: [DONE]\n\n");
+        assert!(decode_event_stream("openai", repeated.as_bytes()).is_err());
+        let mut omitted = second;
+        omitted.as_object_mut().expect("chunk").remove("id");
+        omitted.as_object_mut().expect("chunk").remove("model");
+        assert!(decode_event_stream("openai", encode(&omitted).as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn chat_usage_reporting_distinguishes_explicit_zero_from_missing_counters() {
+        use claw_provider_sdk::model::UsageReporting;
+
+        let mut body = serde_json::json!({"id":"owned","model":"owned","choices":[{"message":{"content":"answer"},"finish_reason":"stop"}]});
+        assert_eq!(
+            decode_completion("openai", body.to_string().as_bytes())
+                .expect("no usage")
+                .usage_reporting,
+            UsageReporting::Unreported
+        );
+        for (usage, expected) in [
+            (serde_json::json!({}), UsageReporting::Partial),
+            (
+                serde_json::json!({"prompt_tokens":0}),
+                UsageReporting::Partial,
+            ),
+            (
+                serde_json::json!({"completion_tokens":0}),
+                UsageReporting::Partial,
+            ),
+            (
+                serde_json::json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}),
+                UsageReporting::Complete,
+            ),
+        ] {
+            body["usage"] = usage;
+            let response = decode_completion("openai", body.to_string().as_bytes())
+                .expect("reported usage shape");
+            assert_eq!(response.usage, Usage::default());
+            assert_eq!(response.usage_reporting, expected);
+        }
+    }
+
+    #[test]
+    fn chat_stream_usage_reporting_tracks_primary_fields_across_updates() {
+        use claw_provider_sdk::model::UsageReporting;
+        use claw_provider_sdk::stream::StreamAccumulator;
+        use std::fmt::Write as _;
+
+        for (snapshots, expected, total) in [
+            (vec![], UsageReporting::Unreported, 0),
+            (vec![serde_json::json!({})], UsageReporting::Partial, 0),
+            (
+                vec![serde_json::json!({"prompt_tokens":0})],
+                UsageReporting::Partial,
+                0,
+            ),
+            (
+                vec![serde_json::json!({"completion_tokens":0})],
+                UsageReporting::Partial,
+                0,
+            ),
+            (
+                vec![serde_json::json!({"prompt_tokens":0,"completion_tokens":0})],
+                UsageReporting::Complete,
+                0,
+            ),
+            (
+                vec![
+                    serde_json::json!({"prompt_tokens":0}),
+                    serde_json::json!({"completion_tokens":0}),
+                    serde_json::json!({}),
+                ],
+                UsageReporting::Complete,
+                0,
+            ),
+            (
+                vec![
+                    serde_json::json!({"prompt_tokens":7}),
+                    serde_json::json!({"completion_tokens":3}),
+                ],
+                UsageReporting::Complete,
+                10,
+            ),
+        ] {
+            let mut updates = String::new();
+            for usage in snapshots {
+                write!(updates, "data: {{\"usage\":{usage}}}\n\n").expect("SSE usage fixture");
+            }
+            let body = format!(
+                "data: {{\"id\":\"owned\",\"model\":\"owned\",\"choices\":[{{\"delta\":{{\"content\":\"answer\"}},\"finish_reason\":\"stop\"}}]}}\n\n{updates}data: [DONE]\n\n"
+            );
+            let events = decode_event_stream("openai", body.as_bytes()).expect("usage stream");
+            let mut accumulator = StreamAccumulator::new();
+            for event in events {
+                accumulator.accept(&event);
+            }
+            assert_eq!(accumulator.usage_reporting(), expected);
+            assert_eq!(accumulator.usage().total_tokens(), total);
+        }
+    }
+
+    #[test]
+    fn chat_usage_totals_details_and_cumulative_updates_are_validated() {
+        let base = serde_json::json!({"id":"owned","model":"owned","choices":[{"message":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5,"prompt_tokens_details":{"cached_tokens":1},"completion_tokens_details":{"reasoning_tokens":1}}});
+        assert!(decode_completion("openai", base.to_string().as_bytes()).is_ok());
+        for (pointer, value) in [
+            ("/usage/total_tokens", serde_json::json!(4)),
+            ("/usage/prompt_tokens", serde_json::json!(u64::MAX)),
+            (
+                "/usage/prompt_tokens_details/cached_tokens",
+                serde_json::json!(3),
+            ),
+            (
+                "/usage/completion_tokens_details/reasoning_tokens",
+                serde_json::json!(4),
+            ),
+        ] {
+            let mut changed = base.clone();
+            *changed.pointer_mut(pointer).expect("field") = value;
+            assert_eq!(
+                decode_completion("openai", changed.to_string().as_bytes())
+                    .expect_err("invalid usage")
+                    .kind(),
+                ErrorKind::Protocol
+            );
+        }
+        let initial =
+            serde_json::json!({"id":"owned","model":"owned","choices":[],"usage":base["usage"]});
+        let update = serde_json::json!({"usage":{"completion_tokens":4,"total_tokens":6}});
+        let frames = |update: &serde_json::Value| {
+            format!("data: {initial}\n\ndata: {update}\n\ndata: [DONE]\n\n")
+        };
+        let events = decode_event_stream("openai", frames(&update).as_bytes())
+            .expect("partial cumulative usage");
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Completed {
+                usage: Usage {
+                    input_tokens: 2,
+                    output_tokens: 4,
+                    cached_input_tokens: 1,
+                    reasoning_tokens: 1
+                },
+                ..
+            })
+        ));
+        for usage in [
+            serde_json::json!({"prompt_tokens":1}),
+            serde_json::json!({"completion_tokens":2}),
+            serde_json::json!({"prompt_tokens_details":{"cached_tokens":0}}),
+            serde_json::json!({"completion_tokens_details":{"reasoning_tokens":0}}),
+        ] {
+            assert!(
+                decode_event_stream(
+                    "openai",
+                    frames(&serde_json::json!({"usage":usage})).as_bytes()
+                )
+                .is_err()
+            );
+        }
+        let embedding = serde_json::json!({"model":"owned","data":[],"usage":{"prompt_tokens":2,"total_tokens":1}});
+        assert_eq!(
+            decode_embeddings("openai", embedding.to_string().as_bytes())
+                .expect_err("same usage contract")
+                .operation(),
+            Operation::Embed
+        );
+    }
+
+    #[test]
+    fn chat_output_budget_counts_utf8_and_shared_text_reasoning_and_arguments() {
+        let limit = claw_provider_sdk::stream::MAX_TOTAL_TOOL_ARGUMENT_BYTES;
+        let content = "\u{00e9}".repeat(limit / 2);
+        let base = serde_json::json!({"id":"owned","model":"owned","choices":[{"message":{"content":content},"finish_reason":"stop"}]});
+        assert!(decode_completion("openai", base.to_string().as_bytes()).is_ok());
+        let mut changed = base.clone();
+        changed["choices"][0]["message"]["reasoning_content"] = serde_json::json!("x");
+        assert!(decode_completion("openai", changed.to_string().as_bytes()).is_err());
+        let mut tool = base;
+        tool["choices"][0]["message"]["tool_calls"] =
+            serde_json::json!([{"id":"owned-call","function":{"name":"lookup","arguments":"{}"}}]);
+        assert!(decode_completion("openai", tool.to_string().as_bytes()).is_err());
+        let mut decoder = OpenAiStreamDecoder::new("openai");
+        let chunk = serde_json::json!({"id":"owned","model":"owned","choices":[{"delta":{"content":"x".repeat(limit / 8)}}]});
+        for _ in 0..8 {
+            decoder
+                .accept(&SseEvent {
+                    data: chunk.to_string(),
+                    ..SseEvent::default()
+                })
+                .expect("within aggregate bound");
+        }
+        assert_eq!(decoder.output_bytes, limit);
+        let extra = serde_json::json!({"choices":[{"delta":{"reasoning_content":"x"}}]});
+        assert!(
+            decoder
+                .accept(&SseEvent {
+                    data: extra.to_string(),
+                    ..SseEvent::default()
+                })
+                .is_err()
+        );
+        let over_body = vec![b' '; MAX_COMPLETION_BODY_BYTES + 1];
+        assert!(decode_completion("openai", &over_body).is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_usage_error_preserves_preceding_events_in_the_same_chunk() {
+        let body = concat!(
+            "data: {\"id\":\"owned\",\"model\":\"owned\",\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":4}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut stream = events_from_chunks(
+            "openai",
+            CancelToken::new(),
+            Box::pin(futures_util::stream::iter([Ok(Bytes::from_static(
+                body.as_bytes(),
+            ))])),
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamEvent::Started { .. }))
+        ));
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .expect("partial")
+                .expect("accepted text"),
+            StreamEvent::TextDelta("partial answer".to_owned())
+        );
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .expect("error")
+                .expect_err("invalid total")
+                .kind(),
+            ErrorKind::Protocol
+        );
+        assert!(stream.next().await.is_none());
     }
 
     #[test]

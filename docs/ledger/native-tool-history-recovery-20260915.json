@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-unconfirmed-tool-history-projection-and-recovery",
+  "capturedAtUtc": "2026-09-15T06:17:12.3113137Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"24abbcdf0f2b035f6ea2c051b9440a71c5ee638a5aae5edc56060fcd6d6c6916"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"b9502822691545979655af994e741f9372068bf3af564d77255f33eb9ec7a84d"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":231, "failed":0, "ignored":4, "testBinaries":9,
+      "log":"target/native-tool-history-recovery-tests-20260915T061518128Z.log",
+      "sha256":"59399a047f94e7f9e6bd4a56681b0137e82525c2986c33de7fc455d13f739eb1"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-tool-history-recovery-clippy-20260915T061450621Z.log",
+      "sha256":"d7e18611f9e1eb0356838b434b352d1a91301df2be4862d22e06db07878edcd8"
+    }
+  ],
+  "retainedFailures": [
+    {"log":"target/native-tool-history-recovery-clippy-20260915T060934961Z.log","sha256":"cafc5fd53b0a39b79d3797adc72587c36b49abb9736a869a275697b8e1bd965b","reason":"Whole-vector drain lint; changed to owned take/iteration without changing projection order"}
+  ],
+  "behaviorEvidence": [
+    "unpaired_historical_calls_remain_data_and_do_not_block_new_typed_rounds",
+    "projected_context_budget_counts_unconfirmed_wrappers_and_preserves_exact_boundary",
+    "bound_explicit_memory_model_calls_keep_notes_scoped_to_the_gateway_device"
+  ],
+  "notes": [
+    "Native context projects incomplete or orphan historical tool groups as explicit untrusted unconfirmed data, not as callable functions or invented tool results",
+    "Complete assistant/result groups remain typed in original order; stored checkpoints are not rewritten by projection",
+    "Projected role/content/function fields and unconfirmed wrappers are charged using the existing heuristic token counter; an over-budget projection fails before inference rather than enlarging its allowance",
+    "The real Chat fixture terminates only its own unapproved daemon child, restarts the same isolated state and device, preserves original outcome_unknown and idempotency, and completes a distinct new request without executing the unapproved tool",
+    "Chat observes eight inference requests including interrupted and new runs; Responses and Anthropic keep their existing six-request complete-tool regression modes. Interrupted process coverage is Chat only",
+    "The six memory-tool audit records remain unchanged, demonstrating the additional unapproved save did not execute; the new request gets old unresolved information as data only",
+    "This does not authorize retrying an unknown external effect or prove model resistance to prompt injection",
+    "No production/user process was stopped, no real accounts/browser/device migration/deployment/Git writes or dependency changes occurred"
+  ],
+  "unverified": [
+    "Automatic context compaction when final projection exceeds its budget; operator-driven compaction or authorized configuration may still be required",
+    "Interrupted process acceptance for other provider dialects/platforms and external-effect reconciliation after an already approved tool began",
+    "Runtime usage/finish/cost durability, signed/opaque reasoning and both prior native-credential anomalies",
+    "Complete frozen manifests, release and whole-project acceptance"
+  ]
+}

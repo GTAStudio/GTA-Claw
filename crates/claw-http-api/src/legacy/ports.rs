@@ -177,6 +177,12 @@ pub trait LegacyTeamsPort: Send + Sync {
 pub struct LegacyChannelMessage {
     /// Stable channel identity.
     pub channel: &'static str,
+    /// Account identifier established by the authenticated channel adapter.
+    pub account_id: String,
+    /// Provider message identity retained for durable processing.
+    pub message_id: String,
+    /// Stable sender identifier, never substituted from a display name.
+    pub sender_id: String,
     /// Conversation/session identity.
     pub conversation_id: String,
     /// Display identity supplied by the channel.
@@ -193,6 +199,18 @@ pub trait LegacyChannelMessagePort: Send + Sync {
         message: LegacyChannelMessage,
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<String, PortError>>;
+
+    /// Processes a message with an owned host lifetime; native hosts may retain durable execution.
+    fn process_owned(
+        self: Arc<Self>,
+        message: LegacyChannelMessage,
+        cancellation: CancellationToken,
+    ) -> PortFuture<'static, Result<String, PortError>>
+    where
+        Self: 'static,
+    {
+        Box::pin(async move { self.process(message, cancellation).await })
+    }
 }
 
 /// Sends one already-bounded `WhatsApp` text chunk.

@@ -280,7 +280,7 @@ async fn chat(
     }
     let value = match read_legacy_json(&state, request).await {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let object = value.as_object();
     let message = first_string(object, &["message", "text", "prompt"]).map_or("", str::trim);
@@ -374,7 +374,7 @@ async fn teams_messages(
     let context = LegacyTeamsRequestContext::from_headers(request.headers());
     let activity = match read_legacy_json(&state, request).await {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Ok(context) = context else {
         return legacy_error(StatusCode::BAD_REQUEST, "Invalid Authorization header");
@@ -454,7 +454,7 @@ async fn whatsapp_incoming(State(state): State<LegacyState>, request: Request) -
     };
     let payload = match read_legacy_raw_body(&state, request).await {
         Ok(payload) => payload,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let services = state
         .inner
@@ -622,7 +622,7 @@ async fn admin_exec(
     }
     let value = match read_legacy_json(&state, request).await {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let object = value.as_object();
     let action_name = object
@@ -789,7 +789,7 @@ async fn drain_for_refusal(state: &LegacyState, request: Request, response: Resp
     .await
 }
 
-async fn read_legacy_json(state: &LegacyState, request: Request) -> Result<Value, Response> {
+async fn read_legacy_json(state: &LegacyState, request: Request) -> Result<Value, Box<Response>> {
     read_json_value(
         request,
         state.inner.config.limits.body_bytes,
@@ -804,18 +804,23 @@ async fn read_legacy_json(state: &LegacyState, request: Request) -> Result<Value
             _ => "Invalid request body",
         };
         let response = legacy_error(status, message);
-        if matches!(
-            status,
-            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::REQUEST_TIMEOUT
-        ) {
-            close_connection_response(response)
-        } else {
-            response
-        }
+        Box::new(
+            if matches!(
+                status,
+                StatusCode::PAYLOAD_TOO_LARGE | StatusCode::REQUEST_TIMEOUT
+            ) {
+                close_connection_response(response)
+            } else {
+                response
+            },
+        )
     })
 }
 
-async fn read_legacy_raw_body(state: &LegacyState, request: Request) -> Result<Bytes, Response> {
+async fn read_legacy_raw_body(
+    state: &LegacyState,
+    request: Request,
+) -> Result<Bytes, Box<Response>> {
     read_raw_body(
         request,
         state.inner.config.limits.body_bytes,
@@ -830,14 +835,16 @@ async fn read_legacy_raw_body(state: &LegacyState, request: Request) -> Result<B
             _ => "Invalid request body",
         };
         let response = legacy_error(status, message);
-        if matches!(
-            status,
-            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::REQUEST_TIMEOUT
-        ) {
-            close_connection_response(response)
-        } else {
-            response
-        }
+        Box::new(
+            if matches!(
+                status,
+                StatusCode::PAYLOAD_TOO_LARGE | StatusCode::REQUEST_TIMEOUT
+            ) {
+                close_connection_response(response)
+            } else {
+                response
+            },
+        )
     })
 }
 
@@ -846,6 +853,14 @@ fn legacy_error(status: StatusCode, message: &str) -> Response {
 }
 
 fn legacy_chat_error(error: &PortError) -> Response {
+    if error.kind == PortErrorKind::OutcomeUnknown {
+        return json_response(
+            StatusCode::CONFLICT,
+            &json!({
+                "error": error.message, "type": "outcome_unknown", "retryable": false, "recoveryRequired": true
+            }),
+        );
+    }
     if error.kind == PortErrorKind::CommittedButNotDurable {
         return json_response(
             StatusCode::CONFLICT,

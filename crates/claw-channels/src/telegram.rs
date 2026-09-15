@@ -180,6 +180,7 @@ pub struct TelegramChannel<T, C> {
     lifecycle: ConnectionStateMachine,
     inbound: BoundedQueue<InboundMessage>,
     offset: i64,
+    pending_offset: Option<i64>,
     poll_interval: Duration,
 }
 
@@ -214,6 +215,7 @@ impl<T, C> TelegramChannel<T, C> {
             lifecycle: ConnectionStateMachine::new(),
             inbound: BoundedQueue::new(inbound_capacity),
             offset: 0,
+            pending_offset: None,
             poll_interval,
         })
     }
@@ -228,6 +230,63 @@ impl<T, C> TelegramChannel<T, C> {
     #[must_use]
     pub const fn offset(&self) -> i64 {
         self.offset
+    }
+
+    /// Restores a host-verified durable cursor before the first connection starts.
+    ///
+    /// # Errors
+    /// Refuses negative cursors, running/stopped adapters and any outstanding inbound batch.
+    pub fn restore_poll_cursor(&mut self, offset: i64) -> Result<(), ChannelError> {
+        if offset < 0
+            || self.state() != ConnectionState::Disconnected
+            || self.pending_offset.is_some()
+            || self.queued_inbound() != 0
+        {
+            return Err(ChannelError::Configuration(
+                ConfigurationError::InvalidAdapterConfiguration,
+            ));
+        }
+        self.offset = offset;
+        Ok(())
+    }
+
+    /// Rewinds a drained running poller after the host has durably expired its idle cursor.
+    ///
+    /// # Errors
+    /// Refuses any unprocessed batch or an adapter that is not running.
+    pub fn rewind_expired_poll_cursor(&mut self) -> Result<(), ChannelError> {
+        if self.state() != ConnectionState::Connected
+            || self.pending_offset.is_some()
+            || self.queued_inbound() != 0
+        {
+            return Err(ChannelError::Configuration(
+                ConfigurationError::InvalidAdapterConfiguration,
+            ));
+        }
+        self.offset = 0;
+        Ok(())
+    }
+
+    /// Settles the last deferred poll after the host has drained its messages.
+    ///
+    /// # Errors
+    /// Refuses an absent deferred batch or a batch with messages still queued.
+    pub fn finish_polled_batch(&mut self, processed: bool) -> Result<bool, ChannelError> {
+        if self.queued_inbound() != 0 {
+            return Err(ChannelError::Configuration(
+                ConfigurationError::InvalidAdapterConfiguration,
+            ));
+        }
+        let Some(next) = self.pending_offset.take() else {
+            return Err(ChannelError::Configuration(
+                ConfigurationError::InvalidAdapterConfiguration,
+            ));
+        };
+        let changed = processed && next > self.offset;
+        if processed {
+            self.offset = next;
+        }
+        Ok(changed)
     }
 
     /// Returns the configured delay between poll attempts.
@@ -286,6 +345,7 @@ impl<T, C> TelegramChannel<T, C> {
         self.lifecycle
             .apply(LifecycleEvent::ShutdownRequested, &mut ())?;
         self.inbound.clear();
+        self.pending_offset = None;
         diagnostics.record(self.diagnostic(
             DiagnosticLevel::Info,
             DiagnosticCode::ChannelStopped,
@@ -316,6 +376,8 @@ impl<T, C> TelegramChannel<T, C> {
     }
 }
 
+type InboundAdmission<'a> = dyn FnMut(&InboundMessage) -> Result<bool, ChannelError> + 'a;
+
 impl<T: TelegramTransport, C: UnixClock> TelegramChannel<T, C> {
     /// Performs one offset-based long-poll request and normalizes its updates.
     ///
@@ -333,7 +395,54 @@ impl<T: TelegramTransport, C: UnixClock> TelegramChannel<T, C> {
         credential: &ChannelCredential,
         diagnostics: &mut impl DiagnosticSink,
     ) -> Result<TelegramPollStats, ChannelError> {
+        self.poll_with_admission(credential, diagnostics, None)
+    }
+
+    /// Polls without acknowledging a batch before the host has durably admitted its messages.
+    ///
+    /// The callback returns true to queue work, or false for an already handled durable identity.
+    /// Failed admission or a full queue leaves the previous offset unchanged for provider replay.
+    ///
+    /// # Errors
+    /// Returns polling failures from [`Self::poll_once`], or the host admission error.
+    pub fn poll_once_with_admission(
+        &mut self,
+        credential: &ChannelCredential,
+        diagnostics: &mut impl DiagnosticSink,
+        mut admission: impl FnMut(&InboundMessage) -> Result<bool, ChannelError>,
+    ) -> Result<TelegramPollStats, ChannelError> {
+        self.poll_with_admission(credential, diagnostics, Some(&mut admission))
+    }
+
+    /// Admits messages without advancing the provider acknowledgement until host processing settles.
+    ///
+    /// # Errors
+    /// Returns polling/admission failures, or refuses a previous unfinished deferred batch.
+    pub fn poll_once_for_processing(
+        &mut self,
+        credential: &ChannelCredential,
+        diagnostics: &mut impl DiagnosticSink,
+        mut admission: impl FnMut(&InboundMessage) -> Result<bool, ChannelError>,
+    ) -> Result<TelegramPollStats, ChannelError> {
+        let previous = self.offset;
+        let stats = self.poll_with_admission(credential, diagnostics, Some(&mut admission))?;
+        self.pending_offset = Some(self.offset);
+        self.offset = previous;
+        Ok(stats)
+    }
+
+    fn poll_with_admission(
+        &mut self,
+        credential: &ChannelCredential,
+        diagnostics: &mut impl DiagnosticSink,
+        mut admission: Option<&mut InboundAdmission<'_>>,
+    ) -> Result<TelegramPollStats, ChannelError> {
         self.require_running()?;
+        if self.pending_offset.is_some() {
+            return Err(ChannelError::Configuration(
+                ConfigurationError::InvalidAdapterConfiguration,
+            ));
+        }
         let offset = (self.offset > 0).then_some(self.offset);
         let response = credential
             .expose_for_origin(
@@ -378,12 +487,16 @@ impl<T: TelegramTransport, C: UnixClock> TelegramChannel<T, C> {
             updates: envelope.result.len(),
             ..TelegramPollStats::default()
         };
+        let mut admitted_offset = self.offset;
         for update in envelope.result {
             let next_offset = update
                 .update_id
                 .checked_add(1)
                 .ok_or(ChannelError::Protocol(ProtocolErrorKind::InvalidField))?;
-            self.offset = self.offset.max(next_offset);
+            admitted_offset = admitted_offset.max(next_offset);
+            if admission.is_none() {
+                self.offset = admitted_offset;
+            }
 
             let Some(message) = update.message else {
                 stats.ignored += 1;
@@ -441,6 +554,12 @@ impl<T: TelegramTransport, C: UnixClock> TelegramChannel<T, C> {
                 attachments: Vec::new(),
                 received_at_unix_ms,
             };
+            if let Some(admit) = admission.as_mut()
+                && !admit(&normalized)?
+            {
+                stats.ignored += 1;
+                continue;
+            }
             if let Err(dropped) = self.inbound.push(normalized) {
                 stats.dropped += 1;
                 diagnostics.record(self.diagnostic(
@@ -450,10 +569,16 @@ impl<T: TelegramTransport, C: UnixClock> TelegramChannel<T, C> {
                     None,
                     None,
                 ));
+                if admission.is_some() {
+                    return Err(ChannelError::RateLimited {
+                        retry_after: self.poll_interval,
+                    });
+                }
             } else {
                 stats.queued += 1;
             }
         }
+        self.offset = admitted_offset;
         stats.next_offset = self.offset;
         Ok(stats)
     }

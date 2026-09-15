@@ -140,6 +140,121 @@ fn tab_until_connection_action(
 }
 
 #[test]
+fn native_memory_form_renders_at_narrow_and_wide_sizes_and_closes_on_binding_change() {
+    let software_window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+    slint::platform::set_platform(Box::new(SoftwarePlatform {
+        window: software_window.clone(),
+        started: Instant::now(),
+    }))
+    .expect("isolated memory software renderer");
+    let app = AppWindow::new().expect("native memory component tree");
+    let view = crate::ProductView::attach(&app, crate::product_state::ProductState::native())
+        .expect("native view");
+    view.state
+        .borrow_mut()
+        .apply_native(crate::controller::ProductUpdate::Ready {
+            connection: crate::controller::ProductConnection {
+                generation: 0,
+                epoch: 1,
+            },
+        });
+    view.apply(&app);
+    app.set_workspace_ready(true);
+    app.set_selected_screen(7);
+    app.show().expect("headless memory tree");
+    for (width, height) in [(1080_u16, 720_u16), (720, 520)] {
+        app.set_layout_width(f32::from(width));
+        software_window.set_size(slint::PhysicalSize::new(
+            u32::from(width),
+            u32::from(height),
+        ));
+        app.set_memory_open(false);
+        let closed = render(&software_window, width as usize, height as usize);
+        app.set_memory_open(true);
+        let opened = render(&software_window, width as usize, height as usize);
+        assert!(app.get_memory_open());
+        assert!(changed_pixel_count(&closed, &opened) > 1_000);
+        assert!(
+            opened
+                .iter()
+                .filter(|pixel| **pixel != RgbPixel::default())
+                .count()
+                > 10_000
+        );
+        let text = format!(
+            "{{\"content\":\"{}\",\"revision\":9}}",
+            "\u{4e2d}\u{6587} ".repeat(500)
+        );
+        app.set_memory_result(text.as_str().into());
+        let _ = render(&software_window, width as usize, height as usize);
+        assert_eq!(app.get_memory_result().as_str(), text);
+    }
+    app.set_memory_binding("0:2:another-session".into());
+    let _ = render(&software_window, 720, 520);
+    assert!(!app.get_memory_open());
+    app.hide().expect("hide software memory tree");
+}
+
+#[test]
+fn native_product_empty_history_and_complete_approval_render_without_demo_data() {
+    let software_window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+    slint::platform::set_platform(Box::new(SoftwarePlatform {
+        window: software_window.clone(),
+        started: Instant::now(),
+    }))
+    .expect("isolated native software renderer");
+    let app = AppWindow::new().expect("native component tree");
+    let view = crate::ProductView::attach(&app, crate::product_state::ProductState::native())
+        .expect("native product view");
+    view.apply(&app);
+    assert_eq!(app.get_transcript().row_count(), 0);
+    assert_eq!(app.get_workspaces().row_count(), 0);
+    assert_eq!(app.get_deliverables().row_count(), 0);
+    assert!(!app.get_can_approve());
+    app.set_workspace_ready(true);
+    app.set_layout_width(1080.0);
+    software_window.set_size(slint::PhysicalSize::new(1080, 720));
+    app.show().expect("headless native view");
+    let empty = render(&software_window, 1080, 720);
+    assert!(
+        empty
+            .iter()
+            .filter(|pixel| **pixel != RgbPixel::default())
+            .count()
+            > 10_000
+    );
+    let connection = crate::controller::ProductConnection {
+        generation: 0,
+        epoch: 1,
+    };
+    view.state
+        .borrow_mut()
+        .apply_native(crate::controller::ProductUpdate::Ready { connection });
+    view.state.borrow_mut().apply_native(crate::controller::ProductUpdate::Response {
+        connection,
+        method: "exec.approval.get",
+        params: serde_json::json!({"id": "approval-1"}),
+        payload: serde_json::json!({"id": "approval-1", "sessionId": "native-session", "previewComplete": true, "redacted": true, "prompt": "write-file\n{\"path\":\"example.txt\",\"apiKey\":\"[REDACTED]\"}"}),
+    });
+    view.apply(&app);
+    assert!(app.get_can_approve());
+    assert!(app.get_approval_prompt().contains("example.txt"));
+    let approval = render(&software_window, 1080, 720);
+    assert!(changed_pixel_count(&empty, &approval) > 100);
+    app.set_layout_width(720.0);
+    software_window.set_size(slint::PhysicalSize::new(720, 520));
+    let narrow = render(&software_window, 720, 520);
+    assert!(
+        narrow
+            .iter()
+            .filter(|pixel| **pixel != RgbPixel::default())
+            .count()
+            > 10_000
+    );
+    app.hide().expect("hide headless native view");
+}
+
+#[test]
 fn software_renderer_constructs_onboarding_and_every_product_screen() {
     let software_window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
     slint::platform::set_platform(Box::new(SoftwarePlatform {

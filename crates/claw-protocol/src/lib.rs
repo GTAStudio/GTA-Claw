@@ -11,6 +11,7 @@ use claw_domain::{DomainError, SessionId};
 pub mod events;
 pub mod gateway;
 pub mod methods;
+pub mod native_approval;
 
 /// The protocol version implemented by this workspace.
 pub const PROTOCOL_VERSION: u16 = 1;

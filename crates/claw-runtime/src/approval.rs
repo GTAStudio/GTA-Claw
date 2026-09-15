@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use claw_application::model::approval::{
 use claw_application::model::ids::{ApprovalId, ToolCallId, TurnId};
 use claw_application::ports::approval::ApprovalPort;
 use claw_application::ports::clock::ClockPort;
+use claw_application::ports::tool::{InvocationAuthority, ToolBinding};
 use claw_application::ports::{PortError, PortFuture};
 use claw_domain::SessionId;
 use tokio::sync::oneshot;
@@ -71,7 +73,12 @@ pub struct ApprovalTicket {
 
 struct Pending {
     request: ApprovalRequest,
+    authority: Option<InvocationAuthority>,
+    binding: Option<ToolBinding>,
+    binding_token: Option<String>,
     responder: oneshot::Sender<ApprovalDecision>,
+    cancellation: CancellationToken,
+    decision_accepted: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -106,6 +113,7 @@ struct PendingGuard {
     state: Arc<Mutex<BrokerState>>,
     approvals: Arc<dyn ApprovalPort>,
     approval_id: ApprovalId,
+    decision_accepted: Arc<AtomicBool>,
     armed: bool,
 }
 
@@ -127,7 +135,7 @@ impl Drop for PendingGuard {
             let mut state = lock_state(&self.state);
             state.pending.remove(&self.approval_id).is_some()
         };
-        if removed {
+        if removed || self.decision_accepted.load(Ordering::Acquire) {
             self.approvals.abandon(&self.approval_id);
         }
     }
@@ -191,6 +199,25 @@ impl ApprovalBroker {
         requests
     }
 
+    /// Returns the immutable authenticated claims for a still-outstanding request.
+    #[must_use]
+    pub fn authority(&self, id: &ApprovalId) -> Option<InvocationAuthority> {
+        self.lock()
+            .pending
+            .get(id)
+            .and_then(|pending| pending.authority.clone())
+    }
+
+    /// Returns a pending call's publication and one-use preview token to an authorized presenter.
+    #[must_use]
+    pub fn binding(&self, id: &ApprovalId) -> Option<(ToolBinding, String)> {
+        let state = self.lock();
+        let pending = state.pending.get(id)?;
+        let binding = (pending.binding.clone()?, pending.binding_token.clone()?);
+        drop(state);
+        Some(binding)
+    }
+
     /// Returns the decision remembered for a tool in a session, if any.
     #[must_use]
     pub fn remembered(&self, session_id: &SessionId, tool_name: &str) -> Option<ApprovalDecision> {
@@ -247,12 +274,57 @@ impl ApprovalBroker {
         approval_id: &ApprovalId,
         decision: ApprovalDecision,
     ) -> Result<(), ApprovalError> {
+        self.resolve_inner(approval_id, decision, None)
+    }
+
+    /// Answers exactly the call whose full preview supplied this one-use token.
+    ///
+    /// # Errors
+    /// Rejects missing, changed, expired or already-used preview bindings.
+    pub fn resolve_bound(
+        &self,
+        id: &ApprovalId,
+        decision: ApprovalDecision,
+        token: &str,
+    ) -> Result<(), ApprovalError> {
+        self.resolve_inner(id, decision, Some(token))
+    }
+
+    fn resolve_inner(
+        &self,
+        approval_id: &ApprovalId,
+        decision: ApprovalDecision,
+        token: Option<&str>,
+    ) -> Result<(), ApprovalError> {
         let pending = {
             let mut state = self.lock();
+            let request = state
+                .pending
+                .get(approval_id)
+                .ok_or_else(|| ApprovalError::Unknown(approval_id.clone()))?;
+            if request.cancellation.is_cancelled()
+                || request
+                    .authority
+                    .as_ref()
+                    .is_some_and(|authority| !authority.can_execute())
+                || request.responder.is_closed()
+                || self.clock.now() >= request.request.expires_at
+            {
+                return Err(ApprovalError::Unknown(approval_id.clone()));
+            }
+            if request.authority.is_some() && decision.scope.is_remembered() {
+                return Err(ApprovalError::Port(PortError::Invalid(
+                    "authenticated tool approvals are restricted to this invocation".to_owned(),
+                )));
+            }
+            if request.binding_token.as_deref() != token {
+                return Err(ApprovalError::Unknown(approval_id.clone()));
+            }
             let pending = state
                 .pending
                 .remove(approval_id)
                 .ok_or_else(|| ApprovalError::Unknown(approval_id.clone()))?;
+            pending.decision_accepted.store(true, Ordering::Release);
             if decision.scope.is_remembered() {
                 state
                     .remembered
@@ -320,7 +392,57 @@ impl ApprovalBroker {
         ticket: ApprovalTicket,
         cancel: &CancellationToken,
     ) -> Result<ApprovalOutcome, ApprovalError> {
-        if let Some(decision) = self.remembered(&ticket.session_id, &ticket.tool_name) {
+        self.request_inner(ticket, None, None, cancel).await
+    }
+
+    /// Requests a once-scoped decision bound to authenticated caller claims.
+    ///
+    /// # Errors
+    /// Reports the same presentation and identifier errors as [`Self::request`].
+    pub async fn request_authorized(
+        &self,
+        ticket: ApprovalTicket,
+        authority: InvocationAuthority,
+        cancel: &CancellationToken,
+    ) -> Result<ApprovalOutcome, ApprovalError> {
+        self.request_inner(ticket, Some(authority), None, cancel)
+            .await
+    }
+
+    /// Requests approval of one immutable caller, input and tool publication.
+    ///
+    /// # Errors
+    /// Refuses adapters without secure preview tokens and the usual approval failures.
+    pub async fn request_bound(
+        &self,
+        ticket: ApprovalTicket,
+        authority: InvocationAuthority,
+        binding: ToolBinding,
+        cancel: &CancellationToken,
+    ) -> Result<ApprovalOutcome, ApprovalError> {
+        self.request_inner(ticket, Some(authority), Some(binding), cancel)
+            .await
+    }
+
+    async fn request_inner(
+        &self,
+        ticket: ApprovalTicket,
+        authority: Option<InvocationAuthority>,
+        binding: Option<ToolBinding>,
+        cancel: &CancellationToken,
+    ) -> Result<ApprovalOutcome, ApprovalError> {
+        if cancel.is_cancelled()
+            || authority
+                .as_ref()
+                .is_some_and(|authority| !authority.can_execute())
+        {
+            return Ok(ApprovalOutcome::Withdrawn {
+                reason: ApprovalWithdrawal::Cancelled,
+            });
+        }
+        if authority.is_none()
+            && let Some(decision) = self.remembered(&ticket.session_id, &ticket.tool_name)
+        {
             return Ok(ApprovalOutcome::Decided {
                 decision,
                 remembered: true,
@@ -365,11 +487,29 @@ impl ApprovalBroker {
             expires_at,
         };
         let (responder, receiver) = oneshot::channel();
+        let binding_token = if binding.is_some() {
+            let token = self.approvals.binding_token()?;
+            if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(PortError::Invalid(
+                    "approval binding token is not a 256-bit encoded value".to_owned(),
+                )
+                .into());
+            }
+            Some(token)
+        } else {
+            None
+        };
+        let decision_accepted = Arc::new(AtomicBool::new(false));
         self.lock().pending.insert(
             approval_id.clone(),
             Pending {
                 request: request.clone(),
+                authority: authority.clone(),
+                binding,
+                binding_token,
                 responder,
+                cancellation: cancel.clone(),
+                decision_accepted: Arc::clone(&decision_accepted),
             },
         );
 
@@ -378,10 +518,15 @@ impl ApprovalBroker {
             state: Arc::clone(&self.state),
             approvals: Arc::clone(&self.approvals),
             approval_id: approval_id.clone(),
+            decision_accepted,
             armed: true,
         };
 
-        if let Err(error) = self.approvals.present(request).await {
+        let presented = match authority.clone() {
+            Some(authority) => self.approvals.present_authorized(request, authority).await,
+            None => self.approvals.present(request).await,
+        };
+        if let Err(error) = presented {
             guard.disarm();
             self.discard(&approval_id);
             return Err(ApprovalError::Port(error));
@@ -389,8 +534,14 @@ impl ApprovalBroker {
 
         let outcome = tokio::select! {
             biased;
-            decided = receiver => decided.ok(),
             () = cancel.cancelled() => None,
+            () = async {
+                match authority.as_ref() {
+                    Some(authority) => authority.revoked().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => None,
+            decided = receiver => decided.ok(),
             () = self.clock.sleep_until(expires_at) => None,
         };
 
@@ -401,12 +552,16 @@ impl ApprovalBroker {
 
         let Some(decision) = outcome else {
             let still_pending = self.discard(&approval_id);
-            let reason = if cancel.is_cancelled() {
+            let reason = if cancel.is_cancelled()
+                || authority
+                    .as_ref()
+                    .is_some_and(InvocationAuthority::is_revoked)
+            {
                 ApprovalWithdrawal::Cancelled
             } else {
                 ApprovalWithdrawal::TimedOut
             };
-            if still_pending {
+            if still_pending || guard.decision_accepted.load(Ordering::Acquire) {
                 self.approvals.withdraw(&approval_id, reason).await?;
             }
             return Ok(ApprovalOutcome::Withdrawn { reason });

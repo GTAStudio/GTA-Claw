@@ -11,6 +11,68 @@ use gta_claw_tui::render::{flush, flush_changes, render};
 use gta_claw_tui::terminal::{TerminalControl, TerminalSession};
 
 #[test]
+fn composer_tail_keeps_latest_wide_character_input_visible_at_small_widths() {
+    let model = AppModel {
+        screen: Screen::Workspace,
+        composer_open: true,
+        composer: format!("old input\n{}TAIL", "\u{4e2d}\u{6587}".repeat(80)),
+        ..AppModel::default()
+    };
+    for width in [20, 40, 80, 120] {
+        for height in [10, 24] {
+            let grid = render(&model, width, height, true);
+            assert_eq!(grid.width(), width);
+            assert_eq!(grid.height(), height);
+            assert!(
+                grid.line(height - 4).trim_end().ends_with("TAIL"),
+                "{width}x{height}"
+            );
+            assert!(!grid.line(height - 4).contains("old input"));
+        }
+    }
+}
+
+#[test]
+fn partial_transcript_pages_wrap_inside_the_workspace_at_narrow_and_wide_sizes() {
+    let mut model = AppModel {
+        screen: Screen::Workspace,
+        sessions: vec![SessionSummary {
+            id: "owned".to_owned(),
+            state: RunState::OutcomeUnknown,
+            ..SessionSummary::default()
+        }],
+        ..AppModel::default()
+    };
+    model.transcript.push_back(TranscriptEntry {
+        role: "partial [0..2048/4096 bytes]".to_owned(),
+        text: format!("{}Z", "\u{4e2d}\u{6587}".repeat(120)),
+    });
+    for width in [40, 80, 120] {
+        for height in [10, 24] {
+            model.scroll = 0;
+            let grid = render(&model, width, height, true);
+            assert_eq!((grid.width(), grid.height()), (width, height));
+            assert!((6..height - 2).any(|row| grid.line(row).contains('Z')));
+            let split = width * 2 / 3;
+            for row in 6..height - 2 {
+                assert_eq!(grid.cell(split, row).expect("column separator").symbol, '|');
+                assert!(
+                    grid.line(row)
+                        .chars()
+                        .all(|character| !character.is_control())
+                );
+            }
+            model.scroll = usize::MAX;
+            assert!(
+                render(&model, width, height, true)
+                    .line(6)
+                    .contains("partial")
+            );
+        }
+    }
+}
+
+#[test]
 fn fake_backend_renders_every_run_state_with_unique_marker_and_color() {
     let mut model = AppModel {
         screen: Screen::Runs,
@@ -38,6 +100,7 @@ fn fake_backend_renders_every_run_state_with_unique_marker_and_color() {
         "[? Waiting for answer]",
         "[P Paused]",
         "[B Blocked]",
+        "[! Outcome unknown]",
         "[F Failed]",
         "[X Cancelled]",
         "[C Completed]",
@@ -57,7 +120,7 @@ fn fake_backend_renders_every_run_state_with_unique_marker_and_color() {
                 .foreground,
         );
     }
-    assert_eq!(colors.len(), 12);
+    assert_eq!(colors.len(), 13);
 }
 
 #[test]
@@ -73,6 +136,7 @@ fn fake_backend_renders_workspace_diff_artifacts_and_palette_cells() {
             progress: Some(60),
         }],
         prompt: Some(Prompt::Approval {
+            preview_fingerprint: None,
             id: "approval-1".to_owned(),
             text: "Run cargo test?".to_owned(),
         }),
@@ -236,16 +300,16 @@ fn monochrome_render_retains_distinct_state_markers() {
         })
         .collect();
     let grid = render(&model, 90, 24, true);
-    let markers: String = (0..12)
+    let markers: String = (0..13)
         .map(|index| {
             grid.cell(31, 6 + index)
                 .expect("monochrome marker cell")
                 .symbol
         })
         .collect();
-    assert_eq!(markers, "DQSRA?PBFXC+");
+    assert_eq!(markers, "DQSRA?PB!FXC+");
     assert_eq!(
-        (0..12)
+        (0..13)
             .map(|index| {
                 grid.cell(30, 6 + index)
                     .expect("monochrome state cell")
@@ -253,7 +317,7 @@ fn monochrome_render_retains_distinct_state_markers() {
                     .foreground
             })
             .collect::<Vec<_>>(),
-        vec![None; 12]
+        vec![None; 13]
     );
 }
 
@@ -407,10 +471,42 @@ fn unicode_output_reanchors_the_terminal_cursor() {
     let mut out = Vec::new();
     flush(&mut out, &grid, true).expect("flush unicode frame");
     assert!(
-        out.windows(b"\x1b[1;13H".len())
-            .any(|window| window == b"\x1b[1;13H"),
+        out.windows(b"\x1b[1;14H".len())
+            .any(|window| window == b"\x1b[1;14H"),
         "the cell after a non-ASCII glyph must use an absolute cursor position"
     );
+}
+
+#[test]
+fn native_long_transcripts_wrap_without_overwriting_the_tool_column() {
+    let mut model = AppModel {
+        screen: Screen::Workspace,
+        viewport: (60, 16),
+        ..AppModel::default()
+    };
+    model.transcript.push_back(TranscriptEntry {
+        role: "assistant".to_owned(),
+        text: format!("FIRST {} LAST", "long reply ".repeat(40)),
+    });
+    model.tools.push_back(ToolActivity {
+        name: "tool".to_owned(),
+        status: "ok".to_owned(),
+        summary: "separate".to_owned(),
+    });
+    let tail = render(&model, 60, 16, true);
+    assert!(tail.text().contains("LAST"));
+    assert!(tail.text().contains("tool [ok] separate"));
+    for row in 6..14 {
+        assert_eq!(tail.cell(40, row).expect("column separator").symbol, '|');
+    }
+    model.scroll = 1000;
+    let start = render(&model, 60, 16, true);
+    assert!(start.text().contains("FIRST"));
+    model.composer_open = true;
+    model.composer = "visible draft".to_owned();
+    let composing = render(&model, 60, 16, true);
+    assert!(composing.line(11).contains("Message"));
+    assert!(composing.line(12).contains("visible draft"));
 }
 
 #[test]

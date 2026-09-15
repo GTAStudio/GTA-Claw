@@ -26,9 +26,9 @@ pub mod worker;
 
 pub use approval::{ApprovalBroker, ApprovalError};
 pub use command::{
-    CommandEffect, CommandError, CommandInvocation, CommandRegistry, CommandSpec, Directive,
-    DirectiveError, DirectiveRegistry, DirectiveScan, DirectiveSpec, OperatorScope, ScopeSet,
-    TurnOptions,
+    CommandEffect, CommandError, CommandInvocation, CommandRegistry, CommandSpec, DirectTool,
+    Directive, DirectiveError, DirectiveRegistry, DirectiveScan, DirectiveSpec, OperatorScope,
+    ScopeSet, TurnOptions,
 };
 pub use context::{ConformanceCheck, ConformanceReport, verify_context_engine};
 pub use context_engine::{

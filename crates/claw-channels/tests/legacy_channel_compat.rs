@@ -138,6 +138,233 @@ impl TelegramTransport for TelegramFixture {
 }
 
 #[test]
+fn telegram_cursor_restore_is_startup_only_and_controls_the_first_poll() {
+    let offsets = Rc::new(RefCell::new(Vec::new()));
+    let transport = TelegramFixture {
+        polls: VecDeque::from([
+            Ok(ProviderResponse::new(
+                200,
+                br#"{"ok":true,"result":[]}"#.as_slice(),
+            )),
+            Ok(ProviderResponse::new(
+                200,
+                br#"{"ok":true,"result":[]}"#.as_slice(),
+            )),
+        ]),
+        poll_offsets: Rc::clone(&offsets),
+        sent: Rc::new(RefCell::new(Vec::new())),
+        debug: Rc::new(RefCell::new(Vec::new())),
+    };
+    let mut channel = TelegramChannel::new(
+        ACCOUNT,
+        approved_origin("telegram", "api.telegram.org"),
+        transport,
+        FixedClock(999),
+        NonZeroUsize::new(2).expect("queue"),
+        Duration::from_millis(250),
+    )
+    .expect("adapter");
+    let credential = token_credential("telegram", "api.telegram.org", "telegram-secret");
+    let mut diagnostics = Diagnostics::default();
+    assert!(channel.restore_poll_cursor(-1).is_err());
+    assert!(channel.rewind_expired_poll_cursor().is_err());
+    channel
+        .restore_poll_cursor(123)
+        .expect("durable pre-start cursor");
+    channel.start(&mut diagnostics).expect("started");
+    assert!(channel.restore_poll_cursor(0).is_err());
+    channel
+        .poll_once_for_processing(&credential, &mut diagnostics, |_| panic!("empty batch"))
+        .expect("first restored poll");
+    assert!(channel.rewind_expired_poll_cursor().is_err());
+    channel
+        .finish_polled_batch(true)
+        .expect("settled empty batch");
+    assert_eq!(*offsets.borrow(), [Some(123)]);
+    channel
+        .rewind_expired_poll_cursor()
+        .expect("drained host-expired cursor");
+    channel
+        .poll_once_for_processing(&credential, &mut diagnostics, |_| panic!("empty batch"))
+        .expect("rewound poll");
+    channel
+        .finish_polled_batch(true)
+        .expect("rewound empty batch");
+    assert_eq!(*offsets.borrow(), [Some(123), None]);
+    channel.stop(&mut diagnostics).expect("stopped");
+    assert!(channel.restore_poll_cursor(0).is_err());
+    assert!(channel.rewind_expired_poll_cursor().is_err());
+}
+
+#[test]
+fn telegram_provider_ack_waits_for_host_processing_and_replays_unsettled_batches() {
+    let payload = br#"{"ok":true,"result":[{"update_id":10,"message":{"message_id":1,"chat":{"id":-100},"from":{"id":7},"text":"first"}},{"update_id":11,"message":{"message_id":2,"chat":{"id":-100},"from":{"id":7},"text":"second"}}]}"#;
+    let offsets = Rc::new(RefCell::new(Vec::new()));
+    let transport = TelegramFixture {
+        polls: VecDeque::from([
+            Ok(ProviderResponse::new(200, payload.as_slice())),
+            Ok(ProviderResponse::new(200, payload.as_slice())),
+            Ok(ProviderResponse::new(
+                200,
+                br#"{"ok":true,"result":[]}"#.as_slice(),
+            )),
+        ]),
+        poll_offsets: Rc::clone(&offsets),
+        sent: Rc::new(RefCell::new(Vec::new())),
+        debug: Rc::new(RefCell::new(Vec::new())),
+    };
+    let mut channel = TelegramChannel::new(
+        ACCOUNT,
+        approved_origin("telegram", "api.telegram.org"),
+        transport,
+        FixedClock(999),
+        NonZeroUsize::new(2).expect("queue"),
+        Duration::from_millis(250),
+    )
+    .expect("adapter");
+    let credential = token_credential("telegram", "api.telegram.org", "telegram-secret");
+    let mut diagnostics = Diagnostics::default();
+    channel.start(&mut diagnostics).expect("started");
+    let polled = channel
+        .poll_once_for_processing(&credential, &mut diagnostics, |_| Ok(true))
+        .expect("durable batch");
+    assert_eq!(polled.next_offset, 12);
+    assert_eq!(channel.offset(), 0);
+    assert!(channel.finish_polled_batch(true).is_err());
+    assert!(channel.poll_once(&credential, &mut diagnostics).is_err());
+    assert_eq!(offsets.borrow().len(), 1);
+    assert!(channel.poll_inbound().expect("first").is_some());
+    assert!(channel.poll_inbound().expect("second").is_some());
+    assert!(
+        !channel
+            .finish_polled_batch(false)
+            .expect("unsettled processing")
+    );
+    assert_eq!(channel.offset(), 0);
+    let replayed = channel
+        .poll_once_for_processing(&credential, &mut diagnostics, |message| {
+            Ok(message.id != "1")
+        })
+        .expect("replay only unhandled durable identity");
+    assert_eq!(replayed.queued, 1);
+    assert_eq!(replayed.ignored, 1);
+    assert_eq!(
+        channel
+            .poll_inbound()
+            .expect("remaining")
+            .expect("queued message")
+            .id,
+        "2"
+    );
+    assert!(
+        channel
+            .finish_polled_batch(true)
+            .expect("settled processing")
+    );
+    assert_eq!(channel.offset(), 12);
+    channel
+        .poll_once_for_processing(&credential, &mut diagnostics, |_| {
+            panic!("empty next batch")
+        })
+        .expect("next poll");
+    assert!(
+        !channel
+            .finish_polled_batch(true)
+            .expect("empty settled batch")
+    );
+    assert_eq!(*offsets.borrow(), [None, None, Some(12)]);
+}
+
+#[test]
+fn telegram_durable_admission_defers_offset_until_persistence_and_queue_capacity_succeed() {
+    let payload = br#"{"ok":true,"result":[{"update_id":10,"message":{"message_id":1,"chat":{"id":-100},"from":{"id":7},"text":"first"}},{"update_id":11,"message":{"message_id":2,"chat":{"id":-100},"from":{"id":7},"text":"second"}}]}"#;
+    let offsets = Rc::new(RefCell::new(Vec::new()));
+    let transport = TelegramFixture {
+        polls: VecDeque::from([
+            Ok(ProviderResponse::new(200, payload.as_slice())),
+            Ok(ProviderResponse::new(200, payload.as_slice())),
+            Ok(ProviderResponse::new(200, payload.as_slice())),
+            Ok(ProviderResponse::new(
+                200,
+                br#"{"ok":true,"result":[]}"#.as_slice(),
+            )),
+        ]),
+        poll_offsets: Rc::clone(&offsets),
+        sent: Rc::new(RefCell::new(Vec::new())),
+        debug: Rc::new(RefCell::new(Vec::new())),
+    };
+    let mut channel = TelegramChannel::new(
+        ACCOUNT,
+        approved_origin("telegram", "api.telegram.org"),
+        transport,
+        FixedClock(999),
+        NonZeroUsize::new(1).expect("bounded queue"),
+        Duration::from_millis(250),
+    )
+    .expect("adapter");
+    let credential = token_credential("telegram", "api.telegram.org", "telegram-secret");
+    let mut diagnostics = Diagnostics::default();
+    channel.start(&mut diagnostics).expect("started");
+    assert!(
+        channel
+            .poll_once_with_admission(&credential, &mut diagnostics, |_| Err(
+                ChannelError::Transport(TransportErrorKind::Io)
+            ))
+            .is_err()
+    );
+    assert_eq!(channel.offset(), 0);
+    assert!(
+        channel
+            .poll_inbound()
+            .expect("empty after rejected admission")
+            .is_none()
+    );
+    let mut admitted = std::collections::BTreeSet::new();
+    let full = channel.poll_once_with_admission(&credential, &mut diagnostics, |message| {
+        admitted.insert(message.id.clone());
+        Ok(true)
+    });
+    assert!(matches!(full, Err(ChannelError::RateLimited { .. })));
+    assert_eq!(
+        channel.offset(),
+        0,
+        "a full queue must not acknowledge the batch"
+    );
+    assert_eq!(admitted.len(), 2, "input is durable before queue insertion");
+    assert_eq!(
+        channel
+            .poll_inbound()
+            .expect("first queued input")
+            .expect("message")
+            .id,
+        "1"
+    );
+    let recovered = channel
+        .poll_once_with_admission(&credential, &mut diagnostics, |message| {
+            assert!(admitted.contains(&message.id));
+            Ok(message.id != "1")
+        })
+        .expect("provider replay skips already handled input");
+    assert_eq!(recovered.queued, 1);
+    assert_eq!(recovered.ignored, 1);
+    assert_eq!(
+        channel
+            .poll_inbound()
+            .expect("remaining queued input")
+            .expect("message")
+            .id,
+        "2"
+    );
+    assert_eq!(channel.offset(), 12);
+    channel
+        .poll_once_with_admission(&credential, &mut diagnostics, |_| {
+            panic!("empty batch contains no new input")
+        })
+        .expect("next poll acknowledges only admitted batch");
+    assert_eq!(*offsets.borrow(), [None, None, None, Some(12)]);
+}
+
+#[test]
 fn telegram_polling_advances_offsets_filters_bots_bounds_queues_and_segments_replies() {
     let payload = br#"{
       "ok": true,
@@ -428,6 +655,193 @@ fn discord_channel(
         gateway,
         rest,
         debug,
+    }
+}
+
+#[test]
+fn discord_restored_session_resumes_only_before_start_and_revalidates_its_origin() {
+    let DiscordHarness {
+        mut channel,
+        gateway,
+        open_urls,
+        ..
+    } = discord_channel(VecDeque::new(), 3);
+    let credential = token_credential("discord", "gateway.discord.gg", "discord-gateway-secret");
+    let mut diagnostics = Diagnostics::default();
+    assert!(channel.restore_resume_state("session", -1, None).is_err());
+    for url in [
+        "ws://gateway.discord.gg",
+        "wss://evil.example",
+        "wss://gateway.discord.gg@evil.example",
+        "wss://gateway.discord.gg/?token=secret",
+    ] {
+        assert!(
+            channel
+                .restore_resume_state("session", 42, Some(url))
+                .is_err(),
+            "{url}"
+        );
+        assert!(channel.session_id().is_none());
+        assert!(channel.sequence().is_none());
+    }
+    channel
+        .restore_resume_state("session", 42, Some("wss://gateway-us-east1-b.discord.gg"))
+        .expect("verified saved resume");
+    channel
+        .start(Duration::ZERO, &mut diagnostics)
+        .expect("start");
+    assert_eq!(
+        open_urls.borrow().as_slice(),
+        ["wss://gateway-us-east1-b.discord.gg?v=10&encoding=json"]
+    );
+    assert!(channel.restore_resume_state("other", 100, None).is_err());
+    channel
+        .gateway_opened(&mut diagnostics)
+        .expect("socket opened");
+    channel
+        .handle_gateway_packet_with_admission(
+            br#"{"op":10,"s":null,"d":{"heartbeat_interval":1000}}"#,
+            Duration::ZERO,
+            &credential,
+            &mut diagnostics,
+            |_| panic!("hello has no message"),
+        )
+        .expect("resume");
+    assert_eq!(gateway.borrow().last().expect("resume request").opcode, 6);
+    assert_eq!(
+        gateway.borrow().last().expect("resume request").sequence,
+        Some(42)
+    );
+    assert_eq!(
+        gateway
+            .borrow()
+            .last()
+            .expect("resume request")
+            .session_id
+            .as_deref(),
+        Some("session")
+    );
+    for sequence in 43..143 {
+        let packet = format!(
+            r#"{{"op":0,"t":"MESSAGE_CREATE","s":{sequence},"d":{{"id":"replayed-{sequence}","channel_id":"room","content":"replayed data","author":{{"id":"user","username":"operator"}}}}}}"#
+        );
+        assert_eq!(
+            channel.handle_gateway_packet_with_admission(
+                packet.as_bytes(),
+                Duration::ZERO,
+                &credential,
+                &mut diagnostics,
+                |_| Ok(true)
+            ),
+            Ok(DiscordPacketOutcome::MessageQueued)
+        );
+        assert_eq!(
+            channel
+                .poll_admitted_inbound()
+                .expect("pre-RESUMED drain")
+                .expect("admitted message")
+                .id,
+            format!("replayed-{sequence}")
+        );
+        assert_eq!(channel.sequence(), Some(sequence));
+    }
+    assert!(
+        channel
+            .poll_admitted_inbound()
+            .expect("drained replay")
+            .is_none()
+    );
+    channel.stop(&mut diagnostics).expect("stop");
+    assert!(channel.restore_resume_state("session", 42, None).is_err());
+    assert!(channel.poll_admitted_inbound().is_err());
+}
+
+#[test]
+fn discord_durable_admission_preserves_resume_sequence_on_failed_or_dropped_dispatch() {
+    for failure in ["persistence", "queue", "malformed"] {
+        let DiscordHarness {
+            mut channel,
+            closes,
+            ..
+        } = discord_channel(VecDeque::new(), 3);
+        let credential =
+            token_credential("discord", "gateway.discord.gg", "discord-gateway-secret");
+        let mut diagnostics = Diagnostics::default();
+        channel
+            .start(Duration::ZERO, &mut diagnostics)
+            .expect("start");
+        channel.gateway_opened(&mut diagnostics).expect("opened");
+        channel
+            .handle_gateway_packet_with_admission(
+                br#"{"op":10,"s":null,"d":{"heartbeat_interval":1000}}"#,
+                Duration::ZERO,
+                &credential,
+                &mut diagnostics,
+                |_| panic!("hello has no message"),
+            )
+            .expect("identify");
+        channel.handle_gateway_packet_with_admission(br#"{"op":0,"t":"READY","s":7,"d":{"session_id":"session-1","resume_gateway_url":"wss://gateway-us-east1-b.discord.gg"}}"#, Duration::ZERO, &credential, &mut diagnostics, |_| panic!("ready has no message")).expect("ready");
+        assert_eq!(channel.sequence(), Some(7));
+        if failure == "queue" {
+            for sequence in [8, 9] {
+                let packet = format!(
+                    r#"{{"op":0,"t":"MESSAGE_CREATE","s":{sequence},"d":{{"id":"m{sequence}","channel_id":"room","content":"queued","author":{{"id":"user","username":"operator"}}}}}}"#
+                );
+                assert_eq!(
+                    channel.handle_gateway_packet_with_admission(
+                        packet.as_bytes(),
+                        Duration::ZERO,
+                        &credential,
+                        &mut diagnostics,
+                        |_| Ok(true)
+                    ),
+                    Ok(DiscordPacketOutcome::MessageQueued)
+                );
+            }
+        }
+        let previous = channel.sequence();
+        let packet = if failure == "malformed" {
+            r#"{"op":0,"t":"MESSAGE_CREATE","s":10,"d":{}}"#
+        } else {
+            r#"{"op":0,"t":"MESSAGE_CREATE","s":10,"d":{"id":"rejected","channel_id":"room","content":"pending","author":{"id":"user","username":"operator"}}}"#
+        };
+        let result = channel.handle_gateway_packet_with_admission(
+            packet.as_bytes(),
+            Duration::ZERO,
+            &credential,
+            &mut diagnostics,
+            |_| {
+                if failure == "persistence" {
+                    Err(ChannelError::Transport(TransportErrorKind::Io))
+                } else {
+                    Ok(true)
+                }
+            },
+        );
+        match failure {
+            "persistence" => assert!(result.is_err()),
+            "queue" => assert_eq!(result, Ok(DiscordPacketOutcome::MessageDropped)),
+            _ => assert_eq!(result, Ok(DiscordPacketOutcome::Malformed)),
+        }
+        assert_eq!(
+            channel.sequence(),
+            previous,
+            "{failure} cannot acknowledge the dispatch"
+        );
+        assert_eq!(channel.state(), ConnectionState::Reconnecting);
+        assert_eq!(closes.get(), 1);
+        assert!(
+            channel
+                .handle_gateway_packet(
+                    packet.as_bytes(),
+                    Duration::ZERO,
+                    &credential,
+                    &mut diagnostics
+                )
+                .is_err(),
+            "later packets cannot skip the failed dispatch before reconnect"
+        );
+        assert_eq!(channel.sequence(), previous);
     }
 }
 

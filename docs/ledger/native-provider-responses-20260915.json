@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-explicit-responses-and-stream-terminal-validation",
+  "capturedAtUtc": "2026-09-15T03:42:17.9205269Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-providers/src/responses.rs","sha256":"fdbf448450e4dd89baea2a5722af8067f30ad19bfd0adb681f74a0d7512ce886"},
+    {"path":"crates/claw-providers/src/openai_compatible.rs","sha256":"fd6e9576e48f581d6cb29407284c4eb8df3bdaf2ff778018e75e1b9434bdc075"},
+    {"path":"crates/claw-providers/src/lib.rs","sha256":"a45b6d15b2eaa9f55fee59631f2d43e5a74eb682f78d69d4d3acc69eec4ffd4d"},
+    {"path":"crates/claw-providers/tests/wire.rs","sha256":"05c46779c9fa033b070e95a4da0820470d7decb96f6aa53b4f706f60b58e85fd"},
+    {"path":"apps/gta-claw-daemon/src/production/native_provider.rs","sha256":"e81366aae792071dce4dadfdda27280dd064caf7727899f5d4937e1c04a60734"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"56ff0aafda494c9ed63841fd4d4728a83973ec14fe50c27ad036787042502a90"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-provider-sdk -p claw-providers -p gta-claw-daemon --all-targets --locked --offline",
+      "result":"passed", "passed":694, "failed":0, "ignored":5, "testBinaries":17,
+      "log":"target/native-provider-responses-tests-20260915T033841776Z.log",
+      "sha256":"f7ba29f5c7dafddc0cecec1901d609bb57168f2e81531b3af728ed2386bf67ba"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-providers -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-provider-responses-clippy-20260915T034141924Z.log",
+      "sha256":"09be1d641475f49e4458985572d61da80718667be9160b31d46af6a9ea085237"
+    }
+  ],
+  "retainedFailures": [
+    {"log":"target/native-provider-responses-clippy-20260915T033451667Z.log","sha256":"a6c56b173166031f45e0845f726957af32a5a7f6bc2c8e6932f0c9124672a266","reason":"Documentation markup, a missing unit-branch semicolon and a file-extension lint on a protocol event name; fixed without disabling checks"},
+    {"log":"target/native-provider-responses-clippy-20260915T033521594Z.log","sha256":"ccc9d5bc5be54c3f38943b5ddbe704ba1d28bb742fdcb19cf20baeb2c1615841","reason":"Test fixture format_collect lint; replaced with writing into one String"}
+  ],
+  "behaviorEvidence": [
+    "unmarked_eof_and_empty_done_do_not_fabricate_completed_answers_or_tools",
+    "live_stream_rejects_incomplete_tool_rounds_without_publishing_partial_calls",
+    "responses_plain_assistant_history_uses_input_message_content",
+    "responses_stream_requires_terminal_identity_content_and_sequence_consistency",
+    "responses_stream_parts_are_typed_ordered_bounded_and_finalized_once",
+    "responses_parallel_functions_publish_only_after_consistent_terminal_snapshot",
+    "responses_every_chunk_split_preserves_deltas_and_unmarked_eof_is_an_error",
+    "responses_completion_and_function_output_round_trip_over_http",
+    "responses_terminal_closes_a_held_socket_and_releases_the_only_capacity_slot",
+    "responses_cancellation_drop_and_truncation_never_replay_a_request",
+    "responses_http_failure_does_not_retry_or_fall_back_to_chat",
+    "bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection"
+  ],
+  "schemaReferences": [
+    "https://raw.githubusercontent.com/openai/openai-python/main/src/openai/types/responses/easy_input_message_param.py",
+    "https://raw.githubusercontent.com/openai/openai-python/main/src/openai/types/responses/response_input_message_content_list_param.py"
+  ],
+  "notes": [
+    "Native completionApi responses is explicit and OpenAI-only; omitted selection retains chat_completions and existing Anthropic behavior",
+    "Stateless Responses requests always store false, preserve explicit model/origin/credentials and never select remote built-in tools or previous_response_id",
+    "Assistant text history was corrected against the public SDK input schema after local fixtures exposed that coverage gap; mutable upstream main is not a frozen compatibility manifest",
+    "Response and stream decoding bound IDs, output items/parts, text/reasoning/function arguments and usage; terminal snapshots must match the stream identity and accepted fragments",
+    "Functions publish only after consistent terminal validation; partial text remains observable, and cancellation/drop/terminal cleanup use the shared runtime",
+    "Chat still accepts finish_reason without DONE and an identified response with DONE but no finish_reason; unmarked EOF and invalid or truncated tool rounds fail in live/recorded streams",
+    "The legacy public Chat decoder finish signature is preserved with an incomplete_stream Other result on errors; it is not the live stream success path",
+    "No dependency download/version changes, real provider accounts, browser execution, production proxy changes, deployment or Git writes"
+  ],
+  "unverified": [
+    "Opaque/encrypted reasoning continuation and assistant phase replay; only portable stateless history is retained",
+    "Remote Responses built-in tools, background jobs, remote conversations, audio/files and model-specific options",
+    "Complete model capability discovery, provider OAuth/configuration generation transitions and durable paid-request unknown/billing workflows",
+    "Real OpenAI or compatible accounts, all platform/remote TLS interoperability and whole-project acceptance",
+    "Root cause of the separate unreproduced native OAuth status failure remains open"
+  ]
+}

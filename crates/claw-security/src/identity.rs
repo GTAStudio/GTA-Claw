@@ -50,7 +50,7 @@ impl DeviceId {
             return Err(DeviceIdError::InvalidLength);
         }
         let mut bytes = [0_u8; 32];
-        for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             bytes[index] = decode_hex_pair(pair)?;
         }
         Ok(Self(bytes))
@@ -497,13 +497,19 @@ const fn is_ecmascript_trim_character(character: char) -> bool {
 /// In-memory Ed25519 signer.
 ///
 /// The private key cannot be cloned, displayed, serialized, or exported. The
-/// underlying `RustCrypto` key zeroizes on drop. A later platform adapter may
-/// create identities from an OS keyring, but this crate provides no persistence.
+/// underlying `RustCrypto` key zeroizes on drop. A platform adapter may restore
+/// a protected seed from an OS keyring; this crate itself provides no persistence.
 pub struct DeviceIdentity {
     signing_key: SigningKey,
 }
 
 impl DeviceIdentity {
+    /// Restores a signer from a platform-owned, zeroizing seed without exporting private material.
+    #[must_use]
+    pub fn from_protected_seed(seed: &zeroize::Zeroizing<[u8; 32]>) -> Self {
+        Self { signing_key: SigningKey::from_bytes(seed) }
+    }
+
     /// Tries to generate an identity using a fallible cryptographic RNG.
     ///
     /// # Errors
@@ -593,6 +599,19 @@ impl Error for SignatureError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn protected_seed_restores_the_same_nonexportable_identity() {
+        let seed = zeroize::Zeroizing::new([7_u8; 32]);
+        let first = super::DeviceIdentity::from_protected_seed(&seed);
+        let second = super::DeviceIdentity::from_protected_seed(&seed);
+        assert_eq!(first.device_id(), second.device_id());
+        assert_eq!(first.public_key().as_bytes(), second.public_key().as_bytes());
+        let device = first.device_id();
+        let payload = input(&device, b"persisted-identity", b"restored-signature");
+        assert_eq!(first.sign_handshake(payload).to_bytes(), second.sign_handshake(payload).to_bytes());
+        assert!(format!("{first:?}").contains("[REDACTED]"));
+    }
+
     use ed25519_dalek::Signer;
     use rand_chacha::{
         ChaCha20Rng,
@@ -605,7 +624,7 @@ mod tests {
     fn hex(value: &str) -> Vec<u8> {
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|pair| decode_hex_pair(pair).expect("test vector hex"))
             .collect()
     }

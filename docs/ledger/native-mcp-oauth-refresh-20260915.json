@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "stage": "mcp-explicit-public-client-oauth-refresh",
+  "capturedAtUtc": "2026-09-15T02:19:34.5726340Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-mcp/src/oauth.rs","sha256":"a856acfe701400f014a635bc55531b11c3146b516912d82ae5d8f9618672ba0d"},
+    {"path":"apps/gta-claw-cli/src/mcp_oauth.rs","sha256":"a7279a38cdda736b163732d8c1a60952a2f07b80a5a6f3797e7cbe3bf90a7f6b"},
+    {"path":"apps/gta-claw-cli/src/lib.rs","sha256":"5e8afa0ba6a94eee3048f62c020891e6e1d4acc36b74494b15edb89245636b5c"},
+    {"path":"apps/gta-claw-cli/tests/foundation.rs","sha256":"bba241af50bf2e574009938fa09c4ff079a86351d3b852a66816a038d0d76139"}
+  ],
+  "cargoLockSha256": "5955c2233d8cad3f8d4c72b61bdfef396f609c5a2b90c50fb56c69e8ba262b1e",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":399, "failed":0, "ignored":5, "testBinaries":20,
+      "log":"target/native-mcp-oauth-refresh-tests-20260915T021612358Z.log",
+      "sha256":"ee1be6b624e6cbc10ad8f214354e6eb7d4320d234583bd08a3f7775fede15fd1"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-oauth-refresh-clippy-20260915T021540827Z.log",
+      "sha256":"c114c6cced50f7900e4046101bf6536d1d5a266ea2c755041f0ae4384d6919a4"
+    }
+  ],
+  "behaviorEvidence": [
+    "oauth_refresh_requires_its_own_confirmation_and_cannot_change_scope_or_callback",
+    "mcp_oauth_login_uses_reviewed_metadata_real_callback_and_native_pending_recovery",
+    "local_authorization_server_covers_registration_exchange_and_refresh",
+    "native_mcp_oauth_records_require_original_fresh_generation_without_automatic_refresh"
+  ],
+  "notes": [
+    "Explicit refresh requires its own confirmation and exact reviewed public-client/resource/issuer endpoints",
+    "Absent/pending/invalid/no-refresh records fail before networking; no browser or callback listener is opened",
+    "A single refresh uses native pending/readback semantics; lost/refused results cannot replay the old refresh token",
+    "Refresh responses without scope or refresh token retain the prior values",
+    "Actual Windows CLI scenarios verify unchanged unconfirmed records, rotated generations, pending failure and zero-network subsequent refusal",
+    "Daemon re-review remains explicit; no dependency/lock changes, production actions or real accounts"
+  ],
+  "unverified": [
+    "Concurrent independent-process/native-store coordination and automatic refresh UX",
+    "Live providers, macOS runtime and confidential-client acceptance",
+    "Native I/O hard deadlines, active Ctrl+C acceptance and cross-system atomicity",
+    "Deployment, complete frozen input manifests and whole-project completion"
+  ]
+}

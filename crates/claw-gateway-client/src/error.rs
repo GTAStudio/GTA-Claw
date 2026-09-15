@@ -625,15 +625,27 @@ pub enum ConnectionState {
 /// permit the wrapper keeps alive is an internal accounting handle.
 pub struct GatewayEvent {
     frame: EventFrame,
+    epoch: ConnectionEpoch,
     _byte_permit: OwnedSemaphorePermit,
 }
 
 impl GatewayEvent {
-    pub(crate) const fn new(frame: EventFrame, byte_permit: OwnedSemaphorePermit) -> Self {
+    pub(crate) const fn new(
+        frame: EventFrame,
+        epoch: ConnectionEpoch,
+        byte_permit: OwnedSemaphorePermit,
+    ) -> Self {
         Self {
             frame,
+            epoch,
             _byte_permit: byte_permit,
         }
+    }
+
+    /// Returns the authenticated connection that produced this queued event.
+    #[must_use]
+    pub const fn epoch(&self) -> ConnectionEpoch {
+        self.epoch
     }
 
     /// Returns the strict P02a event frame.
@@ -658,6 +670,7 @@ impl Debug for GatewayEvent {
             .map_or(0, claw_protocol::gateway::OpaqueJson::encoded_len);
         formatter
             .debug_struct("GatewayEvent")
+            .field("epoch", &self.epoch)
             .field("event", &self.frame.event().as_str())
             .field("sequence", &self.frame.sequence().map(EventSequence::get))
             .field("state_version", &self.frame.state_version())

@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "stage": "oauth-cli-profile-process-coordination",
+  "capturedAtUtc": "2026-09-15T03:15:03.5128874Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-tools/src/sandbox.rs","sha256":"ba12d2fcb54c7ca83cdfa9de0a39ae9a1c19c08890d880c1c6841e8c23cf678b"},
+    {"path":"apps/gta-claw-cli/src/mcp_credential.rs","sha256":"f3c3509e3ef45be46166c751ac3975c732c2a808518ba3dc72298497c43fd912"},
+    {"path":"apps/gta-claw-cli/src/mcp_oauth.rs","sha256":"809d2dfe0788ef4017968fd360246bc5fd6b24d958b6b8a05e1ab953c67e549d"},
+    {"path":"apps/gta-claw-cli/tests/foundation.rs","sha256":"aa6dd74a2fb31eb67f949cdc9c7addec55db7c96d85720230687694091ab062c"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-tools -p claw-mcp -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":570, "failed":0, "ignored":7, "testBinaries":27,
+      "log":"target/native-oauth-coordination-tests-20260915T031205001Z.log",
+      "sha256":"69d735dade36f5b026d1c3d6499849d8b6caaa85f6467892000c27872e2d2ca6"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-tools -p claw-mcp -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-oauth-coordination-clippy-20260915T031136464Z.log",
+      "sha256":"e7983ac031e1d5937276f78c85004371d7a269551989eb8368e5f5e3319236ce"
+    }
+  ],
+  "behaviorEvidence": [
+    "oauth_profile_coordination_is_nonblocking_origin_bound_and_rejects_replaced_files",
+    "mcp_oauth_login_uses_reviewed_metadata_real_callback_and_native_pending_recovery",
+    "mcp_oauth_cli_reports_local_states_and_only_logs_out_with_explicit_confirmation"
+  ],
+  "notes": [
+    "New CLI login/refresh/logout retain one same-profile/origin lock through native and network operations",
+    "The first regression found rename of an ordinarily opened lock file was allowed; the new coordination open denies Windows delete sharing",
+    "Actual competing processes are refused before network or credential mutation, and an owned interrupted process releases the lock",
+    "Only empty coordination files are retained; tests use owned isolated local-data directories",
+    "No dependencies, lock versions, production services, real accounts or browser execution changed"
+  ],
+  "unverified": [
+    "macOS runtime, malicious external/legacy writers, direct SDK users and differing coordination roots",
+    "Native keyring compare-and-swap or a transaction spanning daemon snapshots and remote calls",
+    "Root cause of the separate unreproduced native OAuth status failure",
+    "Deployment, complete frozen manifests and whole-project acceptance"
+  ]
+}

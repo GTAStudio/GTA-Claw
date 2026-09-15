@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-09-14T06:27:34.4637210Z",
+  "status": "passed_scoped_checks",
+  "project_complete": false,
+  "migration_accepted": false,
+  "release_accepted": false,
+  "source_frozen": false,
+  "source": {
+    "base_commit": "b98e39d135203687397d3549348217f13d458f36",
+    "state": "uncommitted_development",
+    "fingerprint": {
+      "input_count": 919,
+      "sha256": "bcb9f79515c206dc4424b4a300806fa7cb6ca6a23cc9375202a6c6ac9a05acb7",
+      "path_source": "git ls-files --cached --others --exclude-standard",
+      "prefixes": ["apps/", "crates/", "desktop/", "compat/", ".cargo/"],
+      "additional_paths": ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"],
+      "serialization": "Unique paths sorted ordinal; UTF-8 without BOM; each record is relative path + TAB + lowercase file SHA256 + LF; concatenate and SHA256",
+      "complete_build_input_manifest": false,
+      "timing": "Captured after verification, not a before/after source-stability attestation. Documentation and environment are outside this digest."
+    },
+    "root_lock_sha256": "9c7df3dc165f77fef18d7ea44e6cdc9f9fa364cfbca4deb47ddf4464abe405b7",
+    "desktop_lock_sha256": "82d4506ce4cd34f1645920aed873359446ff3e5904a7f42ce1c7e0902e639056",
+    "sealed_compat_upstream_unchanged": true,
+    "sealed_compat_legacy_unchanged": true,
+    "trusted_packaging_policy_unchanged": true
+  },
+  "root_dependency_graph": {
+    "command": "cargo +stable metadata --format-version 1 --locked",
+    "result": "pass",
+    "workspace_members": 38,
+    "resolved_packages": 404,
+    "slint_packages": 0,
+    "offline_attempt": "blocked_by_uncached_locked_dependency",
+    "missing_locked_metadata_downloaded_through_existing_proxy": true
+  },
+  "environment": {
+    "platform": "x86_64-pc-windows-msvc",
+    "rustc": "1.98.1 (48a229cea 2026-09-01)",
+    "slint": "1.17.1",
+    "redb": "4.2.0",
+    "declared_msrv": "1.94.0",
+    "msrv_reverified": false,
+    "cargo_build_jobs": 2,
+    "fixtures": "isolated local smoke provider, ephemeral listeners, temporary state and fake credentials",
+    "node_or_npm_executed": false,
+    "subagents_used": false,
+    "production_proxy_changed": false
+  },
+  "upstream": {
+    "candidate_release": "v2026.9.4",
+    "candidate_source_commit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+    "candidate_tag_object": "8bec206f3c1f787e1e9c45cfd34d3de2a78c7b8e",
+    "metadata_normalized_sha256": "5e18827a1d15f4ce1da38a997604e108037375c5f2b95ecb9a58ed4f5547a418",
+    "complete_contract": false,
+    "locally_verified_signatures": false,
+    "external_interoperability_verified": false,
+    "old_baseline_package": "2026.7.2"
+  },
+  "checks": [
+    {
+      "name": "native_core_tests",
+      "command": "cargo +stable test -p gta-claw-daemon -p gta-claw-cli -p claw-state -p claw-runtime -p claw-gateway -p claw-gateway-client -p claw-http-api -p claw-repo-policy -p claw-conformance --all-targets --locked",
+      "result": "pass",
+      "test_binaries": 53,
+      "passed": 922,
+      "failed": 0,
+      "ignored": 3,
+      "local_log": "target/native-core-tests-20260914-final.log",
+      "log_sha256": "73d2f4befcac56e1854959ba795ae772645814b4b3079b0cd15aa89bd5e6d43e"
+    },
+    {
+      "name": "slint_desktop_tests",
+      "command": "cargo +stable test --manifest-path desktop/Cargo.toml --bin gta-claw-desktop --locked",
+      "result": "pass",
+      "test_binaries": 1,
+      "passed": 69,
+      "failed": 0,
+      "ignored": 0,
+      "local_log": "target/native-desktop-tests-20260914-final-r2.log",
+      "log_sha256": "11cfa5d67d035341ff589d397ad9c0e44e4b1c311c21492cb432f735692a74fd"
+    },
+    {
+      "name": "native_core_clippy",
+      "command": "cargo +stable clippy -p gta-claw-cli -p gta-claw-daemon -p claw-state -p claw-runtime -p claw-gateway -p claw-gateway-client -p claw-http-api -p claw-conformance --all-targets --locked -- -D warnings",
+      "result": "pass",
+      "dependencies_included": true,
+      "local_log": "target/native-core-clippy-20260914-final.log",
+      "log_sha256": "619db360cb28ae2d56b8114ea4c748a05f66865e086e4804180df30289bef67d"
+    },
+    {
+      "name": "slint_desktop_clippy",
+      "command": "cargo +stable clippy --manifest-path desktop/Cargo.toml --bin gta-claw-desktop --all-targets --locked -- -D warnings",
+      "result": "pass",
+      "dependencies_included": true,
+      "local_log": "target/native-desktop-clippy-20260914-final.log",
+      "log_sha256": "b40d273abde04094e3bfbf8b8fd095298250f0f717178c6d74fefea34d421623"
+    },
+    {
+      "name": "slint_desktop_development_build",
+      "command": "cargo +stable build --manifest-path desktop/Cargo.toml --bin gta-claw-desktop --locked",
+      "result": "pass",
+      "local_log": "target/native-desktop-build-20260914-final.log",
+      "log_sha256": "f4b662c29f4a1906e14c621ccf34808f7ee890f401f4ec3994683488d002401c"
+    }
+  ],
+  "development_artifacts": [
+    {
+      "path": "target/debug/gta-claw-desktop.exe",
+      "bytes": 38280192,
+      "sha256": "de50938e229d86a3c8fb1423d22fd317bea63c8187e4f9cabff0289d1619caed",
+      "profile": "dev",
+      "launched": false,
+      "installed": false,
+      "signed_release": false
+    }
+  ],
+  "ignored_tests": [
+    "pinned_official_gateway_live_contract: requires explicitly provisioned external OpenClaw Gateway",
+    "tests::stuck_blocking_work_subprocess_helper: helper invoked by its parent test",
+    "adapters::gateway_pairing::tests::pairing_ownership_subprocess_helper: helper invoked by its parent test"
+  ],
+  "post_cohort_changes": [
+    "Runtime state-read await comment corrected; cargo +stable test -p claw-runtime --all-targets --locked passed again. No behavior changed."
+  ],
+  "checklist": {
+    "total": 98,
+    "completed": ["M1-01", "M3-09"],
+    "incomplete": 96,
+    "closed_milestones": []
+  },
+  "unverified_required_gates": [
+    "complete workspace and cross-platform CI, MSRV, rustdoc and supply-chain audit",
+    "reviewed packaging trust-policy/toolchain/image-digest upgrade from Rust 1.97.1",
+    "complete upstream semantic contract extraction and external interoperability",
+    "atomic run/context/goal/outbox recovery and durable admission/idempotency",
+    "full caller/resource/version binding, native tools and skill dispatch",
+    "persistent client identity, pairing, streaming and history/event reconciliation",
+    "real model/channel credentials, visible GUI workflow, mobile platforms and devices",
+    "backups, OpenClaw data import, fault matrix, 24-hour soak and actual cutover"
+  ],
+  "delivery_actions": {
+    "git_commit_or_push": false,
+    "deployment": false,
+    "user_state_migration": false,
+    "legacy_node_deletion": false,
+    "intentional_long_running_test_processes_remaining": false
+  },
+  "notes": [
+    "Logs are local ignored build outputs, encoded by Windows PowerShell Tee-Object; hashes identify their exact bytes.",
+    "Passing counts include existing regressions, not only new tests, and do not measure product completion.",
+    "Software-renderer pixel checks are headless at 1080x720 and 720x520, not visible-window or physical-device acceptance.",
+    "A process-exit crash test is not physical power-loss durability evidence.",
+    "Candidate baseline metadata cannot assert contract completion, local signature verification or runtime acceptance."
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "stage": "transactional-memory-notebook-quota-and-write-authority",
+  "capturedAtUtc": "2026-09-14T16:47:48.1735216Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-daemon/src/adapters/native_memory.rs","sha256":"4c503cf3c73255d0c2d963ea57fd8e778b1c6deb5524c662dd84c5fe8ab02b0d"},
+    {"path":"crates/claw-state/src/lib.rs","sha256":"cd181311e4a2dd27e22dc3050358bc6a8fd9f5ad78bb5048001a28eeed605eef"},
+    {"path":"crates/claw-state/src/memory.rs","sha256":"4f916b1c59fcf5f9dbab5b05947ce85845896d8f69e0c4e89f8cf4dfb99655db"}
+  ],
+  "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":301, "failed":0, "ignored":5, "testBinaries":14,
+      "log":"target/native-memory-quota-tests-20260914T164604619Z.log",
+      "sha256":"6b1d5995c091ab5abe0dce57548bfb6116614eafcd8775be1f9aa4e55766f6e7"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-state -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-memory-quota-clippy-20260914T164540284Z.log",
+      "sha256":"0651c8b2418d84cb9e428f2f367aa37ae947d7fa989c43278ed8e5f5cdd37db1"
+    }
+  ],
+  "behaviorEvidence": [
+    "explicit_memory_global_quota_is_atomic_and_survives_empty_notebooks_and_restart",
+    "explicit_memory_rechecks_authority_after_waiting_for_the_state_writer"
+  ],
+  "notes": [
+    "Allocation count and new record insertion share the same redb write transaction",
+    "Existing notebooks, including empty revision tombstones, remain readable and editable at capacity",
+    "Prefix counts do not decode or copy note bodies; there is no separate quota counter",
+    "Late revocation is checked after writer admission before mutation; cancellation after that point is not a rollback guarantee",
+    "Existing Cargo.lock changes were preserved and its prior witness is unchanged"
+  ],
+  "unverified": [
+    "total physical database size, free pages, other record families and audit storage quotas",
+    "complete identity retirement and quota-slot reclamation",
+    "cross-platform filesystem and physical power-loss guarantees",
+    "real accounts/devices and whole-project completion"
+  ]
+}

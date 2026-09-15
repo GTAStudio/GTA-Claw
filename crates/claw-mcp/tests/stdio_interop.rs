@@ -98,6 +98,120 @@ async fn negotiated_client_capabilities(sampling: Arc<dyn SamplingPort>) -> Valu
 }
 
 #[tokio::test]
+async fn isolated_stdio_only_receives_explicit_environment_without_changing_the_host() {
+    let parent_marker = std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo test environment");
+    for isolated in [true, false] {
+        let mut config = fixture(Vec::new());
+        config.environment.insert(
+            "GTA_CLAW_MCP_EXPLICIT_FIXTURE".into(),
+            "reviewed-fixture-value".into(),
+        );
+        let client = if isolated {
+            McpClient::connect_stdio_isolated(
+                config,
+                Arc::new(RejectSampling),
+                Arc::new(DiscardEvents),
+            )
+            .await
+        } else {
+            McpClient::connect_stdio(config, Arc::new(RejectSampling), Arc::new(DiscardEvents))
+                .await
+        }
+        .expect("owned child initializes");
+        let result = client
+            .call_tool(CallToolRequestParams::new("environment-scope"))
+            .await
+            .expect("fixture environment flags");
+        let encoded = serde_json::to_value(result).expect("result JSON");
+        let flags: Value = serde_json::from_str(
+            encoded["content"][0]["text"]
+                .as_str()
+                .expect("boolean flags text"),
+        )
+        .expect("flags JSON");
+        assert_eq!(
+            flags,
+            json!({"inheritedCargoEnvironment":!isolated,"explicitFixtureValue":true})
+        );
+        client.close().await.expect("owned child closed");
+    }
+    assert_eq!(
+        std::env::var_os("CARGO_MANIFEST_DIR"),
+        Some(parent_marker),
+        "child environment isolation must not mutate its parent"
+    );
+}
+
+#[tokio::test]
+async fn isolated_stdio_requires_and_preserves_its_explicit_working_directory() {
+    struct Root(PathBuf);
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let parent = std::env::current_dir().expect("parent directory");
+    let root = Root(std::env::temp_dir().join(format!(
+            "claw-mcp-cwd-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        )));
+    std::fs::create_dir(&root.0).expect("owned directory");
+    assert!(
+        McpClient::connect_stdio_isolated_at(
+            fixture(Vec::new()),
+            PathBuf::from("relative"),
+            Arc::new(RejectSampling),
+            Arc::new(DiscardEvents)
+        )
+        .await
+        .is_err()
+    );
+    let mut relative = fixture(Vec::new());
+    relative.program = PathBuf::from("relative-program");
+    assert!(
+        McpClient::connect_stdio_isolated_at(
+            relative,
+            root.0.clone(),
+            Arc::new(RejectSampling),
+            Arc::new(DiscardEvents)
+        )
+        .await
+        .is_err()
+    );
+    let client = McpClient::connect_stdio_isolated_at(
+        fixture(Vec::new()),
+        root.0.clone(),
+        Arc::new(RejectSampling),
+        Arc::new(DiscardEvents),
+    )
+    .await
+    .expect("owned child");
+    let output = client
+        .call_tool(CallToolRequestParams::new("working-directory"))
+        .await
+        .expect("child directory");
+    let output = serde_json::to_value(output).expect("JSON output");
+    let child = PathBuf::from(
+        output["content"][0]["text"]
+            .as_str()
+            .expect("directory text"),
+    );
+    assert_eq!(
+        std::fs::canonicalize(child).expect("actual child directory"),
+        std::fs::canonicalize(&root.0).expect("approved directory")
+    );
+    client.close().await.expect("child closed");
+    assert_eq!(
+        std::env::current_dir().expect("parent directory unchanged"),
+        parent
+    );
+}
+
+#[tokio::test]
 async fn sampling_capability_matches_the_installed_sampling_port() {
     let rejected = negotiated_client_capabilities(Arc::new(RejectSampling)).await;
     assert_eq!(
@@ -231,10 +345,6 @@ async fn stdio_subprocess_negotiates_lists_calls_times_out_and_shuts_down() {
         .subscribe(SubscribeRequestParams::new("gta://fixture/session"))
         .await
         .expect("resources/subscribe must succeed");
-    client
-        .unsubscribe(UnsubscribeRequestParams::new("gta://fixture/session"))
-        .await
-        .expect("resources/unsubscribe must succeed");
 
     let prompts = client
         .list_prompts()
@@ -341,6 +451,11 @@ async fn stdio_subprocess_negotiates_lists_calls_times_out_and_shuts_down() {
             )
         ]
     );
+
+    client
+        .unsubscribe(UnsubscribeRequestParams::new("gta://fixture/session"))
+        .await
+        .expect("resources/unsubscribe must succeed");
 
     let error = client
         .call_tool(CallToolRequestParams::new("hang"))

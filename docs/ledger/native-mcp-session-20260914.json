@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "stage": "mcp-owned-sessions-stream-limits-and-native-client-interop",
+  "capturedAtUtc": "2026-09-14T21:37:50.7632623Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-http-api/src/mcp.rs","sha256":"41144dfb04563ee8102d31bebae3cf3ff56735d15a162a010ce0d0ce8b86eebf"},
+    {"path":"crates/claw-http-api/src/state.rs","sha256":"4aa8239b3d62e354c645999c1ece914ee7c5512e6f85532d8143e5bcfdb21e0f"},
+    {"path":"crates/claw-http-api/src/lib.rs","sha256":"872ab4fff4a1f120491c0780ed9baabba64f0e3eff1e91693db54be6541c4ef0"},
+    {"path":"crates/claw-http-api/tests/e2e.rs","sha256":"7835ac60298bffeab60fa2a8a0aeafa553de241fb303a3dea3838a3c43f4dee7"},
+    {"path":"crates/claw-mcp/src/projection.rs","sha256":"dec04cf8d3829ae63e94870fcad1def8bf400dc32bc247727d5202b43bdf6551"},
+    {"path":"apps/gta-claw-daemon/Cargo.toml","sha256":"1898f9a7022e175875d986997743dd6eed630f90fc8387b0dfb81ac3fa9fab4b"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"5b35ea1594a32fc7f2713c5f809e16157419dab05623397168186a9d96450527"}
+  ],
+  "previousCargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "cargoLockSha256": "35d6c486d9f786555694093b3131f1da1fbe4c95985d3d9d0909bd2d07c04254",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":388, "failed":0, "ignored":4, "testBinaries":24,
+      "log":"target/native-mcp-session-tests-20260914T213604106Z.log",
+      "sha256":"600af88eae865c79ea61d077c0bdf5e321acd74b0449c7cb63dfb8f7ffb927f1"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-session-scoped-clippy-20260914T213523664Z.log",
+      "sha256":"5e2630cad36b0357913d9a2adbe9c4d315e3bca1ca1ac12b65a9aea46623206a"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-mcp -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"failed",
+      "reason":"Seven existing unused_async_trait_impl diagnostics in crates/claw-mcp/tests/fixtures/mcp_fixture.rs; not a passing all-target MCP lint gate",
+      "log":"target/native-mcp-session-clippy-20260914T213422184Z.log",
+      "sha256":"ad010306d75ad933b6862635281472471b53f28e6e693146a56637564a5840e9"
+    }
+  ],
+  "behaviorEvidence": [
+    "mcp_sessions_bind_request_namespaces_and_close_expire_with_bounded_capacity",
+    "mcp_stream_permits_bound_global_and_session_connections_until_body_release",
+    "mcp_cancellation_targets_only_the_authenticated_active_request",
+    "native_mcp_http_client_interoperates_with_owned_daemon_sessions",
+    "registered_endpoint_set_exactly_matches_frozen_inventory"
+  ],
+  "notes": [
+    "Random 256-bit sessions bind requests to credential subjects; session and stateless IDs use separate namespaces",
+    "128 global/16 subject sessions and 128 global/2 session SSE limits retain permits until response bodies release them",
+    "Session DELETE cancels only owned child calls and streams; session notifications return empty 202 bodies",
+    "Actual native MCP clients connect to an owned daemon for typed discovery, read-only refusal and independent closure",
+    "One existing workspace test dependency was added and resolved offline; no third-party version or sealed endpoint inventory was requested to change"
+  ],
+  "unverified": [
+    "MCP fixture all-target lint, full initialization state machine and exact background session expiry",
+    "delayed cancellation attribution after ID reuse within the same session and durable session recovery",
+    "outbound MCP/OAuth/stdio product composition, complete resource/prompt events, ACP and live accounts",
+    "cross-platform/power-loss acceptance, deployment and whole-project completion"
+  ]
+}

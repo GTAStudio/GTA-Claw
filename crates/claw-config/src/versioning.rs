@@ -252,6 +252,7 @@ fn create_backup(path: &Path, bytes: &[u8]) -> Result<PathBuf, ConfigMigrationEr
                         path: backup_path.clone(),
                         source,
                     })?;
+                #[cfg(unix)]
                 sync_parent(&backup_path).map_err(|source| ConfigMigrationError::Backup {
                     path: backup_path.clone(),
                     source,
@@ -283,9 +284,4 @@ fn sync_parent(path: &Path) -> io::Result<()> {
             .expect("allocated backup paths always have a parent"),
     )?
     .sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> io::Result<()> {
-    Ok(())
 }

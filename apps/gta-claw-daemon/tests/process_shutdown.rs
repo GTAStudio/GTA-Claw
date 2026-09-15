@@ -98,6 +98,12 @@ fn started() -> (ChildGuard, BufReader<std::process::ChildStdout>) {
     ));
     let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-daemon"));
     command.env_clear();
+    #[cfg(windows)]
+    for name in ["SystemRoot", "SystemDrive", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     let child = command
         .args([
             "--smoke",
@@ -122,7 +128,7 @@ fn started() -> (ChildGuard, BufReader<std::process::ChildStdout>) {
         .env("GTA_CLAW_STATE_DIR", &state)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("daemon process starts");
     let mut child = ChildGuard(child, state);

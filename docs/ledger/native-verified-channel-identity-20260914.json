@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "stage": "teams-and-whatsapp-verified-identity-and-durable-inbound-execution",
+  "capturedAtUtc": "2026-09-14T19:37:53.1231717Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-http-api/src/legacy/ports.rs","sha256":"f3c7b25d8e2b791ae65c94d7a439eb6f7250559b10bd6dacc9b273fa5ef92f34"},
+    {"path":"crates/claw-http-api/tests/legacy_http.rs","sha256":"c9add4388df46828e95f216392ef7ba19f570ebb0dbc1da6e2cc51e1c383bc00"},
+    {"path":"apps/gta-claw-daemon/src/adapters/legacy.rs","sha256":"b4cc4a3edc39da90fa1d7e2c191a2bf2d9184a4280f9b9bb743949abf3bbd9e3"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"be3d4b7f67c5405b802c809b1a9f72e69fc3378ff107b460177fb052fe2acef7"},
+    {"path":"apps/gta-claw-daemon/src/adapters/channels.rs","sha256":"5874a0659a67a71b46b3a3136e78189ea2bb445256171fcd518a46a80f200183"}
+  ],
+  "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":312, "failed":0, "ignored":4, "testBinaries":18,
+      "log":"target/native-verified-channel-identity-tests-20260914T193512873Z.log",
+      "sha256":"6ed427a8a4f2302506518d851005a6479b34a7506e7b421901d7a8ccf44d71f8"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-verified-channel-identity-clippy-20260914T193704021Z.log",
+      "sha256":"11c45644dac8fffbb2b9a9c1a6041c725926360c446d0e86660c1a7d32661e74"
+    },
+    {
+      "command":"cargo +stable check --manifest-path D:/GTA-Claw/Cargo.toml --workspace --all-targets --locked --offline",
+      "result":"passed",
+      "log":"target/native-verified-channel-identity-workspace-20260914T193628501Z.log",
+      "sha256":"0a63b6ade38d6f20005c6a96fcb473b80f197065ebeb93e4488dc6aa533360e5"
+    }
+  ],
+  "behaviorEvidence": [
+    "authenticated_channel_dispatch_isolates_account_history_and_reset",
+    "teams_verified_message_preserves_tenant_sender_and_activity_identity",
+    "teams_missing_tenant_and_sender_ids_never_fall_back_to_display_names",
+    "teams_durable_conversation_and_reset_keep_tenants_and_senders_isolated",
+    "dropped_whatsapp_request_cancels_transport_and_clears_slot",
+    "route_timeout_drop_retries_unsent_whatsapp_chunk_once",
+    "legacy_conditional_channel_routes_use_composed_adapters"
+  ],
+  "notes": [
+    "Native WhatsApp processing preserves SDK account/message/sender identities into scoped authority and durable claims",
+    "Teams normalization follows existing JWT verification and requires app/tenant/stable sender identity, never display-name substitution",
+    "Repeated native messages and scoped status/reset commands return retained results without re-execution",
+    "The owned port default preserves older implementations; native durability is supplied by AgentRuntime",
+    "Root all-target check verifies the expanded public message-port contract",
+    "No new dependencies or changes to the existing Cargo.lock witness"
+  ],
+  "unverified": [
+    "complete durable Teams/WhatsApp outbound delivery and remote receipts",
+    "live OIDC/JWT service matrix and real tenant/Cloud accounts",
+    "complete activity-edit and historic identity migration policy",
+    "platform runtime acceptance, deployment and whole-project completion"
+  ]
+}

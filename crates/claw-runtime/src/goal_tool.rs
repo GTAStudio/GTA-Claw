@@ -13,12 +13,270 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use claw_application::model::goal::GoalStatus;
-use claw_application::ports::tool::ToolDescriptor;
+use claw_application::model::approval::{ApprovalOutcome, ApprovalVerdict, ApprovalWithdrawal};
+use claw_application::model::goal::{GoalRecord, GoalStatus};
+use claw_application::model::ids::ToolCallId;
+use claw_application::ports::PortError;
+use claw_application::ports::tool::{
+    InternalToolAuditPhase, InvocationAuthority, ToolBinding, ToolDescriptor, ToolInvocation,
+    ToolOutcome, ToolPort, ToolStatus,
+};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio_util::sync::CancellationToken;
+
+use crate::approval::{ApprovalBroker, ApprovalTicket};
+use crate::goal::GoalService;
+use crate::tool::ToolExecutionError;
 
 /// The dispatch name of the model-callable goal tool.
 pub const GOAL_TOOL_NAME: &str = "update_goal";
+static NEXT_AUTHORIZED_GOAL: AtomicU64 = AtomicU64::new(0);
+
+/// The confirmed record and client-visible outcome of a runtime-owned goal call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedGoalOutcome {
+    /// Present only after the goal write and completion audit both succeeded.
+    pub record: Option<GoalRecord>,
+    /// Provider-call identity and the corresponding execution result.
+    pub outcome: ToolOutcome,
+}
+
+fn refused_goal(
+    call_id: &ToolCallId,
+    status: ToolStatus,
+    output: impl Into<String>,
+) -> AuthorizedGoalOutcome {
+    AuthorizedGoalOutcome {
+        record: None,
+        outcome: ToolOutcome {
+            call_id: call_id.clone(),
+            status,
+            output: output.into(),
+            changed_workspace: false,
+        },
+    }
+}
+
+/// Binds the runtime goal implementation and its session-wide resource scope.
+///
+/// # Errors
+/// Rejects other tool names, invalid arguments and unrepresentable resource scopes.
+pub fn goal_tool_binding(invocation: &ToolInvocation) -> Result<ToolBinding, PortError> {
+    if invocation.call.name != GOAL_TOOL_NAME || invocation.call.arguments.len() > 16 * 1024 {
+        return Err(PortError::Invalid(
+            "invalid bounded runtime goal invocation".to_owned(),
+        ));
+    }
+    parse_goal_action(&invocation.call.arguments)
+        .map_err(|error| PortError::Invalid(error.to_string()))?;
+    ToolBinding::new("runtime.update_goal", 1)?.with_resource(format!(
+        "goal state for session {}; action targets the active goal at execution",
+        invocation.session_id.as_str()
+    ))
+}
+
+pub(crate) async fn execute_authorized_goal(
+    service: &GoalService,
+    broker: &ApprovalBroker,
+    tools: &dyn ToolPort,
+    mut invocation: ToolInvocation,
+    authority: InvocationAuthority,
+    cancel: &CancellationToken,
+    shutdown: &CancellationToken,
+) -> Result<AuthorizedGoalOutcome, ToolExecutionError> {
+    let call_id = invocation.call.call_id.clone();
+    if invocation.call.name != GOAL_TOOL_NAME {
+        return Ok(refused_goal(
+            &call_id,
+            ToolStatus::Failed,
+            "runtime goal entry received another tool name",
+        ));
+    }
+    if !authority.is_owner() {
+        return Ok(refused_goal(
+            &call_id,
+            ToolStatus::Denied,
+            "goal mutation requires an authenticated owner",
+        ));
+    }
+    if cancel.is_cancelled() || shutdown.is_cancelled() {
+        return Ok(refused_goal(
+            &call_id,
+            ToolStatus::Cancelled,
+            "goal call cancelled before approval",
+        ));
+    }
+    let action = match parse_goal_action(&invocation.call.arguments) {
+        Ok(action) => action,
+        Err(error) => {
+            return Ok(refused_goal(
+                &call_id,
+                ToolStatus::Failed,
+                error.to_string(),
+            ));
+        }
+    };
+    let binding = match tools.bind_authorized(&invocation, &authority) {
+        Ok(binding) => binding,
+        Err(error) => {
+            return Ok(refused_goal(
+                &call_id,
+                ToolStatus::Denied,
+                error.to_string(),
+            ));
+        }
+    };
+    let approval = broker.request_bound(
+        ApprovalTicket {
+            session_id: invocation.session_id.clone(),
+            turn: invocation.turn,
+            call_id: call_id.clone(),
+            tool_name: invocation.call.name.clone(),
+            arguments: invocation.call.arguments.clone(),
+        },
+        authority.clone(),
+        binding.clone(),
+        cancel,
+    );
+    let decision = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Ok(refused_goal(&call_id, ToolStatus::Cancelled, "runtime stopped before goal approval")),
+        decision = approval => decision?,
+    };
+    match decision {
+        ApprovalOutcome::Decided { decision, .. } if decision.verdict == ApprovalVerdict::Deny => {
+            return Ok(refused_goal(
+                &call_id,
+                ToolStatus::Denied,
+                "operator denied the goal call",
+            ));
+        }
+        ApprovalOutcome::Withdrawn { reason } => {
+            return Ok(refused_goal(
+                &call_id,
+                match reason {
+                    ApprovalWithdrawal::Cancelled => ToolStatus::Cancelled,
+                    ApprovalWithdrawal::TimedOut => ToolStatus::TimedOut,
+                },
+                "goal approval was withdrawn",
+            ));
+        }
+        ApprovalOutcome::Decided { .. } => {}
+    }
+    if cancel.is_cancelled() || shutdown.is_cancelled() || !authority.is_owner() {
+        return Ok(refused_goal(
+            &call_id,
+            ToolStatus::Cancelled,
+            "goal authority was withdrawn before execution",
+        ));
+    }
+    if tools.bind_authorized(&invocation, &authority).as_ref() != Ok(&binding) {
+        return Ok(refused_goal(
+            &call_id,
+            ToolStatus::Denied,
+            "goal binding changed after approval",
+        ));
+    }
+    let Ok(ordinal) =
+        NEXT_AUTHORIZED_GOAL.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+    else {
+        return Ok(refused_goal(
+            &call_id,
+            ToolStatus::Failed,
+            "runtime goal identity exhausted",
+        ));
+    };
+    let Ok(host_id) = ToolCallId::new(format!("runtime-goal-{ordinal}")) else {
+        return Ok(refused_goal(
+            &call_id,
+            ToolStatus::Failed,
+            "runtime goal identity is invalid",
+        ));
+    };
+    invocation.call.call_id = host_id;
+    if let Err(error) = tools
+        .audit_internal(
+            &invocation,
+            &authority,
+            &binding,
+            InternalToolAuditPhase::Authorized,
+        )
+        .await
+    {
+        return Ok(refused_goal(
+            &call_id,
+            ToolStatus::Failed,
+            error.to_string(),
+        ));
+    }
+    if cancel.is_cancelled()
+        || shutdown.is_cancelled()
+        || !authority.is_owner()
+        || tools.bind_authorized(&invocation, &authority).as_ref() != Ok(&binding)
+    {
+        tools
+            .audit_internal(
+                &invocation,
+                &authority,
+                &binding,
+                InternalToolAuditPhase::Failed,
+            )
+            .await
+            .map_err(|error| ToolExecutionError::OutcomeUnknown(error.to_string()))?;
+        return Ok(refused_goal(
+            &call_id,
+            ToolStatus::Cancelled,
+            "goal authority was withdrawn before mutation",
+        ));
+    }
+    let record = match service.apply(&invocation.session_id, &action).await {
+        Ok(record) => record,
+        Err(error) => {
+            tools
+                .audit_internal(
+                    &invocation,
+                    &authority,
+                    &binding,
+                    InternalToolAuditPhase::Failed,
+                )
+                .await
+                .map_err(|error| ToolExecutionError::OutcomeUnknown(error.to_string()))?;
+            if matches!(error, crate::goal::GoalError::Port(_)) {
+                return Err(ToolExecutionError::OutcomeUnknown(error.to_string()));
+            }
+            return Ok(refused_goal(
+                &call_id,
+                ToolStatus::Failed,
+                error.to_string(),
+            ));
+        }
+    };
+    tools
+        .audit_internal(
+            &invocation,
+            &authority,
+            &binding,
+            InternalToolAuditPhase::Completed,
+        )
+        .await
+        .map_err(|error| ToolExecutionError::OutcomeUnknown(error.to_string()))?;
+    let output = format!(
+        "goal {} is {} at revision {}",
+        record.goal_id, record.status, record.revision
+    );
+    Ok(AuthorizedGoalOutcome {
+        record: Some(record),
+        outcome: ToolOutcome {
+            call_id,
+            status: ToolStatus::Ok,
+            output,
+            changed_workspace: false,
+        },
+    })
+}
 
 /// One model-authored mutation of the session's durable goal.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -68,14 +326,14 @@ impl Error for GoalToolError {}
 
 /// Returns the descriptor advertised to providers and to `/tools`.
 ///
-/// The tool never mutates the workspace and never needs an approval: it only writes runtime state
-/// the operator can already inspect and overwrite with `/goal`.
+/// The tool writes runtime state rather than workspace files. Authenticated model calls require
+/// an owner grant, a bound once-only approval and durable host audit.
 #[must_use]
 pub fn goal_tool_descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: GOAL_TOOL_NAME.to_owned(),
         summary: "Set, advance or close the durable session goal".to_owned(),
-        requires_approval: false,
+        requires_approval: true,
         mutates_workspace: false,
     }
 }
@@ -210,7 +468,7 @@ expected one of `set`, `progress`, `close` at line 1 column 18"
     }
 
     #[test]
-    fn the_descriptor_needs_no_approval_and_touches_no_workspace() {
+    fn the_descriptor_requires_approval_without_claiming_a_workspace_change() {
         let descriptor = goal_tool_descriptor();
 
         assert_eq!(descriptor.name, GOAL_TOOL_NAME);
@@ -218,7 +476,7 @@ expected one of `set`, `progress`, `close` at line 1 column 18"
             descriptor.summary,
             "Set, advance or close the durable session goal"
         );
-        assert!(!descriptor.requires_approval);
+        assert!(descriptor.requires_approval);
         assert!(!descriptor.mutates_workspace);
     }
 

@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 claw-gateway-client.workspace = true
 claw-observability.workspace = true
+claw-platform = { workspace = true, features = ["native-identity"] }
 claw-protocol.workspace = true
 claw-security.workspace = true
 crossterm = "=0.29.0"
@@ -21,9 +22,11 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 url = "=2.5.8"
+unicode-width = "=0.2.2"
 
 [dev-dependencies]
 base64 = "=0.22.1"
+claw-conformance = { path = "../../crates/claw-conformance" }
 fastwebsockets = { version = "=0.10.0", default-features = false, features = ["unstable-split"] }
 httparse = "=1.10.1"
 sha1 = "=0.11.0"

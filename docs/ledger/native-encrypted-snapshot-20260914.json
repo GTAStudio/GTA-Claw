@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "stage": "consistent-native-state-snapshot-and-encrypted-offline-cli",
+  "capturedAtUtc": "2026-09-14T13:38:57.7315167Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceWitness": {
+    "count": 661,
+    "sha256": "33ee97f233d4a8660262d9e3cef380003ae8a5c647dcc037f86a8dd35b40d619",
+    "inventory": "git ls-files --cached --others --exclude-standard -- *.rs *.toml *.lock; unique ordinal path order",
+    "encoding": "UTF-8 concatenated relative path + NUL + lowercase file SHA256 + LF",
+    "cargoLockSha256": "a8cbee356341502f9e8375def17a5255206622d92ae57101feb4c344b55cdddd"
+  },
+  "checks": [
+    {
+      "command": "cargo +stable test -p claw-state -p claw-tools -p gta-claw-cli -p gta-claw-daemon -p claw-repo-policy --all-targets --locked --quiet",
+      "result": "passed", "passed": 446, "failed": 0, "ignored": 7, "testBinaries": 23,
+      "log": "target/native-encrypted-snapshot-tests-20260914T213015841.log",
+      "sha256": "c73319e117d8349c376ec9f8d07ae5b7fa3c75d5439030afa1b3880f6498a5e5"
+    },
+    {
+      "command": "cargo +stable clippy -p claw-state -p claw-tools -p gta-claw-cli --all-targets --locked -- -D warnings",
+      "result": "passed", "log": "target/native-encrypted-snapshot-clippy-20260914T213828411.log",
+      "sha256": "d48248abd1f5d2dff02e8e52aca0888d71858adbb93ce179faa8afe7471ca1d6"
+    },
+    {
+      "command": "cargo +stable metadata --locked --format-version 1",
+      "result": "passed", "workspaceMembers": 38, "resolvedPackages": 500,
+      "rootSlintOrCheckedJavaScriptRuntimePackages": 0,
+      "age": {"version": "0.12.1", "declaredRustVersion": "1.74", "license": "MIT OR Apache-2.0", "enabledFeatures": []}
+    }
+  ],
+  "unverified": ["full multi-store backup", "runtime/domain compatibility of restored records", "physical power loss", "all-platform ACL and namespace races", "whole-file I/O deadline", "user-state restore", "production cutover", "MSRV 1.94", "whole-project completion"]
+}

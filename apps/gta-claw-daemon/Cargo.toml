@@ -1,6 +1,7 @@
 [package]
 name = "gta-claw-daemon"
 description = "Headless GTA Claw daemon entry point"
+default-run = "gta-claw-daemon"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,6 +19,7 @@ claw-domain.workspace = true
 claw-gateway.workspace = true
 claw-goals.workspace = true
 claw-http-api.workspace = true
+claw-mcp.workspace = true
 claw-memory.workspace = true
 claw-observability.workspace = true
 claw-platform.workspace = true
@@ -29,14 +31,20 @@ claw-providers.workspace = true
 claw-runtime.workspace = true
 claw-security.workspace = true
 claw-skills.workspace = true
+claw-state.workspace = true
+claw-tools.workspace = true
 futures-util = { version = "=0.3.33", default-features = false, features = ["sink", "std"] }
+getrandom = { version = "=0.4.3", features = ["sys_rng"] }
 gta-claw-updater = { path = "../gta-claw-updater", version = "0.1.0" }
+iri-string = "=0.7.13"
 json5 = "1.3.1"
 jsonwebtoken = "=9.3.1"
+jsonschema = { version = "=0.56.0", default-features = false }
 secrecy = "=0.10.3"
 semver = "=1.0.28"
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 same-file = "=1.0.6"
 tokio = { version = "=1.53.1", features = [
   "io-std",
@@ -62,6 +70,18 @@ rustix = { version = "=1.1.4", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi-util = "=0.1.11"
+
+[dev-dependencies]
+claw-gateway-client.workspace = true
+getrandom = { version = "=0.4.3", features = ["sys_rng"] }
+ed25519-dalek = "=3.0.0"
+wat = "=1.252.0"
+
+[[bin]]
+name = "gta-claw-mcp-fixture"
+path = "../../crates/claw-mcp/tests/fixtures/mcp_fixture.rs"
+test = false
+bench = false
 
 [lints]
 workspace = true

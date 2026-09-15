@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "stage": "mcp-session-handshake-protocol-binding-and-strict-json",
+  "capturedAtUtc": "2026-09-14T21:48:18.5226584Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-http-api/src/mcp.rs","sha256":"d1dcd140bdba8fd0f1285aca9da16f5a00c79898eecd031aa35c49445cba4076"},
+    {"path":"crates/claw-http-api/tests/e2e.rs","sha256":"e00f4054b93c4ffd0684e25c9216e38104ef10e48411e5d0bb7bb58e7075ad6d"}
+  ],
+  "cargoLockSha256": "35d6c486d9f786555694093b3131f1da1fbe4c95985d3d9d0909bd2d07c04254",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":323, "failed":0, "ignored":4, "testBinaries":18,
+      "log":"target/native-mcp-handshake-tests-20260914T214627746Z.log",
+      "sha256":"846677ab96d12a3f3454b94d95462f45b2c7ebfcff2b7a581a0cb13f62418d34"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-handshake-clippy-20260914T214747253Z.log",
+      "sha256":"717446c5029498c229de89f1b1f3ab2284144af24a03056c29010e93520be243"
+    }
+  ],
+  "behaviorEvidence": [
+    "mcp_session_initialization_is_shared_pins_version_and_never_revives_closed_calls",
+    "mcp_cancellation_targets_only_the_authenticated_active_request",
+    "native_mcp_http_client_interoperates_with_owned_daemon_sessions",
+    "tools_admin_mcp_and_webhooks_enforce_and_map_contracts"
+  ],
+  "notes": [
+    "Session discovery/calls require initialized notification; supplied protocol headers must match the pinned negotiated version",
+    "Complete bounded client metadata is required for session allocation; simplified legacy initialization remains stateless",
+    "Modern initialization batches and duplicate raw JSON keys are refused before any tool dispatch",
+    "Existing protocol codec enforces byte/nesting/collection/duplicate checks; errors omit rejected data",
+    "Actual native client/owned daemon interoperability and unchanged current Cargo.lock witness verified"
+  ],
+  "unverified": [
+    "service-drain/exact background expiry and delayed cancellation after ID reuse within the same session",
+    "outbound MCP authorization, complete events, OAuth/stdio/ACP and live accounts",
+    "prior MCP stdio fixture all-target lint gap, cross-platform/power-loss acceptance and whole-project completion"
+  ]
+}

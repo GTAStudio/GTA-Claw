@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-anthropic-block-terminal-and-cache-usage",
+  "capturedAtUtc": "2026-09-15T04:12:45.4053031Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-providers/src/anthropic.rs","sha256":"2aac06cae465ad49bce620b74079d1ebc34be51ae147cce23ed000b01376ef25"},
+    {"path":"crates/claw-providers/tests/wire.rs","sha256":"a206e8580ec110469c97a0699536e98bddab43387b07817135732f5608e72574"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-provider-sdk -p claw-providers -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":703, "failed":0, "ignored":5, "testBinaries":17,
+      "log":"target/native-anthropic-lifecycle-tests-20260915T041026477Z.log",
+      "sha256":"dfc632d8eb2409a4526c422656ff7a7072fa5806c5764ad202bd94240700054a"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-providers -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-anthropic-lifecycle-clippy-20260915T040948764Z.log",
+      "sha256":"9511968b468ecd2bcaa662751cdc51b65cae0aa50a13ef8a735eb4e50b2cff8c"
+    }
+  ],
+  "retainedFailures": [
+    {"log":"target/native-anthropic-lifecycle-clippy-20260915T040925348Z.log","sha256":"bc96afa166873b7ae11478b5f1e1c876d80a5d974740e4ebd3452e107bca9bd3","reason":"One new unit branch lacked its trailing semicolon; fixed without relaxing lint"}
+  ],
+  "behaviorEvidence": [
+    "truncated_or_refused_anthropic_streams_do_not_publish_completed_tools",
+    "anthropic_block_lifecycle_rejects_orphans_wrong_types_reuse_and_unclosed_blocks",
+    "anthropic_buffered_and_streamed_duplicate_function_ids_fail_closed",
+    "anthropic_stream_keeps_accepted_partial_text_before_a_later_event_error",
+    "anthropic_usage_includes_cache_reads_and_rejects_overflow_or_cumulative_regression",
+    "anthropic_http_terminal_validates_blocks_usage_and_atomic_tool_completion"
+  ],
+  "schemaReferences": [
+    "https://platform.claude.com/docs/en/build-with-claude/prompt-caching#tracking-cache-performance"
+  ],
+  "notes": [
+    "Stream success requires a valid message_start, closed bounded content blocks and message_stop; EOF cannot fabricate completion",
+    "Completed function events remain withheld until the whole message confirms a consistent terminal state",
+    "Content blocks are sequential, contiguous and single-use; orphan/wrong-type/repeated/unclosed blocks, duplicate tool IDs and mismatched SSE event names fail",
+    "Initial text/thinking content is preserved; initial tool input must be absent or an empty object rather than silently ignored",
+    "Output is bounded to 1024 blocks and 4 MiB aggregate text/thinking/arguments, with existing 1 MiB function argument limit",
+    "Anthropic input totals now include uncached input plus cache creation plus cache reads; optional cumulative updates retain missing fields and reject decreases or overflow",
+    "Seven real HTTP scenarios verify terminal cleanup, retained-stream one-slot release, partial text, invalid tool rounds and one request per failed attempt",
+    "Normal message_stop without stop_reason remains compatible and infers Stop or ToolCalls; legacy public finish keeps its signature with incomplete_stream on errors",
+    "Existing chunk-split fixture gained missing content start/stop to represent the protocol; prior orphan acceptance was not preserved as legitimate success",
+    "Prior native credential failures remain unresolved; this joint pass is not evidence that either root cause was fixed",
+    "No dependency versions/downloads, production proxy/processes, real accounts, browser execution, deployment or Git writes changed"
+  ],
+  "unverified": [
+    "Signed thinking/redacted payload replay and full model-specific reasoning continuation",
+    "Cost computation and separate cache-write pricing, durable paid-request unknown receipts and full usage provenance",
+    "Real Anthropic/compatible account and cross-platform interoperability, complete provider configuration/account lifecycle",
+    "Root causes of the two prior native credential test failures",
+    "Complete frozen build manifests, MSRV/release and whole-project acceptance"
+  ]
+}

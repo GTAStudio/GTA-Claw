@@ -474,23 +474,13 @@ impl LegacyTeamsPort for LegacyTeamsAdapter {
     fn handle_activity(
         &self,
         context: LegacyTeamsRequestContext,
-        mut activity: Value,
+        activity: Value,
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<(), PortError>> {
         Box::pin(async move {
             self.verify_teams_request(&context, &activity, cancellation.clone())
                 .await?;
-            if let Some(sender) = activity.get_mut("from").and_then(Value::as_object_mut)
-                && !sender.contains_key("id")
-            {
-                let id = sender
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .filter(|name| !name.trim().is_empty())
-                    .unwrap_or("teams-user")
-                    .to_owned();
-                sender.insert("id".to_owned(), Value::String(id));
-            }
+            let inbound = verified_teams_message(&self.app_id, &activity)?;
             let conversation_id = activity
                 .get("conversation")
                 .and_then(Value::as_object)
@@ -501,6 +491,11 @@ impl LegacyTeamsPort for LegacyTeamsAdapter {
                 .get("serviceUrl")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            if let (Some(service_url), Some(conversation_id)) =
+                (service_url.as_deref(), conversation_id.as_deref())
+            {
+                let _ = teams_reply_endpoint(service_url, conversation_id)?;
+            }
             let payload = serde_json::to_vec(&activity)
                 .map_err(|_| invalid("Teams activity encoding failed"))?;
             let instructions = self
@@ -508,9 +503,13 @@ impl LegacyTeamsPort for LegacyTeamsAdapter {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
-            let mut conversation = self
-                .runtime
-                .conversation_with_cancellation(cancellation.clone());
+            let mut conversation = inbound
+                .as_ref()
+                .map(|message| {
+                    self.runtime
+                        .durable_legacy_conversation(message, cancellation.clone())
+                })
+                .transpose()?;
             let pending = {
                 let mut handler = self.handler.lock().map_err(|_| {
                     PortError::new(PortErrorKind::Internal, "Teams state unavailable")
@@ -518,7 +517,11 @@ impl LegacyTeamsPort for LegacyTeamsAdapter {
                 let outcome = handler
                     .handle_activity(
                         &payload,
-                        self.runtime.authenticated().then_some(&mut conversation),
+                        if self.runtime.authenticated() {
+                            conversation.as_mut()
+                        } else {
+                            None
+                        },
                         instructions.as_deref().map_or(
                             AuthenticationPrompt::Unconfigured,
                             AuthenticationPrompt::Instructions,
@@ -542,15 +545,18 @@ impl LegacyTeamsPort for LegacyTeamsAdapter {
                     }
                 }
             };
+            let mut delivery = conversation
+                .as_mut()
+                .and_then(super::agent_runtime::RuntimeConversation::take_durable_delivery);
             let actions = match pending {
                 PendingTeamsDispatch::Actions(actions) => actions,
                 PendingTeamsDispatch::Command(command) => {
-                    let conversation_id = conversation_id
-                        .as_deref()
-                        .ok_or_else(|| invalid("Teams command has no conversation id"))?;
+                    let message = inbound.as_ref().ok_or_else(|| {
+                        invalid("Teams command has no authenticated message identity")
+                    })?;
                     let reply = self
                         .runtime
-                        .channel_command(conversation_id, &command)
+                        .owned_channel_command(message, &command, cancellation.clone())
                         .await?;
                     let mut actions = Vec::new();
                     for segment in segment_outbound_text_iter("msteams", &reply)
@@ -561,32 +567,285 @@ impl LegacyTeamsPort for LegacyTeamsAdapter {
                         })?;
                         actions.push(TeamsAction::Reply(segment.into_owned()));
                     }
+                    delivery = Some((message.clone(), reply));
                     actions
                 }
             };
+            if delivery.is_none()
+                && let Some(message) = &inbound
+            {
+                let reply: String = actions
+                    .iter()
+                    .filter_map(|action| match action {
+                        TeamsAction::Reply(text) => Some(text.as_str()),
+                        TeamsAction::Typing => None,
+                    })
+                    .collect();
+                if !reply.is_empty() {
+                    let expected_reply = reply.clone();
+                    let run = self
+                        .runtime
+                        .run_channel_message(message, async move { Ok(Some(reply)) })
+                        .await?;
+                    let retained = super::agent_runtime::completed_channel_reply(&run)?;
+                    if retained != expected_reply {
+                        return Err(invalid(
+                            "Teams generated reply changed from its durable result; inspect the original activity",
+                        ));
+                    }
+                    delivery = Some((message.clone(), retained));
+                }
+            }
             if !actions.is_empty()
                 && let (Some(service_url), Some(conversation_id)) =
                     (service_url.as_deref(), conversation_id.as_deref())
             {
-                for action in &actions {
-                    self.send_action(service_url, conversation_id, action, cancellation.clone())
-                        .await?;
+                if let Some((message, reply)) = &delivery {
+                    let _ = teams_reply_endpoint(service_url, conversation_id)?;
+                    let send_cancel = &cancellation;
+                    send_teams_durable_reply(
+                        &self.runtime,
+                        message,
+                        reply,
+                        &actions,
+                        &cancellation,
+                        |action| async move {
+                            self.send_action(
+                                service_url,
+                                conversation_id,
+                                &action,
+                                send_cancel.clone(),
+                            )
+                            .await
+                        },
+                    )
+                    .await?;
+                } else {
+                    return Err(invalid(
+                        "Teams reply has no durable authenticated source activity",
+                    ));
                 }
             }
             let mut replies = self.replies.lock().map_err(|_| {
                 PortError::new(PortErrorKind::Internal, "Teams reply state unavailable")
             })?;
-            if replies.len() == 16 {
-                replies.pop_front();
-            }
-            replies.extend(actions.into_iter().filter_map(|action| match action {
+            for reply in actions.into_iter().filter_map(|action| match action {
                 TeamsAction::Typing => None,
                 TeamsAction::Reply(reply) => Some(reply),
-            }));
+            }) {
+                while replies.len() >= 16 {
+                    replies.pop_front();
+                }
+                replies.push_back(reply);
+            }
             drop(replies);
             Ok(())
         })
     }
+}
+
+fn verified_teams_message(
+    app_id: &str,
+    activity: &Value,
+) -> Result<Option<claw_channel_sdk::InboundMessage>, PortError> {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let membership = activity["type"] == "conversationUpdate";
+    if !matches!(
+        activity["type"].as_str(),
+        Some("message" | "messageUpdate" | "conversationUpdate")
+    ) {
+        return Ok(None);
+    }
+    if membership
+        && activity
+            .get("membersAdded")
+            .is_none_or(|members| members.as_array().is_some_and(Vec::is_empty))
+    {
+        return Ok(None);
+    }
+    let component = |value: Option<&str>| {
+        value.filter(|value| !value.is_empty() && value.len() <= 256 && value.trim() == *value && !value.chars().any(char::is_control))
+        .map(str::to_owned).ok_or_else(|| invalid("Teams message requires bounded account, tenant, sender, conversation and activity IDs"))
+    };
+    let app_id = component(Some(app_id))?;
+    if activity["channelId"] != "msteams" {
+        return Err(invalid(
+            "Teams identity requires an authenticated msteams activity",
+        ));
+    }
+    let tenant = activity
+        .pointer("/channelData/tenant/id")
+        .and_then(Value::as_str);
+    let conversation_tenant = activity
+        .pointer("/conversation/tenantId")
+        .and_then(Value::as_str);
+    if tenant
+        .zip(conversation_tenant)
+        .is_some_and(|(first, second)| first != second)
+    {
+        return Err(invalid(
+            "Teams activity declares conflicting tenant identities",
+        ));
+    }
+    let tenant = component(tenant.or(conversation_tenant))?;
+    let text = if membership {
+        let members = activity["membersAdded"]
+            .as_array()
+            .filter(|members| members.len() <= 64)
+            .ok_or_else(|| invalid("Teams membership activity exceeds its bound"))?;
+        let members: Vec<Value> = members
+            .iter()
+            .map(|member| {
+                let role = member.get("role").and_then(Value::as_str);
+                if role.is_some_and(|role| role.len() > 32 || role.chars().any(char::is_control)) {
+                    return Err(invalid("Teams member role is invalid"));
+                }
+                Ok(json!({"id":component(member["id"].as_str())?,"role":role}))
+            })
+            .collect::<Result<_, PortError>>()?;
+        Some(json!({"event":"conversationUpdate","membersAdded":members,"recipientId":activity.pointer("/recipient/id").and_then(Value::as_str)}).to_string())
+    } else {
+        activity["text"].as_str().map(str::to_owned)
+    };
+    let account_digest: String = Sha256::digest(
+        json!(["msteams-account/v1", app_id, tenant])
+            .to_string()
+            .as_bytes(),
+    )
+    .into_iter()
+    .flat_map(|byte| {
+        [
+            char::from(HEX[usize::from(byte >> 4)]),
+            char::from(HEX[usize::from(byte & 15)]),
+        ]
+    })
+    .collect();
+    let message = claw_channel_sdk::InboundMessage {
+        id: component(activity["id"].as_str())?,
+        channel_id: "msteams".to_owned(),
+        account_id: format!("app-{account_digest}"),
+        conversation_id: component(activity.pointer("/conversation/id").and_then(Value::as_str))?,
+        sender_id: component(activity.pointer("/from/id").and_then(Value::as_str))?,
+        text,
+        attachments: Vec::new(),
+        received_at_unix_ms: 0,
+    };
+    message
+        .validate()
+        .map_err(|_| invalid("Teams normalized message exceeds its identity or content limits"))?;
+    Ok(Some(message))
+}
+
+async fn send_teams_durable_reply<Send, Response>(
+    runtime: &Arc<AgentRuntime>,
+    message: &claw_channel_sdk::InboundMessage,
+    reply: &str,
+    actions: &[TeamsAction],
+    cancellation: &CancellationToken,
+    mut send: Send,
+) -> Result<(), PortError>
+where
+    Send: FnMut(TeamsAction) -> Response,
+    Response: std::future::Future<Output = Result<Option<String>, PortError>>,
+{
+    if message.channel_id != "msteams" || cancellation.is_cancelled() {
+        return Err(invalid(
+            "Teams reply is cancelled or has no authenticated Teams identity",
+        ));
+    }
+    if actions.len() > 1_025 || !actions.iter().any(|action| matches!(action, TeamsAction::Reply(_)))
+        || actions.iter().any(|action| matches!(action, TeamsAction::Reply(text) if text.is_empty() || text.len() > 16 * 1024))
+    { return Err(invalid("Teams actions exceed the reply limits")); }
+    let Some(claim) = runtime.claim_channel_delivery(message, reply).await? else {
+        return Ok(());
+    };
+    let delivery_outcome = async {
+        let mut index = 0_u32;
+        for action in actions {
+            if cancellation.is_cancelled() || index >= 1_024 {
+                return Err(invalid(
+                    "Teams reply cancelled or exceeds its segment bound",
+                ));
+            }
+            let remote_id = send(action.clone()).await?;
+            if let TeamsAction::Reply(segment) = action {
+                let remote_id = remote_id
+                    .ok_or_else(|| invalid("Teams reply has no confirmed resource identity"))?;
+                runtime
+                    .record_channel_delivery_receipt(message, &claim, index, segment, &remote_id)
+                    .await?;
+                index += 1;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    runtime
+        .finish_channel_delivery(message, claim, delivery_outcome.is_ok())
+        .await?;
+    delivery_outcome
+}
+
+fn teams_reply_endpoint(service_url: &str, conversation_id: &str) -> Result<Url, PortError> {
+    let mut endpoint =
+        Url::parse(service_url).map_err(|_| invalid("Teams service URL is invalid"))?;
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| invalid("Teams service URL has no host"))?;
+    if endpoint.scheme() != "https"
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || endpoint.port().is_some_and(|port| port != 443)
+        || !(host.eq_ignore_ascii_case("api.botframework.com")
+            || host.to_ascii_lowercase().ends_with(".botframework.com")
+            || host.to_ascii_lowercase().ends_with(".trafficmanager.net"))
+        || conversation_id.is_empty()
+        || conversation_id.len() > 256
+        || conversation_id.chars().any(char::is_control)
+    {
+        return Err(invalid(
+            "Teams reply requires a credential-free trusted HTTPS service URL and bounded conversation",
+        ));
+    }
+    endpoint
+        .path_segments_mut()
+        .map_err(|()| invalid("Teams service URL cannot contain path segments"))?
+        .pop_if_empty()
+        .push("v3")
+        .push("conversations")
+        .push(conversation_id)
+        .push("activities");
+    Ok(endpoint)
+}
+
+fn teams_action_receipt(action: &TeamsAction, body: &[u8]) -> Result<Option<String>, PortError> {
+    if body.len() > 16 * 1024 {
+        return Err(invalid("Teams action receipt exceeds its byte limit"));
+    }
+    if matches!(action, TeamsAction::Typing) {
+        return Ok(None);
+    }
+    let encoded = String::from_utf8(body.to_vec())
+        .map_err(|_| invalid("Teams reply receipt is not UTF-8 JSON"))?;
+    let raw = claw_protocol::gateway::OpaqueJson::from_json_string(encoded)
+        .map_err(|_| invalid("Teams reply lacks a complete resource receipt"))?;
+    let receipt: Value = claw_protocol::gateway::Codec::authenticated()
+        .decode_opaque(&raw)
+        .map_err(|_| invalid("Teams reply receipt is ambiguous or malformed"))?;
+    let id = receipt["id"]
+        .as_str()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 256
+                && id.bytes().all(|byte| {
+                    byte.is_ascii() && !byte.is_ascii_whitespace() && !byte.is_ascii_control()
+                })
+        })
+        .ok_or_else(|| invalid("Teams reply receipt has no valid resource identity"))?;
+    Ok(Some(format!("msteams:{id}")))
 }
 
 impl LegacyTeamsAdapter {
@@ -778,27 +1037,8 @@ impl LegacyTeamsAdapter {
         conversation_id: &str,
         action: &TeamsAction,
         cancellation: CancellationToken,
-    ) -> Result<(), PortError> {
-        let base = Url::parse(service_url).map_err(|_| invalid("Teams service URL is invalid"))?;
-        let host = base
-            .host_str()
-            .ok_or_else(|| invalid("Teams service URL has no host"))?;
-        if base.scheme() != "https"
-            || !(host.eq_ignore_ascii_case("api.botframework.com")
-                || host.to_ascii_lowercase().ends_with(".botframework.com")
-                || host.to_ascii_lowercase().ends_with(".trafficmanager.net"))
-        {
-            return Err(invalid(
-                "Teams service URL is not a trusted Bot Framework host",
-            ));
-        }
-        let conversation =
-            url::form_urlencoded::byte_serialize(conversation_id.as_bytes()).collect::<String>();
-        let endpoint = Url::parse(&format!(
-            "{}/v3/conversations/{conversation}/activities",
-            base.as_str().trim_end_matches('/')
-        ))
-        .map_err(|_| invalid("Teams reply endpoint is invalid"))?;
+    ) -> Result<Option<String>, PortError> {
+        let endpoint = teams_reply_endpoint(service_url, conversation_id)?;
         let token = self.access_token(cancellation.clone()).await?;
         let credential = BoundSecret::new(
             Origin::of(&endpoint)
@@ -836,7 +1076,7 @@ impl LegacyTeamsAdapter {
                 format!("Teams reply returned HTTP {}", response.status()),
             ));
         }
-        Ok(())
+        teams_action_receipt(action, response.body())
     }
 
     async fn access_token(
@@ -997,6 +1237,7 @@ fn classify_whatsapp_send_failure(
 /// Origin-bound `WhatsApp` Graph API sender using the integrated channel state machine.
 pub struct GraphWhatsAppAdapter {
     account_id: String,
+    runtime: Arc<AgentRuntime>,
     channel: Arc<AsyncMutex<WhatsAppChannel<GraphWhatsAppTransport, SystemClock>>>,
     credential: ChannelCredential,
     app_secret: ChannelCredential,
@@ -1025,6 +1266,7 @@ impl Drop for WhatsAppRequestGuard {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn handle_whatsapp_webhook<T, C>(
     channel: Arc<AsyncMutex<WhatsAppChannel<T, C>>>,
     credential: ChannelCredential,
@@ -1034,6 +1276,36 @@ async fn handle_whatsapp_webhook<T, C>(
     messages: Arc<dyn LegacyChannelMessagePort>,
     max_reply_bytes: usize,
     cancellation: CancellationToken,
+) -> Result<(), PortError>
+where
+    T: WhatsAppTransport + Send + 'static,
+    C: UnixClock + Send + 'static,
+{
+    handle_whatsapp_webhook_with_runtime(
+        channel,
+        credential,
+        request_cancel,
+        diagnostics,
+        payload,
+        messages,
+        max_reply_bytes,
+        cancellation,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_whatsapp_webhook_with_runtime<T, C>(
+    channel: Arc<AsyncMutex<WhatsAppChannel<T, C>>>,
+    credential: ChannelCredential,
+    request_cancel: Arc<Mutex<Option<CancelToken>>>,
+    diagnostics: Arc<Diagnostics>,
+    payload: Vec<u8>,
+    messages: Arc<dyn LegacyChannelMessagePort>,
+    max_reply_bytes: usize,
+    cancellation: CancellationToken,
+    native: Option<Arc<AgentRuntime>>,
 ) -> Result<(), PortError>
 where
     T: WhatsAppTransport + Send + 'static,
@@ -1063,11 +1335,46 @@ where
         cancel: sdk_cancel.clone(),
         slot: request_cancel,
     };
-    let task_cancellation = cancellation.clone();
+    let task_cancellation = cancellation.child_token();
+    let _execution_cancel_on_drop = task_cancellation.clone().drop_guard();
     let runtime = tokio::runtime::Handle::current();
     let mut task = tokio::task::spawn_blocking(move || {
         let mut channel = channel;
         let _request_guard = request_guard;
+        if let Some(native) = native {
+            let updates = channel
+                .delivery_updates(&payload)
+                .map_err(|error| channel_port_error(&error))?;
+            let ingestion = channel
+                .ingest_native_webhook(&payload, &mut ChannelDiagnostics(diagnostics))
+                .map_err(|error| channel_port_error(&error))?;
+            runtime.block_on(async {
+                for update in &updates {
+                    if task_cancellation.is_cancelled() {
+                        return Err(invalid("WhatsApp callback processing cancelled"));
+                    }
+                    native.record_whatsapp_delivery_update(update).await?;
+                }
+                Ok::<(), PortError>(())
+            })?;
+            if ingestion.messages > 0 {
+                runtime
+                    .block_on(process_native_whatsapp_queue(
+                        &mut channel,
+                        &credential,
+                        &native,
+                        max_reply_bytes,
+                        &task_cancellation,
+                    ))
+                    .map_err(|error| channel_port_error(&error))?;
+            }
+            if ingestion.dropped > 0 {
+                return Err(channel_port_error(&ChannelError::RateLimited {
+                    retry_after: Duration::from_secs(1),
+                }));
+            }
+            return Ok(());
+        }
         channel
             .handle_webhook(
                 &payload,
@@ -1079,9 +1386,12 @@ where
                         ));
                     }
                     let reply = runtime
-                        .block_on(messages.process(
+                        .block_on(Arc::clone(&messages).process_owned(
                             LegacyChannelMessage {
                                 channel: "whatsapp",
+                                account_id: message.account_id.clone(),
+                                message_id: message.id.clone(),
+                                sender_id: message.sender_id.clone(),
                                 conversation_id: message.conversation_id.clone(),
                                 user_name: message.sender_id.clone(),
                                 text: message.text.clone().unwrap_or_default(),
@@ -1121,6 +1431,99 @@ where
     }
 }
 
+async fn process_native_whatsapp_queue<T: WhatsAppTransport, C: UnixClock>(
+    channel: &mut WhatsAppChannel<T, C>,
+    credential: &ChannelCredential,
+    native: &Arc<AgentRuntime>,
+    max_reply_bytes: usize,
+    cancellation: &CancellationToken,
+) -> Result<(), ChannelError> {
+    let mut first_error = None;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(ChannelError::Transport(
+                claw_channel_sdk::TransportErrorKind::CancelledBeforeSend,
+            ));
+        }
+        let Some(message) = channel.poll_inbound()? else {
+            break;
+        };
+        let result = async {
+            channel.validate_native_reply(&message)?;
+            let reply = native
+                .process_channel_input(message.clone(), cancellation.clone())
+                .await
+                .map_err(|_| ChannelError::RemoteRejected { status: 503 })?;
+            if reply.len() > max_reply_bytes {
+                return Err(ChannelError::Protocol(
+                    claw_channel_sdk::ProtocolErrorKind::PayloadTooLarge,
+                ));
+            }
+            if reply.trim().is_empty() {
+                return Ok(());
+            }
+            let segments = segment_outbound_text_iter("whatsapp", &reply).map_err(|_| {
+                ChannelError::Protocol(claw_channel_sdk::ProtocolErrorKind::InvalidField)
+            })?;
+            channel.validate_native_reply(&message)?;
+            let Some(claim) = native
+                .claim_channel_delivery(&message, &reply)
+                .await
+                .map_err(|_| ChannelError::RemoteRejected { status: 503 })?
+            else {
+                return Ok(());
+            };
+            let mut failure = None;
+            for (index, segment) in segments.enumerate() {
+                if cancellation.is_cancelled() || index >= 1_024 {
+                    failure = Some(ChannelError::Transport(
+                        claw_channel_sdk::TransportErrorKind::CancelledBeforeSend,
+                    ));
+                    break;
+                }
+                let Ok(segment) = segment else {
+                    failure = Some(ChannelError::Protocol(
+                        claw_channel_sdk::ProtocolErrorKind::InvalidField,
+                    ));
+                    break;
+                };
+                let remote_id =
+                    match channel.send_confirmed_reply_segment(&message, &segment, credential) {
+                        Ok(remote_id) => remote_id,
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    };
+                if native
+                    .record_channel_delivery_receipt(
+                        &message,
+                        &claim,
+                        u32::try_from(index).expect("bounded segment"),
+                        &segment,
+                        &remote_id,
+                    )
+                    .await
+                    .is_err()
+                {
+                    failure = Some(ChannelError::RemoteRejected { status: 503 });
+                    break;
+                }
+            }
+            native
+                .finish_channel_delivery(&message, claim, failure.is_none())
+                .await
+                .map_err(|_| ChannelError::RemoteRejected { status: 503 })?;
+            failure.map_or(Ok(()), Err)
+        }
+        .await;
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 impl GraphWhatsAppAdapter {
     /// Creates a sender for one configured phone-number identity.
     ///
@@ -1134,6 +1537,7 @@ impl GraphWhatsAppAdapter {
         access_token: &SecretString,
         app_secret: &SecretString,
         diagnostics: Arc<Diagnostics>,
+        runtime: Arc<AgentRuntime>,
     ) -> Result<Arc<Self>, PortError> {
         if phone_number_id.is_empty()
             || !phone_number_id
@@ -1185,6 +1589,7 @@ impl GraphWhatsAppAdapter {
             .map_err(|error| invalid(format!("WhatsApp channel startup failed: {error}")))?;
         Ok(Arc::new(Self {
             account_id,
+            runtime,
             channel: Arc::new(AsyncMutex::new(channel)),
             credential,
             app_secret,
@@ -1207,7 +1612,7 @@ impl LegacyWhatsAppPort for GraphWhatsAppAdapter {
         max_reply_bytes: usize,
         cancellation: CancellationToken,
     ) -> PortFuture<'_, Result<(), PortError>> {
-        Box::pin(handle_whatsapp_webhook(
+        Box::pin(handle_whatsapp_webhook_with_runtime(
             Arc::clone(&self.channel),
             self.credential.clone(),
             Arc::clone(&self.request_cancel),
@@ -1216,6 +1621,7 @@ impl LegacyWhatsAppPort for GraphWhatsAppAdapter {
             messages,
             max_reply_bytes,
             cancellation,
+            Some(Arc::clone(&self.runtime)),
         ))
     }
 
@@ -1789,12 +2195,552 @@ mod tests {
     impl LegacyChannelMessagePort for ReplyingMessages {
         fn process(
             &self,
-            _message: LegacyChannelMessage,
+            message: LegacyChannelMessage,
             _cancellation: CancellationToken,
         ) -> PortFuture<'_, Result<String, PortError>> {
+            assert_eq!(message.channel, "whatsapp");
+            assert!(!message.account_id.is_empty());
+            assert!(!message.message_id.is_empty());
+            assert_eq!(message.sender_id, message.user_name);
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok("reply".to_owned()) })
         }
+    }
+
+    #[test]
+    fn teams_resource_receipt_does_not_echo_remote_error_content() {
+        let error = super::teams_action_receipt(
+            &claw_channels::TeamsAction::Reply("text".to_owned()),
+            br#"{"error":"private-remote-error"}"#,
+        )
+        .expect_err("missing ID");
+        assert!(!error.to_string().contains("private-remote-error"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teams_claimed_replies_keep_confirmed_prefix_and_do_not_repeat_after_restart() {
+        use crate::adapters::agent_runtime::AgentRuntime;
+        use crate::adapters::http_api::{
+            DependencyReadiness, EmptyModelTools, OperatorRuntimeStatus, ProviderHistoryConfig,
+            SmokeProvider, SwappableProvider,
+        };
+        use crate::adapters::signed_plugins::PluginToolSurface;
+        use claw_channels::TeamsAction;
+        use serde_json::json;
+        struct Root(std::path::PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let reply = "private-teams-reply ".repeat(620);
+        let actions: Vec<TeamsAction> = std::iter::once(TeamsAction::Typing)
+            .chain(
+                claw_channels::segment_outbound_text_iter("msteams", &reply)
+                    .expect("segments")
+                    .map(|segment| {
+                        TeamsAction::Reply(segment.expect("valid segment").into_owned())
+                    }),
+            )
+            .collect();
+        let segments = claw_channels::segment_outbound_text_iter("msteams", &reply)
+            .expect("segments")
+            .count();
+        assert!(segments >= 3);
+        for mode in [
+            "delivered",
+            "partial",
+            "missing-receipt",
+            "typing-failed",
+            "closed-storage",
+            "dropped",
+        ] {
+            let root = Root(std::env::temp_dir().join(format!(
+                    "claw-teams-delivery-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock")
+                        .as_nanos()
+                )));
+            std::fs::create_dir(&root.0).expect("owned state");
+            let diagnostics = Arc::new(Diagnostics::new(32));
+            let provider = Arc::new(SwappableProvider::new(
+                "gpt-4o",
+                "Teams fixture",
+                ProviderHistoryConfig::default(),
+                Arc::new(EmptyModelTools),
+                Arc::new(DependencyReadiness::new(["provider"])),
+            ));
+            provider
+                .activate(Arc::new(SmokeProvider::new().expect("local provider")))
+                .await
+                .expect("activated");
+            let plugins = PluginToolSurface::new(Arc::clone(&diagnostics));
+            let runtime = AgentRuntime::new(
+                Arc::clone(&provider),
+                Arc::clone(&plugins),
+                &root.0,
+                "gpt-4o".to_owned(),
+                0,
+                8,
+                Duration::from_secs(60),
+                Arc::clone(&diagnostics),
+            )
+            .expect("runtime");
+            let message = super::verified_teams_message("app", &json!({"type":"message","id":"activity","channelId":"msteams","text":"question","from":{"id":"sender"},"conversation":{"id":"thread","tenantId":"tenant"}})).expect("verified identity").expect("message");
+            let retained = reply.clone();
+            let run = runtime
+                .run_channel_message(&message, async move { Ok(Some(retained)) })
+                .await
+                .expect("retained result");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let cancellation = CancellationToken::new();
+            let mut operation = Box::pin(super::send_teams_durable_reply(
+                &runtime,
+                &message,
+                &reply,
+                &actions,
+                &cancellation,
+                |action| {
+                    let calls = Arc::clone(&calls);
+                    let runtime = Arc::clone(&runtime);
+                    let entered = Arc::clone(&entered);
+                    async move {
+                        let call = calls.fetch_add(1, Ordering::SeqCst);
+                        if mode == "dropped" {
+                            entered.notify_one();
+                            std::future::pending::<()>().await;
+                        }
+                        match action {
+                            TeamsAction::Typing => {
+                                assert_eq!(call, 0);
+                                if mode == "typing-failed" {
+                                    Err(super::invalid("typing failed"))
+                                } else {
+                                    Ok(None)
+                                }
+                            }
+                            TeamsAction::Reply(text) => {
+                                assert!(!text.is_empty());
+                                if mode == "partial" && call == 2 {
+                                    return Err(super::invalid("second reply failed"));
+                                }
+                                if mode == "missing-receipt" {
+                                    return Ok(None);
+                                }
+                                if mode == "closed-storage" {
+                                    runtime
+                                        .shutdown()
+                                        .await
+                                        .expect("storage closed before receipt");
+                                }
+                                super::teams_action_receipt(
+                                    &TeamsAction::Reply(text),
+                                    json!({"id":format!("resource:{call}")})
+                                        .to_string()
+                                        .as_bytes(),
+                                )
+                            }
+                        }
+                    }
+                },
+            ));
+            let result = if mode == "dropped" {
+                tokio::select! {
+                    result = &mut operation => panic!("send completed before drop: {result:?}"),
+                    () = entered.notified() => {}
+                }
+                drop(operation);
+                Err(super::invalid("test dropped the pending send future"))
+            } else {
+                operation.await
+            };
+            assert_eq!(result.is_ok(), mode == "delivered", "{mode}");
+            let expected_calls = match mode {
+                "delivered" => segments + 1,
+                "partial" => 3,
+                "typing-failed" | "dropped" => 1,
+                _ => 2,
+            };
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+            if mode != "closed-storage" {
+                runtime.shutdown().await.expect("drain");
+            }
+            drop(runtime);
+            let reopened = AgentRuntime::new(
+                provider,
+                plugins,
+                &root.0,
+                "gpt-4o".to_owned(),
+                0,
+                8,
+                Duration::from_secs(60),
+                diagnostics,
+            )
+            .expect("reopened runtime");
+            let query = json!({"nativeRecovery":{"channelId":"msteams","accountId":message.account_id,"conversationId":message.conversation_id,"senderId":message.sender_id,"runId":run.id()}});
+            let status = reopened
+                .dispatch("channels.status", Some(&query), CancellationToken::new())
+                .await
+                .expect("receipt recovery")
+                .expect("status");
+            assert_eq!(
+                status["delivery"],
+                if mode == "delivered" {
+                    "delivered"
+                } else {
+                    "outcome_unknown"
+                }
+            );
+            let receipts = status["deliveryReceipts"]
+                .as_array()
+                .expect("receipt prefix");
+            assert_eq!(
+                receipts.len(),
+                match mode {
+                    "delivered" => segments,
+                    "partial" => 1,
+                    _ => 0,
+                }
+            );
+            for (index, receipt) in receipts.iter().enumerate() {
+                assert_eq!(
+                    receipt["remoteMessageId"],
+                    format!("msteams:resource:{}", index + 1)
+                );
+                assert_eq!(receipt["segment"], index);
+            }
+            assert!(!status.to_string().contains("private-teams-reply"));
+            let retry = super::send_teams_durable_reply(
+                &reopened,
+                &message,
+                &reply,
+                &actions,
+                &CancellationToken::new(),
+                |_| async { panic!("claimed typing/reply must not be sent again") },
+            )
+            .await;
+            assert_eq!(retry.is_ok(), mode == "delivered");
+            reopened.shutdown().await.expect("reopened drain");
+        }
+    }
+
+    #[test]
+    fn teams_reply_requires_trusted_path_and_unambiguous_resource_receipt() {
+        let endpoint = super::teams_reply_endpoint(
+            "https://api.botframework.com/region/",
+            "thread/with?delimiters",
+        )
+        .expect("scoped endpoint");
+        assert_eq!(
+            endpoint.as_str(),
+            "https://api.botframework.com/region/v3/conversations/thread%2Fwith%3Fdelimiters/activities"
+        );
+        for source in [
+            "http://api.botframework.com",
+            "https://api.botframework.com.evil.example",
+            "https://user:secret@api.botframework.com",
+            "https://api.botframework.com?token=value",
+            "https://api.botframework.com#fragment",
+            "https://api.botframework.com:444",
+        ] {
+            assert!(super::teams_reply_endpoint(source, "thread").is_err());
+        }
+        let action = claw_channels::TeamsAction::Reply("reply".to_owned());
+        assert_eq!(
+            super::teams_action_receipt(&action, br#"{"id":"activity:1|segment=one"}"#)
+                .expect("resource response"),
+            Some("msteams:activity:1|segment=one".to_owned())
+        );
+        for body in [
+            b"".as_slice(),
+            b"{}",
+            br#"{"id":null}"#,
+            br#"{"id":"one","id":"two"}"#,
+            br#"{"id":"line\nforgery"}"#,
+            br#"{"id":"space id"}"#,
+        ] {
+            assert!(super::teams_action_receipt(&action, body).is_err());
+        }
+        assert!(
+            super::teams_action_receipt(&claw_channels::TeamsAction::Typing, b"")
+                .expect("typing has no reply receipt")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn teams_missing_tenant_and_sender_ids_never_fall_back_to_display_names() {
+        let activity = serde_json::json!({"type":"message","id":"activity","channelId":"msteams","text":"hello","conversation":{"id":"thread"},"from":{"name":"claimed admin"}});
+        assert!(super::verified_teams_message("app", &activity).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teams_durable_conversation_and_reset_keep_tenants_and_senders_isolated() {
+        use crate::adapters::agent_runtime::AgentRuntime;
+        use crate::adapters::http_api::{
+            DependencyReadiness, Diagnostics, EmptyModelTools, ProviderHistoryConfig,
+            SmokeProvider, SwappableProvider,
+        };
+        use crate::adapters::signed_plugins::PluginToolSurface;
+        use claw_channels::ConversationService;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+        struct Root(std::path::PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Root(std::env::temp_dir().join(format!(
+                "claw-teams-identity-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            )));
+        std::fs::create_dir(&root.0).expect("owned state");
+        let diagnostics = Arc::new(Diagnostics::new(32));
+        let provider = Arc::new(SwappableProvider::new(
+            "gpt-4o",
+            "Teams fixture",
+            ProviderHistoryConfig::default(),
+            Arc::new(EmptyModelTools),
+            Arc::new(DependencyReadiness::new(["provider"])),
+        ));
+        provider
+            .activate(Arc::new(SmokeProvider::new().expect("local provider")))
+            .await
+            .expect("activated");
+        let plugins = PluginToolSurface::new(Arc::clone(&diagnostics));
+        let runtime = AgentRuntime::new(
+            Arc::clone(&provider),
+            Arc::clone(&plugins),
+            &root.0,
+            "gpt-4o".to_owned(),
+            0,
+            8,
+            Duration::from_secs(60),
+            Arc::clone(&diagnostics),
+        )
+        .expect("actual runtime");
+        let message = |tenant: &str, sender: &str, text: &str| {
+            super::verified_teams_message("app", &serde_json::json!({"type":"message","channelId":"msteams","id":"same-activity","text":text,"from":{"id":sender},"conversation":{"id":"same-thread","tenantId":tenant}})).expect("verified identity fields").expect("message")
+        };
+        let first = message("tenant-one", "sender", "first-tenant-private");
+        let mut raw_first = first.clone();
+        raw_first.text = Some("<at>bot</at> first-tenant-private".to_owned());
+        let mut conversation = runtime
+            .durable_legacy_conversation(&raw_first, CancellationToken::new())
+            .expect("bound conversation");
+        let mut handler = claw_channels::TeamsActivityHandler::new(
+            first.account_id.clone(),
+            "app",
+            None,
+            NonZeroUsize::new(8).expect("actions"),
+        )
+        .expect("actual Teams handler");
+        handler.start(&mut ()).expect("started handler");
+        let activity = serde_json::json!({"type":"message","id":first.id,"text":raw_first.text,"from":{"id":first.sender_id},"recipient":{"id":"app"},"conversation":{"id":first.conversation_id},"entities":[{"type":"mention","text":"<at>bot</at>","mentioned":{"id":"app"}}]});
+        handler
+            .handle_activity(
+                activity.to_string().as_bytes(),
+                Some(&mut conversation),
+                claw_channels::AuthenticationPrompt::Unconfigured,
+                &mut (),
+            )
+            .expect("actual mention-normalized dispatch");
+        let (normalized, generated_reply) = conversation
+            .take_durable_delivery()
+            .expect("handler-retained result binding");
+        assert_eq!(normalized, first);
+        assert!(
+            generated_reply.contains("first-tenant-private")
+                && !generated_reply.contains("<at>bot</at>")
+        );
+        let claim = runtime
+            .claim_channel_delivery(&normalized, &generated_reply)
+            .await
+            .expect("normalized input matches its retained result")
+            .expect("first delivery claim");
+        runtime
+            .finish_channel_delivery(&normalized, claim, false)
+            .await
+            .expect("test does not send the reply");
+        assert!(conversation.chat("other-thread", "not allowed").is_err());
+        let reply = conversation
+            .chat(&first.conversation_id, first.text.as_deref().expect("text"))
+            .expect("first turn");
+        assert_eq!(
+            conversation
+                .chat(&first.conversation_id, first.text.as_deref().expect("text"))
+                .expect("duplicate reads durable result"),
+            reply
+        );
+        let delivery = conversation
+            .take_durable_delivery()
+            .expect("exact normalized request and durable output");
+        assert_eq!(delivery.0, first);
+        assert_eq!(delivery.1, reply);
+        assert!(conversation.take_durable_delivery().is_none());
+        assert!(
+            conversation
+                .chat(&first.conversation_id, "changed text for the same activity")
+                .is_err()
+        );
+        assert!(
+            conversation.take_durable_delivery().is_none(),
+            "a failed request cannot retain another reply binding"
+        );
+        drop(conversation);
+        let second = message("tenant-two", "sender", "second-tenant-private");
+        let mut conversation = runtime
+            .durable_legacy_conversation(&second, CancellationToken::new())
+            .expect("other tenant");
+        let reply = conversation
+            .chat(
+                &second.conversation_id,
+                second.text.as_deref().expect("text"),
+            )
+            .expect("second turn");
+        assert!(reply.contains("second-tenant-private") && !reply.contains("first-tenant-private"));
+        drop(conversation);
+        let third = message("tenant-one", "other-sender", "other-sender-private");
+        let mut conversation = runtime
+            .durable_legacy_conversation(&third, CancellationToken::new())
+            .expect("other sender");
+        let reply = conversation
+            .chat(&third.conversation_id, third.text.as_deref().expect("text"))
+            .expect("third turn");
+        assert!(
+            !reply.contains("first-tenant-private") && !reply.contains("second-tenant-private")
+        );
+        drop(conversation);
+        let mut reset = first.clone();
+        reset.id = "reset-activity".to_owned();
+        reset.text = Some("/reset".to_owned());
+        let reset_reply = runtime
+            .owned_channel_command(&reset, "reset", CancellationToken::new())
+            .await
+            .expect("own scoped reset");
+        assert_eq!(reset_reply, "Conversation reset.");
+        assert_eq!(
+            runtime
+                .owned_channel_command(&reset, "reset", CancellationToken::new())
+                .await
+                .expect("duplicate reset reads result"),
+            reset_reply
+        );
+        assert_eq!(runtime.operator_status()["sessions"]["managed"], 2);
+        runtime.shutdown().await.expect("drain");
+        drop(runtime);
+        let reopened = AgentRuntime::new(
+            provider,
+            plugins,
+            &root.0,
+            "gpt-4o".to_owned(),
+            0,
+            8,
+            Duration::from_secs(60),
+            diagnostics,
+        )
+        .expect("reopened runtime");
+        assert_eq!(
+            reopened
+                .owned_channel_command(&reset, "reset", CancellationToken::new())
+                .await
+                .expect("reset not repeated after restart"),
+            reset_reply
+        );
+        let mut continue_second = second;
+        continue_second.id = "after-restart".to_owned();
+        let mut conversation = reopened
+            .durable_legacy_conversation(&continue_second, CancellationToken::new())
+            .expect("reopened scoped conversation");
+        let reply = conversation
+            .chat(&continue_second.conversation_id, "continue after restart")
+            .expect("retained second-tenant history");
+        assert!(
+            reply.contains("second-tenant-private")
+                && !reply.contains("first-tenant-private")
+                && !reply.contains("other-sender-private")
+        );
+        drop(conversation);
+        reopened.shutdown().await.expect("reopened drain");
+    }
+
+    #[test]
+    fn teams_verified_message_preserves_tenant_sender_and_activity_identity() {
+        use serde_json::{Value, json};
+        let activity = json!({"type":"message","id":"activity-one","channelId":"msteams","text":"scoped message","from":{"id":"sender-one","name":"display only"},"conversation":{"id":"conversation-one","tenantId":"tenant-one"},"channelData":{"tenant":{"id":"tenant-one"}}});
+        let first = super::verified_teams_message("app-one", &activity)
+            .expect("verified message")
+            .expect("message");
+        assert_eq!(first.id, "activity-one");
+        assert_eq!(first.sender_id, "sender-one");
+        assert_eq!(first.conversation_id, "conversation-one");
+        assert_eq!(first.channel_id, "msteams");
+        let mut renamed = activity.clone();
+        renamed["from"]["name"] = json!("changed display name");
+        assert_eq!(
+            super::verified_teams_message("app-one", &renamed)
+                .expect("renamed")
+                .expect("message"),
+            first
+        );
+        let mut other_tenant = activity.clone();
+        other_tenant["channelData"]["tenant"]["id"] = json!("tenant-two");
+        assert!(super::verified_teams_message("app-one", &other_tenant).is_err());
+        other_tenant["conversation"]["tenantId"] = json!("tenant-two");
+        assert_ne!(
+            super::verified_teams_message("app-one", &other_tenant)
+                .expect("other tenant")
+                .expect("message")
+                .account_id,
+            first.account_id
+        );
+        assert_ne!(
+            super::verified_teams_message("app-two", &activity)
+                .expect("other app")
+                .expect("message")
+                .account_id,
+            first.account_id
+        );
+        for pointer in ["/from/id", "/id", "/conversation/id", "/channelId"] {
+            let mut invalid = activity.clone();
+            *invalid.pointer_mut(pointer).expect("field") = Value::Null;
+            assert!(
+                super::verified_teams_message("app-one", &invalid).is_err(),
+                "{pointer}"
+            );
+        }
+        assert!(
+            super::verified_teams_message("app-one", &json!({"type":"conversationUpdate"}))
+                .expect("non-message event")
+                .is_none()
+        );
+        let mut membership = activity;
+        membership["type"] = json!("conversationUpdate");
+        membership["membersAdded"] = json!([{"id":"member-one"}, {"id":"member-two"}]);
+        let member_event = super::verified_teams_message("app-one", &membership)
+            .expect("verified member event")
+            .expect("durable source activity");
+        assert_eq!(member_event.account_id, first.account_id);
+        assert_eq!(member_event.sender_id, first.sender_id);
+        assert_eq!(
+            serde_json::from_str::<Value>(member_event.text.as_deref().expect("event data"))
+                .expect("JSON")["membersAdded"]
+                .as_array()
+                .expect("members")
+                .len(),
+            2
+        );
+        membership["from"]["id"] = Value::Null;
+        assert!(super::verified_teams_message("app-one", &membership).is_err());
     }
 
     #[test]
@@ -1861,6 +2807,596 @@ mod tests {
         });
         assert!(cancel.is_cancelled());
         assert!(slot.lock().expect("request slot").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_whatsapp_webhook_retains_confirmed_prefix_and_never_resends_after_restart() {
+        use crate::adapters::agent_runtime::AgentRuntime;
+        use crate::adapters::http_api::{
+            DependencyReadiness, EmptyModelTools, OperatorRuntimeStatus, ProviderHistoryConfig,
+            SmokeProvider, SwappableProvider,
+        };
+        use crate::adapters::signed_plugins::PluginToolSurface;
+        use claw_channel_sdk::{ChannelError, InboundMessage, TransportErrorKind};
+        use serde_json::json;
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::AtomicU64;
+
+        const MESSAGE_AT_MS: u64 = 2_000;
+        const REPLY_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
+
+        struct OwnedRoot(std::path::PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        struct CallbackClock(Arc<AtomicU64>);
+        impl claw_channels::UnixClock for CallbackClock {
+            fn now_unix_ms(&self) -> u64 {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        struct CloudReplies {
+            calls: Arc<AtomicUsize>,
+            mode: &'static str,
+            runtime: Arc<AgentRuntime>,
+            clock: Arc<AtomicU64>,
+        }
+        impl WhatsAppTransport for CloudReplies {
+            fn send_text(
+                &mut self,
+                request: &WhatsAppSendRequest<'_>,
+            ) -> Result<ProviderResponse, WhatsAppSendError> {
+                assert_eq!(request.phone_number_id(), "phone-id");
+                assert_eq!(request.to(), "15550001");
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if self.mode == "partial" && call == 2 {
+                    return Err(WhatsAppSendError::AmbiguousAfterSend(
+                        ChannelError::Transport(TransportErrorKind::Io),
+                    ));
+                }
+                if self.mode == "not-sent" {
+                    return Err(WhatsAppSendError::CancelledBeforeSend);
+                }
+                if self.mode == "empty" {
+                    return Ok(ProviderResponse::new(200, Vec::new()));
+                }
+                if self.mode == "closed-storage" && call == 1 {
+                    tokio::runtime::Handle::current()
+                        .block_on(self.runtime.shutdown())
+                        .expect("owned storage closed before receipt");
+                }
+                if self.mode == "expires-after-first" && call == 1 {
+                    self.clock
+                        .store(MESSAGE_AT_MS + REPLY_WINDOW_MS, Ordering::SeqCst);
+                }
+                Ok(ProviderResponse::new(
+                    200,
+                    json!({"messages":[{"id":format!("wamid.fixture-{call}")}]}).to_string(),
+                ))
+            }
+        }
+
+        let reply = "private-cloud-reply ".repeat(520);
+        let segments: Vec<String> = claw_channels::segment_outbound_text_iter("whatsapp", &reply)
+            .expect("segments")
+            .map(|segment| segment.expect("valid segment").into_owned())
+            .collect();
+        assert!(segments.len() >= 3);
+        for mode in [
+            "delivered",
+            "partial",
+            "empty",
+            "not-sent",
+            "closed-storage",
+            "expires-after-first",
+        ] {
+            let root = OwnedRoot(std::env::temp_dir().join(format!(
+                    "claw-native-whatsapp-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock")
+                        .as_nanos()
+                )));
+            std::fs::create_dir(&root.0).expect("owned state");
+            let diagnostics = Arc::new(Diagnostics::new(32));
+            let provider = Arc::new(SwappableProvider::new(
+                "gpt-4o",
+                "Cloud fixture",
+                ProviderHistoryConfig::default(),
+                Arc::new(EmptyModelTools),
+                Arc::new(DependencyReadiness::new(["provider"])),
+            ));
+            provider
+                .activate(Arc::new(SmokeProvider::new().expect("local provider")))
+                .await
+                .expect("activated");
+            let plugins = PluginToolSurface::new(Arc::clone(&diagnostics));
+            let runtime = AgentRuntime::new(
+                Arc::clone(&provider),
+                Arc::clone(&plugins),
+                &root.0,
+                "gpt-4o".to_owned(),
+                0,
+                8,
+                Duration::from_secs(60),
+                Arc::clone(&diagnostics),
+            )
+            .expect("actual runtime");
+            let message = InboundMessage {
+                id: "one".to_owned(),
+                channel_id: "whatsapp".to_owned(),
+                account_id: "phone-id".to_owned(),
+                conversation_id: "whatsapp:15550001".to_owned(),
+                sender_id: "15550001".to_owned(),
+                text: Some("question".to_owned()),
+                attachments: Vec::new(),
+                received_at_unix_ms: MESSAGE_AT_MS,
+            };
+            let retained_reply = reply.clone();
+            let run = runtime
+                .run_channel_message(&message, async move { Ok(Some(retained_reply)) })
+                .await
+                .expect("retained model result");
+            let origin =
+                official_origin("whatsapp", "phone-id", "graph.facebook.com").expect("origin");
+            let credential = ChannelCredential::bind(
+                "access-token",
+                CredentialRequest {
+                    channel_id: "whatsapp".to_owned(),
+                    account_id: "phone-id".to_owned(),
+                    kind: CredentialKind::Token,
+                    binding: CredentialBinding::Origin(origin.clone()),
+                },
+            )
+            .expect("credential");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let clock = Arc::new(AtomicU64::new(MESSAGE_AT_MS + 1));
+            let timestamp = (MESSAGE_AT_MS / 1_000).to_string();
+            let payload = json!({"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"messages":[{"from":"15550001","id":"one","type":"text","timestamp":timestamp,"text":{"body":"question"}}]}}]}]}).to_string().into_bytes();
+            let make_channel = |runtime: &Arc<AgentRuntime>| {
+                let mut channel = WhatsAppChannel::new(
+                    "phone-id",
+                    "phone-id",
+                    origin.clone(),
+                    CloudReplies {
+                        calls: Arc::clone(&calls),
+                        mode,
+                        runtime: Arc::clone(runtime),
+                        clock: Arc::clone(&clock),
+                    },
+                    CallbackClock(Arc::clone(&clock)),
+                    NonZeroUsize::new(2).expect("queue"),
+                )
+                .expect("channel");
+                channel.start(&mut ()).expect("started");
+                Arc::new(AsyncMutex::new(channel))
+            };
+            let channel = make_channel(&runtime);
+            let request_cancel = Arc::new(Mutex::new(None));
+            for (invalid_timestamp, current_time) in [
+                (json!(null), MESSAGE_AT_MS + 1),
+                (json!("0"), MESSAGE_AT_MS + 1),
+                (json!("18446744073709551615"), MESSAGE_AT_MS + 1),
+                (json!("3"), MESSAGE_AT_MS + 1),
+                (json!("2"), MESSAGE_AT_MS + REPLY_WINDOW_MS),
+            ] {
+                clock.store(current_time, Ordering::SeqCst);
+                let mut invalid_payload: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("fixture payload");
+                invalid_payload["entry"][0]["changes"][0]["value"]["messages"][0]["timestamp"] =
+                    invalid_timestamp;
+                invalid_payload["entry"][0]["changes"][0]["value"]["messages"][0]["id"] =
+                    json!("window-must-not-execute");
+                assert!(
+                    super::handle_whatsapp_webhook_with_runtime(
+                        Arc::clone(&channel),
+                        credential.clone(),
+                        Arc::clone(&request_cancel),
+                        Arc::clone(&diagnostics),
+                        invalid_payload.to_string().into_bytes(),
+                        Arc::clone(&runtime) as Arc<dyn LegacyChannelMessagePort>,
+                        64 * 1024,
+                        CancellationToken::new(),
+                        Some(Arc::clone(&runtime))
+                    )
+                    .await
+                    .is_err()
+                );
+                assert!(
+                    claw_channel_sdk::Channel::poll_inbound(&mut *channel.lock().await)
+                        .expect("queue")
+                        .is_none()
+                );
+            }
+            assert_eq!(
+                runtime.operator_status()["sessions"]["managed"],
+                0,
+                "invalid/expired timestamps cannot create model sessions"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            clock.store(MESSAGE_AT_MS + 1, Ordering::SeqCst);
+            let mut changed_time: serde_json::Value =
+                serde_json::from_slice(&payload).expect("fixture payload");
+            changed_time["entry"][0]["changes"][0]["value"]["messages"][0]["timestamp"] =
+                json!("1");
+            assert!(
+                super::handle_whatsapp_webhook_with_runtime(
+                    Arc::clone(&channel),
+                    credential.clone(),
+                    Arc::clone(&request_cancel),
+                    Arc::clone(&diagnostics),
+                    changed_time.to_string().into_bytes(),
+                    Arc::clone(&runtime) as Arc<dyn LegacyChannelMessagePort>,
+                    64 * 1024,
+                    CancellationToken::new(),
+                    Some(Arc::clone(&runtime))
+                )
+                .await
+                .is_err(),
+                "same ID cannot replace its stored provider timestamp"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(runtime.operator_status()["sessions"]["managed"], 0);
+            let result = super::handle_whatsapp_webhook_with_runtime(
+                Arc::clone(&channel),
+                credential.clone(),
+                Arc::clone(&request_cancel),
+                Arc::clone(&diagnostics),
+                payload.clone(),
+                Arc::clone(&runtime) as Arc<dyn LegacyChannelMessagePort>,
+                64 * 1024,
+                CancellationToken::new(),
+                Some(Arc::clone(&runtime)),
+            )
+            .await;
+            assert_eq!(result.is_ok(), mode == "delivered", "{mode}");
+            assert!(request_cancel.lock().expect("slot").is_none());
+            let expected_sends = match mode {
+                "delivered" => segments.len(),
+                "partial" => 2,
+                _ => 1,
+            };
+            assert_eq!(calls.load(Ordering::SeqCst), expected_sends, "{mode}");
+            if mode != "closed-storage" {
+                let pending = json!({"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"messages":[{"id":"pending-callback-probe","from":"15550001","type":"text","text":{"body":"pending input must not run"}}]}}]}]});
+                assert_eq!(
+                    channel
+                        .lock()
+                        .await
+                        .ingest_webhook(pending.to_string().as_bytes(), &mut ())
+                        .expect("pre-existing input")
+                        .queued,
+                    1
+                );
+                for (label, timestamp) in [
+                    ("read", "30"),
+                    ("sent", "10"),
+                    ("delivered", "20"),
+                    ("failed", "40"),
+                    ("sent", "5"),
+                ] {
+                    let callback = json!({"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"statuses":[{"id":"wamid.fixture-1","recipient_id":"15550001","status":label,"timestamp":timestamp,"errors":[{"code":131_000,"message":"private-cloud-error"}]}]}}]}]});
+                    super::handle_whatsapp_webhook_with_runtime(
+                        Arc::clone(&channel),
+                        credential.clone(),
+                        Arc::clone(&request_cancel),
+                        Arc::clone(&diagnostics),
+                        callback.to_string().into_bytes(),
+                        Arc::clone(&runtime) as Arc<dyn LegacyChannelMessagePort>,
+                        64 * 1024,
+                        CancellationToken::new(),
+                        Some(Arc::clone(&runtime)),
+                    )
+                    .await
+                    .expect("bounded signed-host status path");
+                }
+                let mut foreign = json!({"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"statuses":[{"id":"wamid.fixture-1","recipient_id":"15550002","status":"read","timestamp":"99"}]}}]}]});
+                super::handle_whatsapp_webhook_with_runtime(
+                    Arc::clone(&channel),
+                    credential.clone(),
+                    Arc::clone(&request_cancel),
+                    Arc::clone(&diagnostics),
+                    foreign.to_string().into_bytes(),
+                    Arc::clone(&runtime) as Arc<dyn LegacyChannelMessagePort>,
+                    64 * 1024,
+                    CancellationToken::new(),
+                    Some(Arc::clone(&runtime)),
+                )
+                .await
+                .expect("unmatched recipient is ignored");
+                foreign["entry"][0]["changes"][0]["value"]["metadata"]["phone_number_id"] =
+                    json!("other-phone");
+                assert!(
+                    super::handle_whatsapp_webhook_with_runtime(
+                        Arc::clone(&channel),
+                        credential.clone(),
+                        Arc::clone(&request_cancel),
+                        Arc::clone(&diagnostics),
+                        foreign.to_string().into_bytes(),
+                        Arc::clone(&runtime) as Arc<dyn LegacyChannelMessagePort>,
+                        64 * 1024,
+                        CancellationToken::new(),
+                        Some(Arc::clone(&runtime))
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    expected_sends,
+                    "callbacks cannot send messages"
+                );
+                assert_eq!(
+                    runtime.operator_status()["sessions"]["managed"],
+                    0,
+                    "callbacks cannot create model sessions"
+                );
+                assert_eq!(
+                    claw_channel_sdk::Channel::poll_inbound(&mut *channel.lock().await)
+                        .expect("queue available")
+                        .expect("callbacks retain pending input")
+                        .id,
+                    "pending-callback-probe"
+                );
+                runtime.shutdown().await.expect("runtime drained");
+            }
+            drop(channel);
+            drop(runtime);
+            let reopened = AgentRuntime::new(
+                provider,
+                plugins,
+                &root.0,
+                "gpt-4o".to_owned(),
+                0,
+                8,
+                Duration::from_secs(60),
+                Arc::clone(&diagnostics),
+            )
+            .expect("reopened actual runtime");
+            for changed_time in [0, MESSAGE_AT_MS + 1_000] {
+                let mut changed = message.clone();
+                changed.received_at_unix_ms = changed_time;
+                assert!(
+                    reopened
+                        .process_channel_input(changed.clone(), CancellationToken::new())
+                        .await
+                        .is_err(),
+                    "restart must preserve the original timestamp binding"
+                );
+                assert!(
+                    reopened
+                        .claim_channel_delivery(&changed, &reply)
+                        .await
+                        .is_err(),
+                    "changed or missing time cannot acquire a delivery claim"
+                );
+            }
+            assert_eq!(reopened.operator_status()["sessions"]["managed"], 0);
+            let query = json!({"nativeRecovery":{"channelId":"whatsapp","accountId":"phone-id","conversationId":"whatsapp:15550001","senderId":"15550001","runId":run.id()}});
+            let status = reopened
+                .dispatch("channels.status", Some(&query), CancellationToken::new())
+                .await
+                .expect("recovery query")
+                .expect("status");
+            assert_eq!(
+                status["delivery"],
+                if mode == "delivered" {
+                    "delivered"
+                } else {
+                    "outcome_unknown"
+                }
+            );
+            let receipts = status["deliveryReceipts"]
+                .as_array()
+                .expect("Cloud receipts");
+            let statuses = status["deliveryStatuses"]
+                .as_array()
+                .expect("provider status facts");
+            assert_eq!(
+                statuses.len(),
+                usize::from(matches!(
+                    mode,
+                    "delivered" | "partial" | "expires-after-first"
+                ))
+            );
+            if let Some(status) = statuses.first() {
+                assert_eq!(status["reportedState"], "read");
+                assert_eq!(status["conflictingReports"], true);
+                assert_eq!(status["facts"]["sentAtMs"], 10_000);
+                assert_eq!(status["facts"]["readAtMs"], 30_000);
+                assert_eq!(status["facts"]["failureCode"], 131_000);
+            }
+            assert!(!status.to_string().contains("private-cloud-error"));
+            assert_eq!(
+                receipts.len(),
+                match mode {
+                    "delivered" => segments.len(),
+                    "partial" | "expires-after-first" => 1,
+                    _ => 0,
+                }
+            );
+            for (index, receipt) in receipts.iter().enumerate() {
+                use std::fmt::Write as _;
+                let mut digest = String::with_capacity(64);
+                for byte in &Sha256::digest(segments[index].as_bytes()) {
+                    write!(digest, "{byte:02x}").expect("hex");
+                }
+                assert_eq!(
+                    receipt["remoteMessageId"],
+                    format!("wamid.fixture-{}", index + 1)
+                );
+                assert_eq!(receipt["contentSha256"], digest);
+                assert_eq!(receipt["contentBytes"], segments[index].len());
+            }
+            assert!(!status.to_string().contains("private-cloud-reply"));
+            let channel = make_channel(&reopened);
+            let retry = super::handle_whatsapp_webhook_with_runtime(
+                Arc::clone(&channel),
+                credential,
+                request_cancel,
+                diagnostics,
+                payload,
+                Arc::clone(&reopened) as Arc<dyn LegacyChannelMessagePort>,
+                64 * 1024,
+                CancellationToken::new(),
+                Some(Arc::clone(&reopened)),
+            )
+            .await;
+            assert_eq!(retry.is_ok(), mode == "delivered");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                expected_sends,
+                "new adapter after restart cannot repeat the delivery"
+            );
+            drop(channel);
+            reopened.shutdown().await.expect("reopened drain");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_whatsapp_dropped_request_stops_before_later_queued_input() {
+        use crate::adapters::agent_runtime::AgentRuntime;
+        use crate::adapters::http_api::{
+            DependencyReadiness, EmptyModelTools, OperatorRuntimeStatus, ProviderHistoryConfig,
+            SmokeProvider, SwappableProvider,
+        };
+        use crate::adapters::signed_plugins::PluginToolSurface;
+        use claw_channel_sdk::InboundMessage;
+        use serde_json::json;
+        struct Root(std::path::PathBuf);
+        impl Drop for Root {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Root(std::env::temp_dir().join(format!(
+                "claw-whatsapp-native-drop-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            )));
+        std::fs::create_dir(&root.0).expect("owned state");
+        let diagnostics = Arc::new(Diagnostics::new(32));
+        let provider = Arc::new(SwappableProvider::new(
+            "gpt-4o",
+            "drop fixture",
+            ProviderHistoryConfig::default(),
+            Arc::new(EmptyModelTools),
+            Arc::new(DependencyReadiness::new(["provider"])),
+        ));
+        provider
+            .activate(Arc::new(SmokeProvider::new().expect("local provider")))
+            .await
+            .expect("activated");
+        let runtime = AgentRuntime::new(
+            provider,
+            PluginToolSurface::new(Arc::clone(&diagnostics)),
+            &root.0,
+            "gpt-4o".to_owned(),
+            0,
+            8,
+            Duration::from_secs(60),
+            Arc::clone(&diagnostics),
+        )
+        .expect("runtime");
+        let message = InboundMessage {
+            id: "one".to_owned(),
+            channel_id: "whatsapp".to_owned(),
+            account_id: "phone-id".to_owned(),
+            conversation_id: "whatsapp:15550001".to_owned(),
+            sender_id: "15550001".to_owned(),
+            text: Some("question".to_owned()),
+            attachments: Vec::new(),
+            received_at_unix_ms: (claw_channels::UnixClock::now_unix_ms(&SystemClock) / 1_000)
+                * 1_000,
+        };
+        let run = runtime
+            .run_channel_message(&message, async { Ok(Some("reply".to_owned())) })
+            .await
+            .expect("retained first answer");
+        let request_cancel = Arc::new(Mutex::new(None));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let origin = official_origin("whatsapp", "phone-id", "graph.facebook.com").expect("origin");
+        let credential = ChannelCredential::bind(
+            "access-token",
+            CredentialRequest {
+                channel_id: "whatsapp".to_owned(),
+                account_id: "phone-id".to_owned(),
+                kind: CredentialKind::Token,
+                binding: CredentialBinding::Origin(origin.clone()),
+            },
+        )
+        .expect("credential");
+        let mut channel = WhatsAppChannel::new(
+            "phone-id",
+            "phone-id",
+            origin,
+            PausedWhatsAppTransport {
+                request_cancel: Arc::clone(&request_cancel),
+                entered: Mutex::new(Some(entered_tx)),
+                release: Arc::clone(&release),
+                sends: Arc::clone(&sends),
+            },
+            SystemClock,
+            NonZeroUsize::new(2).expect("queue"),
+        )
+        .expect("channel");
+        channel.start(&mut ()).expect("started");
+        let channel = Arc::new(AsyncMutex::new(channel));
+        let timestamp = (message.received_at_unix_ms / 1_000).to_string();
+        let payload = json!({"entry":[{"changes":[{"value":{"metadata":{"phone_number_id":"phone-id"},"messages":[{"from":"15550001","id":"one","type":"text","timestamp":timestamp,"text":{"body":"question"}},{"from":"15550002","id":"two","type":"text","timestamp":timestamp,"text":{"body":"must not execute after drop"}}]}}]}]}).to_string().into_bytes();
+        let parent = CancellationToken::new();
+        let mut request = Box::pin(super::handle_whatsapp_webhook_with_runtime(
+            Arc::clone(&channel),
+            credential,
+            Arc::clone(&request_cancel),
+            diagnostics,
+            payload,
+            Arc::clone(&runtime) as Arc<dyn LegacyChannelMessagePort>,
+            1024,
+            parent.clone(),
+            Some(Arc::clone(&runtime)),
+        ));
+        tokio::select! {
+            result = &mut request => panic!("request finished before send gate: {result:?}"),
+            entered = entered_rx => entered.expect("pre-send gate"),
+        }
+        drop(request);
+        assert!(
+            !parent.is_cancelled(),
+            "request drop may revoke only its own child scope"
+        );
+        let (released, wake) = release.as_ref();
+        *released.lock().expect("release") = true;
+        wake.notify_all();
+        let owned_channel = tokio::time::timeout(Duration::from_secs(2), channel.lock())
+            .await
+            .expect("native worker releases channel");
+        assert!(request_cancel.lock().expect("slot").is_none());
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            runtime.operator_status()["sessions"]["managed"],
+            0,
+            "later queued message must not create a model session"
+        );
+        let query = json!({"nativeRecovery":{"channelId":"whatsapp","accountId":"phone-id","conversationId":"whatsapp:15550001","senderId":"15550001","runId":run.id()}});
+        let result = runtime
+            .dispatch("channels.status", Some(&query), CancellationToken::new())
+            .await
+            .expect("retained delivery")
+            .expect("query");
+        assert_eq!(result["delivery"], "outcome_unknown");
+        assert_eq!(result["deliveryReceipts"], json!([]));
+        drop(owned_channel);
+        drop(channel);
+        runtime.shutdown().await.expect("owned runtime drained");
     }
 
     #[tokio::test]

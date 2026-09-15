@@ -121,6 +121,7 @@ pub(crate) fn atomic_write_bytes(
     let (mut temporary, mut file) = TemporaryArtifact::create(&destination, "tmp")?;
 
     let operation = (|| {
+        #[cfg(unix)]
         set_permissions(existing.as_ref(), &file)?;
         file.write_all(contents)?;
         file.flush()?;
@@ -134,6 +135,7 @@ pub(crate) fn atomic_write_bytes(
             warnings.push(warning);
         }
         temporary.disarm();
+        #[cfg(unix)]
         if let Err(error) = sync_parent(&destination) {
             warnings.push(WriteWarning::DirectorySyncFailed {
                 path: destination
@@ -338,11 +340,6 @@ fn set_permissions(existing: Option<&fs::Metadata>, file: &File) -> io::Result<(
     file.set_permissions(fs::Permissions::from_mode(mode))
 }
 
-#[cfg(not(unix))]
-fn set_permissions(_existing: Option<&fs::Metadata>, _file: &File) -> io::Result<()> {
-    Ok(())
-}
-
 #[cfg(unix)]
 fn replace_destination(
     temporary: &Path,
@@ -384,11 +381,6 @@ fn sync_parent(destination: &Path) -> io::Result<()> {
             .expect("prepared destination always has a parent"),
     )?
     .sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_parent(_destination: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(windows)]

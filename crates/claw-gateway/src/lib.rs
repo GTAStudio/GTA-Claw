@@ -50,7 +50,7 @@ pub mod store;
 pub mod transport;
 
 pub use auth::{CredentialPolicy, Grant, StaticAuthenticator, issue_challenge};
-pub use authority::{AuthorizationSource, DeviceDirectory};
+pub use authority::{AuthorizationLease, AuthorizationSource, DeviceDirectory};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{Exposure, GatewayServerConfig, ServerLimits, ServerTimeouts, ValidatedConfig};
 pub use connection::ConnectionServices;

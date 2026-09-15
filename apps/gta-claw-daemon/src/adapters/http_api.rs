@@ -497,12 +497,18 @@ impl ProviderPort for ProviderAdapter {
                 .complete(prepared.request, cancellation)
                 .await
                 .map_err(|error| map_provider_error(&error))?;
-            self.remember(
-                &prepared.session_id,
-                prepared.user,
-                response.message.clone(),
-            );
-            Ok(output_from(response))
+            let finish_reason = generation_finish_reason(
+                &response.finish_reason,
+                !response.message.tool_calls.is_empty(),
+            )?;
+            if finish_reason.is_complete() {
+                self.remember(
+                    &prepared.session_id,
+                    prepared.user,
+                    response.message.clone(),
+                );
+            }
+            Ok(output_from(response, finish_reason))
         })
     }
 
@@ -511,7 +517,7 @@ impl ProviderPort for ProviderAdapter {
         request: GenerationRequest,
         events: mpsc::Sender<GenerationEvent>,
         cancellation: CancellationToken,
-    ) -> PortFuture<'_, Result<HttpUsage, PortError>> {
+    ) -> PortFuture<'_, Result<claw_http_api::GenerationSummary, PortError>> {
         Box::pin(async move {
             let prepared = self.to_completion(request)?;
             let cancel = CancelToken::new();
@@ -547,14 +553,9 @@ impl ProviderPort for ProviderAdapter {
                 accumulator.accept(&event);
                 let outgoing = match event {
                     StreamEvent::TextDelta(text) => Some(GenerationEvent::Text(text)),
-                    StreamEvent::ToolCallCompleted { call, .. } => {
-                        Some(GenerationEvent::ToolCall(claw_http_api::ToolCall {
-                            id: call.id,
-                            name: call.name,
-                            arguments: call.arguments.as_str().to_owned(),
-                        }))
-                    }
-                    StreamEvent::UsageUpdate(_)
+                    StreamEvent::ToolCallCompleted { .. }
+                    | StreamEvent::UsageUpdate(_)
+                    | StreamEvent::UsageReported { .. }
                     | StreamEvent::Completed { .. }
                     | StreamEvent::Started { .. }
                     | StreamEvent::ReasoningDelta(_)
@@ -598,8 +599,38 @@ impl ProviderPort for ProviderAdapter {
                     "provider stream ended before completion",
                 ));
             }
-            self.remember(&prepared.session_id, prepared.user, accumulator.message());
-            Ok(http_usage(accumulator.usage()))
+            let message = accumulator.message();
+            let finish_reason = generation_finish_reason(
+                accumulator.finish_reason().expect("completion was checked"),
+                !message.tool_calls.is_empty(),
+            )?;
+            for call in &message.tool_calls {
+                let outgoing = GenerationEvent::ToolCall(claw_http_api::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.as_str().to_owned(),
+                });
+                tokio::select! {
+                    result = events.send(outgoing) => {
+                        if result.is_err() {
+                            cancel.cancel();
+                            return Err(PortError::new(PortErrorKind::Unavailable, "stream consumer disconnected"));
+                        }
+                    }
+                    () = cancellation.cancelled() => {
+                        cancel.cancel();
+                        return Err(PortError::new(PortErrorKind::Unavailable, "request cancelled"));
+                    }
+                }
+            }
+            if finish_reason.is_complete() {
+                self.remember(&prepared.session_id, prepared.user, message);
+            }
+            Ok(claw_http_api::GenerationSummary {
+                usage: http_usage(accumulator.usage()),
+                usage_reporting: usage_reporting(accumulator.usage_reporting()),
+                finish_reason,
+            })
         })
     }
 
@@ -656,6 +687,7 @@ pub struct SwappableProvider {
 struct SwappableState {
     current: Option<Arc<ProviderAdapter>>,
     default_model: String,
+    default_model_locked: bool,
     role_prompt: String,
     generation: u64,
 }
@@ -691,6 +723,7 @@ impl SwappableProvider {
             state: RwLock::new(SwappableState {
                 current: None,
                 default_model: default_model.into(),
+                default_model_locked: false,
                 role_prompt: role_prompt.into(),
                 generation: 0,
             }),
@@ -842,12 +875,28 @@ impl SwappableProvider {
             .state
             .write()
             .map_err(|_| "provider slot is unavailable".to_owned())?;
+        if state.default_model_locked && state.default_model != model {
+            return Err("default model is pinned by explicit native provider policy; change the trusted startup policy and restart".to_owned());
+        }
         if let Some(provider) = state.current.as_ref() {
             provider.set_default_model(model)?;
         }
         model.clone_into(&mut state.default_model);
         state.generation = state.generation.saturating_add(1);
         drop(state);
+        Ok(())
+    }
+
+    /// Pins the current model against role, administrative and file-based reloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider slot lock is poisoned.
+    pub fn pin_default_model(&self) -> Result<(), String> {
+        self.state
+            .write()
+            .map_err(|_| "provider slot is unavailable".to_owned())?
+            .default_model_locked = true;
         Ok(())
     }
 
@@ -888,6 +937,32 @@ impl SwappableProvider {
     /// provider's typed cache error.
     pub fn model_ids(&self) -> Result<Vec<String>, PortError> {
         self.active()?.model_ids()
+    }
+
+    pub(super) async fn generate_context(
+        &self,
+        request: GenerationRequest,
+        context: Vec<ChatMessage>,
+        cancellation: CancellationToken,
+    ) -> Result<
+        (
+            GenerationOutput,
+            claw_application::ports::provider::ProviderResponseReport,
+        ),
+        PortError,
+    > {
+        let provider = self.active()?;
+        let prepared = provider.to_completion_with_context(request, Some(context))?;
+        let response = provider
+            .complete(prepared.request, cancellation)
+            .await
+            .map_err(|error| map_provider_error(&error))?;
+        let finish_reason = generation_finish_reason(
+            &response.finish_reason,
+            !response.message.tool_calls.is_empty(),
+        )?;
+        let report = provider_response_report(&provider.provider_name, &response, finish_reason)?;
+        Ok((output_from(response, finish_reason), report))
     }
 
     fn active(&self) -> Result<Arc<ProviderAdapter>, PortError> {
@@ -935,7 +1010,7 @@ impl ProviderPort for SwappableProvider {
         request: GenerationRequest,
         events: mpsc::Sender<GenerationEvent>,
         cancellation: CancellationToken,
-    ) -> PortFuture<'_, Result<HttpUsage, PortError>> {
+    ) -> PortFuture<'_, Result<claw_http_api::GenerationSummary, PortError>> {
         let provider = self.active();
         Box::pin(async move { provider?.stream(request, events, cancellation).await })
     }
@@ -952,6 +1027,14 @@ impl ProviderPort for SwappableProvider {
 
 impl ProviderAdapter {
     fn to_completion(&self, request: GenerationRequest) -> Result<PreparedCompletion, PortError> {
+        self.to_completion_with_context(request, None)
+    }
+
+    fn to_completion_with_context(
+        &self,
+        request: GenerationRequest,
+        history_override: Option<Vec<ChatMessage>>,
+    ) -> Result<PreparedCompletion, PortError> {
         if request.frequency_penalty.is_some_and(|value| value != 0.0)
             || request.presence_penalty.is_some_and(|value| value != 0.0)
         {
@@ -986,7 +1069,9 @@ impl ProviderAdapter {
         if let Some(instructions) = request.instructions {
             messages.push(ChatMessage::System(instructions));
         }
-        messages.extend(self.history(&session_id));
+        if history_override.is_none() {
+            messages.extend(self.history(&session_id));
+        }
         let mut content = vec![ContentPart::text(request.prompt)];
         for media in request.media {
             if media.kind != claw_http_api::InputMediaKind::Image {
@@ -1022,7 +1107,11 @@ impl ProviderAdapter {
             }));
         }
         let user = ChatMessage::User(content);
-        messages.push(user.clone());
+        if let Some(history) = history_override {
+            messages.extend(history);
+        } else {
+            messages.push(user.clone());
+        }
 
         let mut completion = CompletionRequest::new(
             ModelId::new(model).map_err(|error| invalid_request(error.to_string()))?,
@@ -1122,8 +1211,93 @@ fn scaled_thousand(
         .transpose()
 }
 
-fn output_from(response: CompletionResponse) -> GenerationOutput {
+fn generation_finish_reason(
+    reason: &FinishReason,
+    has_tools: bool,
+) -> Result<claw_http_api::GenerationFinishReason, PortError> {
+    use claw_http_api::GenerationFinishReason;
+
+    match reason {
+        FinishReason::Stop | FinishReason::ToolCalls if has_tools => {
+            Ok(GenerationFinishReason::ToolCalls)
+        }
+        FinishReason::Stop => Ok(GenerationFinishReason::Stop),
+        FinishReason::Length if !has_tools => Ok(GenerationFinishReason::Length),
+        FinishReason::ContentFilter if !has_tools => Ok(GenerationFinishReason::ContentFilter),
+        FinishReason::Length => Err(PortError::new(
+            PortErrorKind::Unavailable,
+            "provider output was truncated before completion",
+        )),
+        FinishReason::ContentFilter => Err(PortError::new(
+            PortErrorKind::Unavailable,
+            "provider output was stopped by a content filter",
+        )),
+        FinishReason::Cancelled => Err(PortError::new(
+            PortErrorKind::Unavailable,
+            "provider generation was cancelled",
+        )),
+        FinishReason::Other(_) | FinishReason::ToolCalls => Err(PortError::new(
+            PortErrorKind::Unavailable,
+            "provider generation did not reach a supported complete state",
+        )),
+    }
+}
+
+const fn usage_reporting(
+    reporting: claw_provider_sdk::model::UsageReporting,
+) -> claw_http_api::UsageReporting {
+    match reporting {
+        claw_provider_sdk::model::UsageReporting::Unreported => {
+            claw_http_api::UsageReporting::Unreported
+        }
+        claw_provider_sdk::model::UsageReporting::Partial => claw_http_api::UsageReporting::Partial,
+        claw_provider_sdk::model::UsageReporting::Complete => {
+            claw_http_api::UsageReporting::Complete
+        }
+    }
+}
+
+fn provider_response_report(
+    provider: &str,
+    response: &CompletionResponse,
+    finish: claw_http_api::GenerationFinishReason,
+) -> Result<claw_application::ports::provider::ProviderResponseReport, PortError> {
+    use claw_application::ports::provider::{ProviderResponseFinish, ProviderResponseReport};
+
+    let report = ProviderResponseReport {
+        provider: provider.to_owned(),
+        model: response.model.as_str().to_owned(),
+        response_id: (!response.id.is_empty()).then(|| response.id.clone()),
+        usage_reporting: usage_reporting(response.usage_reporting),
+        input_tokens: response.usage.input_tokens,
+        output_tokens: response.usage.output_tokens,
+        cached_input_tokens: response.usage.cached_input_tokens,
+        reasoning_tokens: response.usage.reasoning_tokens,
+        finish_reason: match finish {
+            claw_http_api::GenerationFinishReason::Stop => ProviderResponseFinish::Stop,
+            claw_http_api::GenerationFinishReason::ToolCalls => ProviderResponseFinish::ToolCalls,
+            claw_http_api::GenerationFinishReason::Length => ProviderResponseFinish::Length,
+            claw_http_api::GenerationFinishReason::ContentFilter => {
+                ProviderResponseFinish::ContentFilter
+            }
+        },
+    };
+    report.validate().map_err(|_| {
+        PortError::new(
+            PortErrorKind::Internal,
+            "provider response accounting is invalid",
+        )
+    })?;
+    Ok(report)
+}
+
+fn output_from(
+    response: CompletionResponse,
+    finish_reason: claw_http_api::GenerationFinishReason,
+) -> GenerationOutput {
     GenerationOutput {
+        usage_reporting: usage_reporting(response.usage_reporting),
+        finish_reason,
         text: response.message.text(),
         tool_calls: response
             .message
@@ -1360,6 +1534,7 @@ pub(crate) fn updates_enabled(snapshot: &ConfigSnapshot) -> Result<bool, String>
 pub struct DurableSecurityAudit {
     file: Mutex<File>,
     readiness: Arc<DependencyReadiness>,
+    failed: std::sync::atomic::AtomicBool,
 }
 
 impl DurableSecurityAudit {
@@ -1369,36 +1544,172 @@ impl DurableSecurityAudit {
     ///
     /// Returns the operating-system error raised while opening the file.
     pub fn open(path: &Path, readiness: Arc<DependencyReadiness>) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(0x0020_0000).share_mode(3);
+        }
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::other("audit path is not a regular file"));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err(io::Error::other("audit path is a reparse point"));
+            }
+        }
         Ok(Self {
-            file: Mutex::new(OpenOptions::new().create(true).append(true).open(path)?),
+            file: Mutex::new(file),
             readiness,
+            failed: std::sync::atomic::AtomicBool::new(false),
         })
     }
-}
 
-impl AuditPort for DurableSecurityAudit {
-    fn persist(&self, event: &AuditEvent) -> Result<(), PortError> {
+    pub(super) fn persist_tool(
+        &self,
+        record: &claw_tools::ToolAuditRecord,
+        authority: &claw_application::ports::tool::InvocationAuthority,
+        invocation: &claw_application::ports::tool::ToolInvocation,
+    ) -> Result<(), PortError> {
+        self.persist_value(&json!({
+            "action": "native_tool", "source": format!("{:?}", authority.source()), "subject": authority.subject(),
+            "account": authority.account(), "permissionGeneration": authority.generation(),
+            "sessionId": invocation.session_id.as_str(), "turn": invocation.turn.ordinal(), "callId": invocation.call.call_id.as_str(),
+            "record": record,
+        }))
+    }
+
+    pub(super) fn persist_internal_tool(
+        &self,
+        invocation: &claw_application::ports::tool::ToolInvocation,
+        authority: &claw_application::ports::tool::InvocationAuthority,
+        binding: &claw_application::ports::tool::ToolBinding,
+        phase: claw_application::ports::tool::InternalToolAuditPhase,
+    ) -> Result<(), PortError> {
+        use claw_application::ports::tool::InternalToolAuditPhase;
+        let phase = match phase {
+            InternalToolAuditPhase::Authorized => "authorized",
+            InternalToolAuditPhase::Completed => "completed",
+            InternalToolAuditPhase::Failed => "failed",
+        };
+        self.persist_value(&json!({
+            "action": "internal_tool", "phase": phase, "tool": invocation.call.name,
+            "source": format!("{:?}", authority.source()), "subject": authority.subject(), "account": authority.account(),
+            "permissionGeneration": authority.generation(), "sessionId": invocation.session_id.as_str(),
+            "turn": invocation.turn.ordinal(), "callId": invocation.call.call_id.as_str(),
+            "toolPublication": binding.identity(), "toolRevision": binding.revision(), "resourceScope": binding.resource(),
+        }))
+    }
+
+    pub(super) fn persist_plugin_tool(
+        &self,
+        invocation: &claw_http_api::ToolInvocation,
+        phase: claw_application::ports::tool::InternalToolAuditPhase,
+    ) -> Result<(), PortError> {
+        use claw_application::ports::tool::InternalToolAuditPhase;
+        let authority = invocation.context.authority.as_ref().ok_or_else(|| {
+            PortError::new(
+                PortErrorKind::InvalidRequest,
+                "plugin audit requires verified authority",
+            )
+        })?;
+        let binding = invocation.context.binding.as_ref().ok_or_else(|| {
+            PortError::new(
+                PortErrorKind::InvalidRequest,
+                "plugin audit requires an approved binding",
+            )
+        })?;
+        let phase = match phase {
+            InternalToolAuditPhase::Authorized => "authorized",
+            InternalToolAuditPhase::Completed => "completed",
+            InternalToolAuditPhase::Failed => "failed",
+        };
+        self.persist_value(&json!({
+            "action": "plugin_tool", "phase": phase, "tool": invocation.name,
+            "source": format!("{:?}", authority.source()), "subject": authority.subject(), "account": authority.account(),
+            "permissionGeneration": authority.generation(), "sessionId": invocation.context.session_key,
+            "callId": invocation.context.idempotency_key, "toolPublication": binding.identity(), "toolRevision": binding.revision(),
+        }))
+    }
+
+    pub(super) fn persist_skill_tool(
+        &self,
+        invocation: &claw_application::ports::tool::ToolInvocation,
+        authority: &claw_application::ports::tool::InvocationAuthority,
+        binding: &claw_application::ports::tool::ToolBinding,
+        target: &str,
+        phase: claw_application::ports::tool::InternalToolAuditPhase,
+    ) -> Result<(), PortError> {
+        use claw_application::ports::tool::InternalToolAuditPhase;
+        let phase = match phase {
+            InternalToolAuditPhase::Authorized => "authorized",
+            InternalToolAuditPhase::Completed => "completed",
+            InternalToolAuditPhase::Failed => "failed",
+        };
+        self.persist_value(&json!({
+            "action":"skill_tool", "phase":phase, "skill":invocation.call.name, "target":target,
+            "source":format!("{:?}", authority.source()), "subject":authority.subject(), "account":authority.account(),
+            "permissionGeneration":authority.generation(), "sessionId":invocation.session_id.as_str(),
+            "callId":invocation.call.call_id.as_str(), "skillBinding":binding.identity(), "targetRevision":binding.revision(),
+        }))
+    }
+
+    fn persist_value(&self, value: &Value) -> Result<(), PortError> {
+        let mut file = self.file.lock().map_err(|_| {
+            self.failed
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.readiness.set("audit", false);
+            PortError::new(PortErrorKind::Internal, "audit writer lock failed")
+        })?;
         let result = (|| {
-            let encoded = serde_json::to_vec(&json!({
-                "action": audit_action(event.action),
-                "subject": audit_subject(&event.subject),
-                "outcome": audit_outcome(event.outcome),
-                "reason": audit_reason(event.reason),
-                "unixMillis": event.unix_millis,
-            }))
-            .map_err(|_| PortError::new(PortErrorKind::Internal, "audit encoding failed"))?;
-            let mut file = self
-                .file
-                .lock()
-                .map_err(|_| PortError::new(PortErrorKind::Internal, "audit writer lock failed"))?;
+            if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(PortError::new(
+                    PortErrorKind::Unavailable,
+                    "audit writer requires recovery",
+                ));
+            }
+            let encoded = serde_json::to_vec(value)
+                .map_err(|_| PortError::new(PortErrorKind::Internal, "audit encoding failed"))?;
+            if encoded.len() > 64 * 1024 {
+                return Err(PortError::new(
+                    PortErrorKind::Unavailable,
+                    "audit record exceeds its bound",
+                ));
+            }
             file.write_all(&encoded)
                 .and_then(|()| file.write_all(b"\n"))
                 .and_then(|()| file.flush())
                 .and_then(|()| file.sync_data())
                 .map_err(|_| PortError::new(PortErrorKind::Unavailable, "audit persistence failed"))
         })();
+        if result.is_err() {
+            self.failed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         self.readiness.set("audit", result.is_ok());
+        drop(file);
         result
+    }
+}
+
+impl AuditPort for DurableSecurityAudit {
+    fn persist(&self, event: &AuditEvent) -> Result<(), PortError> {
+        self.persist_value(&json!({
+            "action": audit_action(event.action), "subject": audit_subject(&event.subject),
+            "outcome": audit_outcome(event.outcome), "reason": audit_reason(event.reason), "unixMillis": event.unix_millis,
+        }))
     }
 }
 
@@ -1575,6 +1886,11 @@ impl OperatorAdmin {
     fn status(&self) -> Result<Value, PortError> {
         let readiness = self.readiness.snapshot()?;
         let (model, generation) = self.config.model_generation();
+        let runtime = self.inventory.runtime.status();
+        let active_skills = runtime
+            .pointer("/skills/active")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| u64::try_from(self.inventory.active_skill_count).unwrap_or(0));
         Ok(json!({
             "ready": readiness.ready,
             "failing": readiness.failing,
@@ -1585,13 +1901,13 @@ impl OperatorAdmin {
             "configGeneration": generation,
             "configuration": self.inventory.config_resolution,
             "plugins": self.inventory.plugin_activation,
-            "runtime": self.inventory.runtime.status(),
+            "runtime": runtime,
             "channels": self.inventory.channels,
             "skills": {
                 "registered": self.inventory.registered_skill_count,
-                "active": self.inventory.active_skill_count,
-                "state": if self.inventory.active_skill_count > 0 {
-                    "signed_plugins_active"
+                "active": active_skills,
+                "state": if active_skills > 0 {
+                    "native_skills_configured"
                 } else {
                     "requires_native_ports"
                 },
@@ -1617,7 +1933,25 @@ impl AdminPort for OperatorAdmin {
                 "models.authStatus" => {
                     json!({"ready": self.readiness.snapshot().map_err(admin_port_failure)?.ready})
                 }
-                "channels.status" => json!({"channels": self.inventory.channels}),
+                "channels.status" => {
+                    let recovery = if params
+                        .as_ref()
+                        .is_some_and(|params| params.get("nativeRecovery").is_some())
+                    {
+                        self.inventory
+                            .runtime
+                            .dispatch(&method, params.as_ref(), cancellation)
+                            .await
+                            .map_err(admin_port_failure)?
+                    } else {
+                        None
+                    };
+                    let mut status = json!({"channels": self.inventory.channels});
+                    if let Some(recovery) = recovery {
+                        status["nativeRecovery"] = recovery;
+                    }
+                    status
+                }
                 "update.status" => json!({
                     "configured": self.inventory.updates_enabled,
                     "state": if self.inventory.updates_enabled {
@@ -1772,6 +2106,13 @@ fn admin_port_failure(error: PortError) -> AdminFailure {
             retryable: Some(false),
             retry_after_ms: None,
         },
+        PortErrorKind::OutcomeUnknown => AdminFailure {
+            code: "OUTCOME_UNKNOWN".to_owned(),
+            message: error.message,
+            details: Some(json!({"recoveryRequired": true})),
+            retryable: Some(false),
+            retry_after_ms: None,
+        },
         PortErrorKind::Internal => AdminFailure {
             code: "INTERNAL".to_owned(),
             message: error.message,
@@ -1888,6 +2229,7 @@ impl Provider for SmokeProvider {
                     tool_calls: Vec::new(),
                 },
                 finish_reason: FinishReason::Stop,
+                usage_reporting: claw_provider_sdk::model::UsageReporting::Complete,
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 1,
@@ -1922,6 +2264,10 @@ impl Provider for SmokeProvider {
                         model,
                     }),
                     Ok(StreamEvent::TextDelta(answer)),
+                    Ok(StreamEvent::UsageReported {
+                        usage,
+                        reporting: claw_provider_sdk::model::UsageReporting::Complete,
+                    }),
                     Ok(StreamEvent::Completed {
                         finish_reason: FinishReason::Stop,
                         usage,
@@ -1975,6 +2321,362 @@ mod tests {
     use claw_config::{migrate_legacy_environment, to_json5};
     use claw_http_api::{PortError, PortErrorKind};
 
+    #[tokio::test]
+    async fn provider_response_report_keeps_actual_identity_and_usage_coverage() {
+        use super::Provider as _;
+
+        let provider = SmokeProvider::new().expect("owned provider");
+        let request = super::CompletionRequest::new(
+            super::ModelId::new("actual-model").expect("model"),
+            vec![super::ChatMessage::user_text("owned input")],
+        );
+        let mut response = provider
+            .complete(&request, &super::RequestContext::new())
+            .await
+            .expect("owned response");
+        let report = super::provider_response_report(
+            "actual-provider",
+            &response,
+            claw_http_api::GenerationFinishReason::Length,
+        )
+        .expect("response report");
+        assert_eq!(report.provider, "actual-provider");
+        assert_eq!(report.model, "actual-model");
+        assert_eq!(report.response_id.as_deref(), Some("smoke-response"));
+        assert_eq!(report.input_tokens, 1);
+        assert_eq!(
+            report.usage_reporting,
+            claw_http_api::UsageReporting::Complete
+        );
+        assert_eq!(
+            report.finish_reason,
+            claw_application::ports::provider::ProviderResponseFinish::Length
+        );
+        response.id.clear();
+        response.usage = super::Usage::default();
+        response.usage_reporting = claw_provider_sdk::model::UsageReporting::Unreported;
+        let unknown = super::provider_response_report(
+            "actual-provider",
+            &response,
+            claw_http_api::GenerationFinishReason::Stop,
+        )
+        .expect("unreported remains unknown");
+        assert!(unknown.response_id.is_none());
+        assert_eq!(
+            unknown.usage_reporting,
+            claw_http_api::UsageReporting::Unreported
+        );
+        response.usage_reporting = claw_provider_sdk::model::UsageReporting::Complete;
+        let zero = super::provider_response_report(
+            "actual-provider",
+            &response,
+            claw_http_api::GenerationFinishReason::Stop,
+        )
+        .expect("explicit zero remains known");
+        assert_ne!(unknown, zero);
+        assert_eq!(
+            zero.usage_reporting,
+            claw_http_api::UsageReporting::Complete
+        );
+    }
+
+    #[test]
+    fn provider_adapter_preserves_partial_status_and_rejects_unknown_or_partial_tools() {
+        use claw_provider_sdk::FinishReason;
+
+        for reason in [
+            FinishReason::Length,
+            FinishReason::ContentFilter,
+            FinishReason::Cancelled,
+            FinishReason::Other("private-provider-reason".to_owned()),
+        ] {
+            for has_tools in [false, true] {
+                if !has_tools
+                    && matches!(reason, FinishReason::Length | FinishReason::ContentFilter)
+                {
+                    assert!(
+                        !super::generation_finish_reason(&reason, has_tools)
+                            .expect("known partial result")
+                            .is_complete()
+                    );
+                    continue;
+                }
+                let error = super::generation_finish_reason(&reason, has_tools)
+                    .expect_err("not an ordinary complete answer");
+                assert!(!error.to_string().contains("private-provider-reason"));
+            }
+        }
+        assert!(super::generation_finish_reason(&FinishReason::Stop, false).is_ok());
+        assert!(super::generation_finish_reason(&FinishReason::Stop, true).is_ok());
+        assert!(super::generation_finish_reason(&FinishReason::ToolCalls, true).is_ok());
+        assert!(super::generation_finish_reason(&FinishReason::ToolCalls, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_adapter_holds_tools_until_complete_and_does_not_remember_failed_turns() {
+        use claw_http_api::ProviderPort as _;
+        use futures_util::StreamExt as _;
+        use tokio::sync::Notify;
+
+        struct TerminalProvider {
+            id: super::ProviderId,
+            reason: super::FinishReason,
+            has_tools: bool,
+            usage: super::Usage,
+            reporting: Option<claw_provider_sdk::model::UsageReporting>,
+            waiting: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        impl TerminalProvider {
+            fn message(&self) -> super::AssistantMessage {
+                super::AssistantMessage {
+                    content: vec![super::ContentPart::text("partial text")],
+                    tool_calls: if self.has_tools {
+                        vec![claw_provider_sdk::ToolCall {
+                            id: "owned-call".to_owned(),
+                            name: "lookup".to_owned(),
+                            arguments: claw_provider_sdk::ToolArguments::new("{}")
+                                .expect("arguments"),
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    reasoning: None,
+                }
+            }
+        }
+
+        impl super::Provider for TerminalProvider {
+            fn id(&self) -> &super::ProviderId {
+                &self.id
+            }
+            fn capabilities(&self) -> super::CapabilitySet {
+                super::CapabilitySet::from_slice(&[
+                    super::Capability::Completion,
+                    super::Capability::Streaming,
+                ])
+            }
+            fn complete<'a>(
+                &'a self,
+                request: &'a super::CompletionRequest,
+                _context: &'a super::RequestContext,
+            ) -> super::ProviderFuture<'a, Result<super::CompletionResponse, super::ProviderError>>
+            {
+                Box::pin(async move {
+                    Ok(super::CompletionResponse {
+                        id: "owned-response".to_owned(),
+                        model: request.model.clone(),
+                        message: self.message(),
+                        finish_reason: self.reason.clone(),
+                        usage_reporting: self.reporting.unwrap_or_else(|| {
+                            if self.usage.total_tokens() == 0 {
+                                claw_provider_sdk::model::UsageReporting::Unreported
+                            } else {
+                                claw_provider_sdk::model::UsageReporting::Partial
+                            }
+                        }),
+                        usage: self.usage,
+                    })
+                })
+            }
+            fn stream<'a>(
+                &'a self,
+                request: &'a super::CompletionRequest,
+                context: &'a super::RequestContext,
+            ) -> super::ProviderFuture<'a, Result<super::CompletionStream, super::ProviderError>>
+            {
+                let waiting = Arc::clone(&self.waiting);
+                let release = Arc::clone(&self.release);
+                let reason = self.reason.clone();
+                let usage = self.usage;
+                let reporting = self.reporting;
+                let model = request.model.as_str().to_owned();
+                let cancel = context.cancel().clone();
+                let mut message = self.message();
+                Box::pin(async move {
+                    let mut prefix = vec![
+                        Ok(super::StreamEvent::Started {
+                            id: "owned-response".to_owned(),
+                            model,
+                        }),
+                        Ok(super::StreamEvent::TextDelta("partial text".to_owned())),
+                    ];
+                    if let Some(reporting) = reporting {
+                        prefix.push(Ok(super::StreamEvent::UsageReported { usage, reporting }));
+                    }
+                    if let Some(call) = message.tool_calls.pop() {
+                        prefix.push(Ok(super::StreamEvent::ToolCallCompleted { index: 0, call }));
+                    }
+                    let terminal = futures_util::stream::once(async move {
+                        waiting.notify_one();
+                        release.notified().await;
+                        Ok(super::StreamEvent::Completed {
+                            finish_reason: reason,
+                            usage,
+                        })
+                    });
+                    Ok(super::CompletionStream::new(
+                        "terminal-fixture",
+                        cancel,
+                        Box::pin(futures_util::stream::iter(prefix).chain(terminal)),
+                    ))
+                })
+            }
+        }
+
+        let request = claw_http_api::GenerationRequest {
+            model: "owned-model".to_owned(),
+            prompt: "owned request".to_owned(),
+            instructions: None,
+            media: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: claw_http_api::ToolChoice::Auto,
+            max_tokens: None,
+            max_tool_calls: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            stop: None,
+            response_format: None,
+            request_id: "owned-request".to_owned(),
+            session_id: "owned-session".to_owned(),
+        };
+        let known_usage = super::Usage {
+            input_tokens: 4,
+            output_tokens: 3,
+            ..super::Usage::default()
+        };
+        let usage_profiles = [
+            (
+                super::Usage::default(),
+                None,
+                claw_http_api::UsageReporting::Unreported,
+            ),
+            (
+                super::Usage::default(),
+                Some(claw_provider_sdk::model::UsageReporting::Partial),
+                claw_http_api::UsageReporting::Partial,
+            ),
+            (
+                super::Usage::default(),
+                Some(claw_provider_sdk::model::UsageReporting::Complete),
+                claw_http_api::UsageReporting::Complete,
+            ),
+            (
+                known_usage,
+                Some(claw_provider_sdk::model::UsageReporting::Complete),
+                claw_http_api::UsageReporting::Complete,
+            ),
+            (known_usage, None, claw_http_api::UsageReporting::Partial),
+        ];
+        for (reason, has_tools, usage, reporting, expected_reporting) in [
+            super::FinishReason::ToolCalls,
+            super::FinishReason::Length,
+            super::FinishReason::ContentFilter,
+            super::FinishReason::Cancelled,
+            super::FinishReason::Other("private-terminal".to_owned()),
+        ]
+        .into_iter()
+        .flat_map(|reason| [false, true].map(|has_tools| (reason.clone(), has_tools)))
+        .flat_map(|(reason, has_tools)| {
+            usage_profiles.map(|(usage, reporting, expected)| {
+                (reason.clone(), has_tools, usage, reporting, expected)
+            })
+        }) {
+            let expected_finish = super::generation_finish_reason(&reason, has_tools).ok();
+            let expected_success = expected_finish.is_some();
+            let expected_history =
+                expected_finish.is_some_and(claw_http_api::GenerationFinishReason::is_complete);
+            let waiting = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let provider = Arc::new(TerminalProvider {
+                id: super::ProviderId::new("terminal-fixture").expect("id"),
+                reason,
+                has_tools,
+                usage,
+                reporting,
+                waiting: Arc::clone(&waiting),
+                release: Arc::clone(&release),
+            });
+            let adapter = Arc::new(super::ProviderAdapter::new(
+                provider,
+                "owned-model",
+                "",
+                ProviderHistoryConfig::default(),
+                Arc::new(EmptyModelTools),
+                Arc::new(DependencyReadiness::new(["provider"])),
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ));
+            let generated = adapter
+                .generate(request.clone(), tokio_util::sync::CancellationToken::new())
+                .await;
+            assert_eq!(generated.is_ok(), expected_success);
+            if let Ok(output) = generated {
+                assert_eq!(Some(output.finish_reason), expected_finish);
+                assert_eq!(output.usage.total_tokens, usage.total_tokens());
+                assert_eq!(output.usage_reporting, expected_reporting);
+                assert_eq!(output.text, "partial text");
+            }
+            assert_eq!(
+                adapter.history("owned-session").len(),
+                if expected_history { 2 } else { 0 }
+            );
+            adapter.clear_history();
+            let (events, mut receiver) = tokio::sync::mpsc::channel(4);
+            let worker = tokio::spawn({
+                let adapter = Arc::clone(&adapter);
+                let request = request.clone();
+                async move {
+                    adapter
+                        .stream(request, events, tokio_util::sync::CancellationToken::new())
+                        .await
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), waiting.notified())
+                .await
+                .expect("provider reached terminal barrier");
+            assert_eq!(
+                receiver.try_recv().expect("partial text before terminal"),
+                claw_http_api::GenerationEvent::Text("partial text".to_owned())
+            );
+            assert!(
+                matches!(
+                    receiver.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "completed tool must still be held before terminal"
+            );
+            assert!(adapter.history("owned-session").is_empty());
+            release.notify_one();
+            let streamed = tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+                .await
+                .expect("adapter terminates")
+                .expect("worker joined");
+            assert_eq!(streamed.is_ok(), expected_success);
+            if let Ok(summary) = streamed {
+                assert_eq!(Some(summary.finish_reason), expected_finish);
+                assert_eq!(summary.usage.total_tokens, usage.total_tokens());
+                assert_eq!(summary.usage_reporting, expected_reporting);
+            }
+            if expected_success && has_tools {
+                assert!(
+                    matches!(receiver.try_recv(),Ok(claw_http_api::GenerationEvent::ToolCall(call)) if call.id == "owned-call")
+                );
+            }
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ));
+            assert_eq!(
+                adapter.history("owned-session").len(),
+                if expected_history { 2 } else { 0 }
+            );
+        }
+    }
+
     fn snapshot(model: &str) -> claw_config::ConfigSnapshot {
         snapshot_with_timeout(model, "120000")
     }
@@ -1992,6 +2694,36 @@ mod tests {
     }
 
     #[test]
+    fn durable_audit_latches_failed_writes_for_all_subsequent_writers() {
+        let readiness = Arc::new(DependencyReadiness::new(["audit"]));
+        let audit = Arc::new(super::DurableSecurityAudit {
+            file: std::sync::Mutex::new(
+                std::fs::File::open(std::env::current_exe().expect("test executable"))
+                    .expect("read-only file handle"),
+            ),
+            readiness: Arc::clone(&readiness),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let first = audit
+            .persist_value(&serde_json::json!({"action": "fixture"}))
+            .expect_err("read-only audit cannot append");
+        assert_eq!(first.message, "audit persistence failed");
+        assert!(!readiness.is_ready());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let audit = Arc::clone(&audit);
+                scope.spawn(move || {
+                    let refused = audit
+                        .persist_value(&serde_json::json!({"action": "must_not_append"}))
+                        .expect_err("failed audit remains closed");
+                    assert_eq!(refused.message, "audit writer requires recovery");
+                });
+            }
+        });
+        assert!(!readiness.is_ready());
+    }
+
+    #[test]
     fn admin_port_errors_retain_their_http_classification() {
         let cases = [
             (
@@ -2002,6 +2734,11 @@ mod tests {
             (PortErrorKind::NotFound, "NOT_FOUND", Some(false)),
             (PortErrorKind::Unavailable, "UNAVAILABLE", Some(false)),
             (PortErrorKind::Timeout, "AGENT_TIMEOUT", Some(true)),
+            (
+                PortErrorKind::OutcomeUnknown,
+                "OUTCOME_UNKNOWN",
+                Some(false),
+            ),
             (PortErrorKind::Internal, "INTERNAL", Some(false)),
         ];
         for (kind, code, retryable) in cases {

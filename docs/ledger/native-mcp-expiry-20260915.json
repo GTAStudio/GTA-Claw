@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "stage": "inbound-mcp-active-idle-session-expiry",
+  "capturedAtUtc": "2026-09-15T03:03:51.9812892Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-http-api/src/mcp.rs","sha256":"3e61f4ebe5029581a50f26f480f1dd325c379c6ccd3c7931f89b5e5dd696acc1"},
+    {"path":"crates/claw-http-api/src/state.rs","sha256":"95e6724e2ea871481f2004cb4e9631319a9ff060214378ed65a7461c0ddc0053"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":342, "failed":0, "ignored":4, "testBinaries":19,
+      "log":"target/native-mcp-expiry-tests-20260915T030148177Z.log",
+      "sha256":"e0a10020e0c626aa3b6bda11941c3ad64f1c71e6df391d2f6ede21a3a4b865e0"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-expiry-clippy-20260915T030102969Z.log",
+      "sha256":"75c6d7bcdeba87c64ba037cf69a25d8a8747a789812f2515b7d346c2961c542f"
+    }
+  ],
+  "behaviorEvidence": [
+    "mcp_idle_sessions_cancel_without_new_requests_and_hold_active_permits_until_release",
+    "mcp_idle_expiry_finishes_real_sse_body_and_releases_stream_capacity",
+    "mcp_expiry_worker_restarts_after_runtime_abort_and_uses_latest_activity",
+    "mcp_expiry_worker_does_not_cancel_an_active_or_other_owner_session",
+    "mcp_sessions_bind_request_namespaces_and_close_expire_with_bounded_capacity"
+  ],
+  "notes": [
+    "One owned task per registry waits for the earliest idle deadline or authenticated activity notification",
+    "Expired sessions cancel calls and streams without waiting for another request; live guards retain their capacity",
+    "Actual SSE body completion, separate-owner retention, completed-worker replacement and shutdown are covered",
+    "The production idle limit remains thirty minutes; tests use short internal TTLs or controlled timestamps",
+    "No dependency, lock, protocol-version, endpoint-inventory or production-service changes"
+  ],
+  "unverified": [
+    "Thirty-minute wall-clock and cross-platform suspend/resume acceptance, hard real-time expiry deadlines",
+    "Continuous cleanup for registries used only outside an async runtime",
+    "Root cause of the separate unreproduced native OAuth status failure",
+    "Deployment, complete frozen manifests and whole-project completion"
+  ]
+}

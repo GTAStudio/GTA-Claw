@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-mcp-owned-invocation-drain-observation",
+  "capturedAtUtc": "2026-09-15T09:26:08.7691519Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-daemon/src/adapters/native_mcp.rs","sha256":"ae621f93366c014ddcc54585c27cd340dff34cb136405c01636bf3dc0003f4e2"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"3023c9030771e12d8e8f08669d650c6251de0152e98a5d140640418cc41a30e4"}
+  ],
+  "cargoLockSha256": "0a733a16d4af7584ad8b084671aa3fd5b1083f27ed723ebcdc2445459e6162f1",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":235, "failed":0, "ignored":4, "testBinaries":9,
+      "log":"target/native-mcp-drain-tests-20260915T092441160Z.log",
+      "sha256":"2eeb3f0418c90d80cc476f939bb0997b962518eccc1fa575da5495233a9ee92f"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-drain-clippy-20260915T092420015Z.log",
+      "sha256":"74f07537fcd376b3c652728122ebf46cbabac130448202b33a1fae7eb5dc3392"
+    },
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --test production_composition bound_native_mcp_stdio_requires_launch_approval_pins_program_and_isolates_environment --locked --offline -- --exact --nocapture",
+      "result":"passed", "passed":1, "failed":0, "ignored":0, "testBinaries":1,
+      "log":"target/native-mcp-drain-focused-20260915T092311354Z.log",
+      "sha256":"b0f82b60b9f6ad7d28ba7fd694001b9b1e9c059cf11fb109de09511e7a7d5076",
+      "scopeNote":"Focused stdio case also included in final daemon regression"
+    }
+  ],
+  "retainedFailures": [],
+  "behaviorEvidence": [
+    "bound_native_mcp_stdio_requires_launch_approval_pins_program_and_isolates_environment"
+  ],
+  "notes": [
+    "Authenticated operator status counts actual NativeMcp TaskTracker owners, not only HTTP request handlers, and exposes activeInvocations plus allInvocationsDrained",
+    "Cancellation can return unknown before the tracked invocation finishes transport cleanup and audit; executable pinning remains until the owning task releases it",
+    "The real fixture checks active count one with pinned program/directory, preserves nonretryable cancellation, waits for observed task completion within three seconds, then checks the program handle is released before the later mutation scenario",
+    "No production cancellation, closing, execution, approval, retry or credential policy changed; the original file-lock failure remains in the prior accounting receipt",
+    "The status is a snapshot, not a maintenance lock, remote-effect reconciliation or permission to repeat unknown work",
+    "No dependency/lock change, production/proxy operation, real account/browser/device migration, deployment or Git write occurred"
+  ],
+  "unverified": [
+    "Remote side-effect reconciliation after cancellation, cross-platform process cleanup and exact attribution of every historical stdio failure",
+    "All retained native-credential/OAuth anomalies and full MCP lifecycle acceptance",
+    "Complete frozen build manifests, release and whole-project acceptance"
+  ]
+}

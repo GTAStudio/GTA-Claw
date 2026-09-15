@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "stage": "credential-scoped-configured-telegram-and-discord-account-partitions",
+  "capturedAtUtc": "2026-09-14T19:21:39.5886575Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"apps/gta-claw-daemon/src/adapters/channels.rs","sha256":"8382ab1fc362fe2c6150ee7a0109dab863c1ecfea19f6818e0c28591d3b4e000"},
+    {"path":"apps/gta-claw-daemon/src/adapters/agent_runtime.rs","sha256":"d4008d4d1a43b2ed660d1ac07b1fb34a5fa5ba28d7c126ec24f77e2c0dccaccd"}
+  ],
+  "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":197, "failed":0, "ignored":4, "testBinaries":8,
+      "log":"target/native-channel-accounts-tests-20260914T192034382Z.log",
+      "sha256":"061dede26a761bc2e9e685feb9e2b703a23bed16e75efb8cd6f4c254d278675e"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-channel-accounts-clippy-20260914T192132665Z.log",
+      "sha256":"3b9bf4ae5af230eb68082d96c7de827d2060022bbcf497e8600b79ac25303eb9"
+    }
+  ],
+  "behaviorEvidence": [
+    "configured_bot_accounts_are_stable_credential_and_channel_partitions",
+    "authenticated_channel_dispatch_isolates_account_history_and_reset",
+    "telegram_processing_loop_retains_failed_delivery_batch_without_resending",
+    "discord_segment_receipts_survive_partial_delivery_and_closed_storage_stops_sends"
+  ],
+  "notes": [
+    "Production adapter account IDs are derived from channel and configured credential instead of a shared default",
+    "Same message IDs under distinct configured credentials cannot reuse old histories or durable input keys",
+    "Actual outbound credential checks use the message account; foreign/default-account sends are rejected locally",
+    "Token rotation, including for the same bot, creates a new partition without adopting or deleting older data",
+    "Configured account status is metadata, not provider bot verification, readiness or permission",
+    "No new dependencies or changes to the existing Cargo.lock witness"
+  ],
+  "unverified": [
+    "independently verified stable bot identities and approved token-rotation/history migration",
+    "complete cross-channel account lifecycle and actual provider accounts",
+    "real account/device acceptance, deployment and whole-project completion"
+  ]
+}

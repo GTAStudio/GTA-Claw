@@ -1,5 +1,18 @@
 //! Closed gateway role/scope registries and deny-by-default authorization.
 
+/// Returns a public fingerprint of a one-use approval token, without exposing the token in argv.
+///
+/// A fingerprint identifies the exact pending preview; it is not an independent authorization.
+#[must_use]
+pub fn approval_preview_fingerprint(token: &str) -> Option<String> {
+    use sha2::Digest;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return None;
+    }
+    Some(sha2::Sha256::digest(token.as_bytes()).iter().flat_map(|byte| [HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 15)]]).map(char::from).collect())
+}
+
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 

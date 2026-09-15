@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "stage": "mcp-shared-service-drain-and-discovery-cancellation",
+  "capturedAtUtc": "2026-09-14T22:00:02.6811947Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceFiles": [
+    {"path":"crates/claw-http-api/src/mcp.rs","sha256":"be61ab334e7b090936ae2ea2d08d5c065579309d997ab136aae1b49560c5504c"},
+    {"path":"crates/claw-http-api/src/state.rs","sha256":"8f617e7463cd305674c640b88f5e67acd9ee105cdd9a8df399f908e98049e7b2"},
+    {"path":"crates/claw-http-api/src/lib.rs","sha256":"0b5e92174d9d86b703b8f85b02ce9ed63aa7a82c5836f4cc867446862f5faa7c"},
+    {"path":"crates/claw-http-api/tests/e2e.rs","sha256":"5c208de56c94b7a28c90d1dbf99c69a4783788c2a248f66fc69f7e99168bc0c8"},
+    {"path":"apps/gta-claw-daemon/src/production.rs","sha256":"82f4a0e078d08e428c664adb2e560dd31f5cfddcb3189df6d986ec293ada3df7"},
+    {"path":"apps/gta-claw-daemon/tests/production_composition.rs","sha256":"0ff5058ce1ec2f6ae99e4e435b6a4b75988848034ed75cc145852f4941a8504a"}
+  ],
+  "cargoLockSha256": "35d6c486d9f786555694093b3131f1da1fbe4c95985d3d9d0909bd2d07c04254",
+  "checks": [
+    {
+      "command":"cargo +stable test --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result":"passed", "passed":324, "failed":0, "ignored":4, "testBinaries":18,
+      "log":"target/native-mcp-drain-tests-20260914T215727558Z.log",
+      "sha256":"096f02b9a18b885d4232711b2bcabae309f861961b3c82ecb64f0b845773ac0f"
+    },
+    {
+      "command":"cargo +stable clippy --manifest-path D:/GTA-Claw/Cargo.toml -p claw-http-api -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result":"passed",
+      "log":"target/native-mcp-drain-clippy-20260914T215908055Z.log",
+      "sha256":"251f0bc1b513457ae09e1b9893c99a4f5d78a90e1bcb2b2b5fb0cf8776c2582e"
+    }
+  ],
+  "behaviorEvidence": [
+    "mcp_drain_revokes_sessions_stateless_calls_and_streams_without_releasing_active_slots",
+    "mcp_cancellation_targets_only_the_authenticated_active_request",
+    "native_mcp_http_client_interoperates_with_owned_daemon_sessions"
+  ],
+  "notes": [
+    "One host-owned shutdown root revokes all MCP child tokens and permanently refuses new work",
+    "Daemon cancels MCP before awaiting HTTP drain; directory discovery now supports ID cancellation and drain",
+    "Real TCP tests cover hung discovery, active session/stateless tools, SSE EOF and partial body rejection",
+    "Actual owned daemon cleanly stops with a live MCP SSE; cancellation never claims rollback",
+    "The final pure-constructor const qualifier was validated by lint after the test cohort; current lock witness is unchanged"
+  ],
+  "unverified": [
+    "noncooperative/blocking backend immediate stop and exact background session expiry",
+    "complete event/outbound MCP/OAuth/stdio/ACP product workflows and live accounts",
+    "prior MCP fixture all-target lint, cross-platform/power-loss acceptance and whole-project completion"
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "stage": "candidate-request-schemas-and-native-session-queries",
+  "capturedAtUtc": "2026-09-14T15:07:16.1865212Z",
+  "baseCommit": "b98e39d135203687397d3549348217f13d458f36",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "sourceWitness": {
+    "count": 664,
+    "sha256": "c62fb58b9020fb520a0078e1aef4aaed843e4c7918eea6e796743e15dea0cd7f",
+    "inventory": "git ls-files --cached --others --exclude-standard -- *.rs *.toml *.lock; unique ordinal path order",
+    "encoding": "UTF-8 concatenated relative path + NUL + lowercase file SHA256 + LF",
+    "cargoLockSha256": "fc59f55c8b8ccf415093441daf37d670dc43337ed98b23b8ecef2a4e90b8db49"
+  },
+  "candidateRequests": {
+    "artifact": "compat/releases/v2026.9.4/gateway-sources.json",
+    "sha256": "a2876a516bc0ca9a36dce9064017330fb9da4f353e515c02bc7e41eab4349973",
+    "reviewedSourceWitnesses": 8,
+    "schemaConstructor": "typebox@1.3.18",
+    "methods": ["agent.wait", "chat.abort", "chat.history", "chat.send", "sessions.describe", "sessions.send"],
+    "extraction": "manual_review_of_pinned_typebox_sources",
+    "upstreamSourceBytesBundled": false,
+    "completeContract": false,
+    "localSignatureVerification": false,
+    "externalRuntimeInteroperability": false
+  },
+  "checks": [
+    {
+      "command": "cargo +stable test -p claw-conformance -p gta-claw-cli -p gta-claw-tui -p gta-claw-daemon --all-targets --locked --offline --quiet",
+      "result": "passed",
+      "passed": 406,
+      "failed": 0,
+      "ignored": 5,
+      "testBinaries": 21,
+      "log": "target/native-session-contract-tests-20260914T230337624.log",
+      "sha256": "d23aa7acaebaefa4ba52b16039a3e577792261baee8fea57f179d6f90ca733dc"
+    },
+    {
+      "command": "cargo +stable clippy -p claw-conformance -p gta-claw-cli -p gta-claw-tui -p gta-claw-daemon --all-targets --locked --offline -- -D warnings",
+      "result": "passed",
+      "log": "target/native-session-contract-clippy-20260914T230313121.log",
+      "sha256": "b49f0b9f6b80a66c7c1183f3af8bab63248a091d3d3b9977f75085c45dc9c811"
+    },
+    {
+      "command": "cargo +stable test -p claw-repo-policy --all-targets --locked --offline --quiet",
+      "result": "passed",
+      "passed": 12,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "command": "cargo +stable metadata --locked --offline --format-version 1",
+      "result": "passed",
+      "workspaceMembers": 38,
+      "resolvedPackages": 500,
+      "rootSlintOrCheckedJavaScriptRuntimePackages": 0,
+      "sealedSurfaceChanges": []
+    }
+  ],
+  "concurrentEdits": "Existing explicit-memory implementation and tests changed during this cohort; retained and included in the final passing run. Only local borrowing/static-method lint fixes were applied to that adapter in this slice.",
+  "unverified": ["complete upstream request/response/event semantics", "upstream runtime interoperability", "local cryptographic verification of upstream source", "history cursors and full archive", "derived session titles and last-message options", "MSRV 1.94 execution", "non-Windows runtime", "visible GUI and mobile usability", "production deployment", "whole-project completion"]
+}

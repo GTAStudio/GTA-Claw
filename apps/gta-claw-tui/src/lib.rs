@@ -50,6 +50,8 @@ pub struct Options {
     pub gateway_url: Url,
     /// Optional shared token.
     pub token: Option<String>,
+    /// Explicit Windows/macOS native device profile, never a plaintext credential file.
+    pub device_profile: Option<String>,
     /// Force monochrome rendering.
     pub no_color: bool,
     /// Force a single non-interactive snapshot.
@@ -79,7 +81,7 @@ impl fmt::Debug for Options {
             .field("plain", &self.plain)
             .field("verbosity", &self.verbosity)
             .field("log_file", &self.log_file)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -105,6 +107,7 @@ impl Options {
             .map(|value| value.to_string_lossy().into_owned());
         let mut no_color = std::env::var_os("NO_COLOR").is_some();
         let mut plain = false;
+        let mut device_profile = None;
         let mut verbosity = Verbosity::Off;
         let mut log_file = None;
         let mut values = arguments.into_iter();
@@ -119,6 +122,24 @@ impl Options {
                         .into_owned();
                 }
                 "--no-color" => no_color = true,
+                "--device-profile" => {
+                    if device_profile.is_some() {
+                        return Err("--device-profile may be specified only once".to_owned());
+                    }
+                    let profile = values
+                        .next()
+                        .and_then(|value| value.into_string().ok())
+                        .ok_or_else(|| "--device-profile requires an ASCII alias".to_owned())?;
+                    if profile.is_empty()
+                        || profile.len() > 64
+                        || !profile
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                    {
+                        return Err("--device-profile must contain 1..64 ASCII letters, digits, hyphens or underscores".to_owned());
+                    }
+                    device_profile = Some(profile);
+                }
                 "--plain" => plain = true,
                 "-v" | "--verbose" => verbosity = verbosity.max(Verbosity::Basic),
                 "-vv" => verbosity = Verbosity::Detailed,
@@ -144,6 +165,7 @@ impl Options {
         Ok(Self {
             gateway_url,
             token,
+            device_profile,
             no_color,
             plain,
             verbosity,
@@ -179,6 +201,7 @@ pub async fn run(options: Options) -> Result<(), String> {
     let worker_options = GatewayOptions {
         url: options.gateway_url,
         token: options.token,
+        device_profile: options.device_profile,
     };
     if full_screen {
         return run_interactive(worker_options, options.no_color)
@@ -237,9 +260,11 @@ async fn run_interactive(options: GatewayOptions, no_color: bool) -> io::Result<
         loop {
             if redraw {
                 let (width, height) = crossterm_terminal::size().unwrap_or((100, 30));
+                model.viewport = (width, height);
                 let grid = render::render(&model, width, height, no_color);
                 render::flush_changes(&mut stdout, painted.as_ref(), &grid, no_color)?;
                 painted = Some(grid);
+                acknowledge_rendered_results(&mut model, &worker.commands);
                 redraw = false;
             }
             tokio::select! {
@@ -283,6 +308,25 @@ async fn run_interactive(options: GatewayOptions, no_color: bool) -> io::Result<
 }
 
 fn handle_input(model: &mut AppModel, event: &Event, commands: &mpsc::Sender<UiCommand>) -> bool {
+    if let Event::Paste(text) = event {
+        if model.composer_open && model.prompt.is_none() && !model.palette_open {
+            let limit = model
+                .memory_draft
+                .as_ref()
+                .map_or(16 * 1024, |(_, draft)| draft.input_limit());
+            if model.composer.len().saturating_add(text.len()) <= limit
+                && !text.chars().any(|character| {
+                    character.is_control() && !matches!(character, '\n' | '\r' | '\t')
+                })
+            {
+                model.composer.push_str(text);
+            } else {
+                model.notice =
+                    Some("Paste rejected: input limit or unsupported control character".to_owned());
+            }
+        }
+        return false;
+    }
     let Event::Key(key) = event else {
         return false;
     };
@@ -291,6 +335,64 @@ fn handle_input(model: &mut AppModel, event: &Event, commands: &mpsc::Sender<UiC
     }
     if model.palette_open {
         return handle_palette(model, key, commands);
+    }
+    if model.composer_open && model.prompt.is_none() {
+        let input_limit = model
+            .memory_draft
+            .as_ref()
+            .map_or(16 * 1024, |(_, draft)| draft.input_limit());
+        match key.code {
+            KeyCode::Esc => model.composer_open = false,
+            KeyCode::Backspace => {
+                model.composer.pop();
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let _ = push_bounded(&mut model.composer, '\n', input_limit);
+            }
+            KeyCode::Enter => submit_message(model, commands),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && !push_bounded(&mut model.composer, character, input_limit) =>
+            {
+                model.notice = Some("Message limit reached".to_owned());
+            }
+            _ => {}
+        }
+        return false;
+    }
+    if matches!(
+        model.prompt,
+        Some(Prompt::Approval {
+            preview_fingerprint: Some(_),
+            ..
+        })
+    ) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                model.approval_scroll = model.approval_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                model.approval_scroll = model.approval_scroll.saturating_add(1).min(32 * 1024);
+            }
+            KeyCode::PageDown => {
+                model.approval_scroll = model
+                    .approval_scroll
+                    .saturating_add(usize::from(model.viewport.1.saturating_sub(9)))
+                    .min(32 * 1024);
+            }
+            KeyCode::PageUp => {
+                model.approval_scroll = model
+                    .approval_scroll
+                    .saturating_sub(usize::from(model.viewport.1.saturating_sub(9)));
+            }
+            KeyCode::Char('y') => resolve_prompt(model, commands, true),
+            KeyCode::Char('n') => resolve_prompt(model, commands, false),
+            KeyCode::Char('q') => return true,
+            _ => {}
+        }
+        return false;
     }
     if matches!(model.prompt, Some(Prompt::Question { .. })) {
         match key.code {
@@ -330,6 +432,9 @@ fn handle_input(model: &mut AppModel, event: &Event, commands: &mpsc::Sender<UiC
     }
     match key.code {
         KeyCode::Char('q') => return true,
+        KeyCode::Char('c') => begin_message(model, true),
+        KeyCode::Char('i') => begin_message(model, false),
+        KeyCode::Char('x') => native_run_command(model, commands, true),
         KeyCode::Tab => {
             model.next_screen();
             load_screen(model, commands);
@@ -406,7 +511,56 @@ fn handle_palette(
         KeyCode::Enter => {
             let command = std::mem::take(&mut model.palette);
             model.palette_open = false;
+            if command
+                .split_whitespace()
+                .next()
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("memory"))
+            {
+                begin_memory(model, commands, &command);
+                return false;
+            }
             match command.trim().to_ascii_lowercase().as_str() {
+                "new" => begin_message(model, true),
+                "message" | "send" => begin_message(model, false),
+                "cancel" => native_run_command(model, commands, true),
+                "run" => native_run_command(model, commands, false),
+                "partial" => partial_page_command(model, commands, false),
+                "partial-next" => partial_page_command(model, commands, true),
+                "retry-send" => {
+                    if let Some(pending) = model
+                        .pending_message
+                        .clone()
+                        .filter(|pending| pending.unconfirmed)
+                    {
+                        if queue_command(model, commands, pending.command()) {
+                            if let Some(pending) = model.pending_message.as_mut() {
+                                pending.unconfirmed = false;
+                            }
+                            model.notice = Some("Checking the original submission key".to_owned());
+                        }
+                    } else {
+                        model.notice = Some("No unconfirmed message is retained".to_owned());
+                    }
+                }
+                "discard-send" => {
+                    if model
+                        .pending_message
+                        .as_ref()
+                        .is_some_and(|pending| pending.unconfirmed && !pending.may_have_been_sent)
+                    {
+                        model.pending_message = None;
+                        model.notice = Some("Unsent input discarded".to_owned());
+                    } else {
+                        model.notice =
+                            Some("Queued or unknown input must retain its original key".to_owned());
+                    }
+                }
+                "discard-draft" => {
+                    model.composer.clear();
+                    model.memory_draft = None;
+                    model.composer_open = false;
+                    model.notice = Some("Unsubmitted draft discarded".to_owned());
+                }
                 "sessions" => model.screen = Screen::Sessions,
                 "workspace" => model.screen = Screen::Workspace,
                 "runs" => model.screen = Screen::Runs,
@@ -423,7 +577,20 @@ fn handle_palette(
                 unknown => model.notice = Some(format!("Unknown command: {unknown}")),
             }
             model.scroll = 0;
-            load_screen(model, commands);
+            if !model.composer_open
+                && !matches!(
+                    command.trim().to_ascii_lowercase().as_str(),
+                    "cancel"
+                        | "run"
+                        | "partial"
+                        | "partial-next"
+                        | "retry-send"
+                        | "discard-send"
+                        | "discard-draft"
+                )
+            {
+                load_screen(model, commands);
+            }
         }
         _ => {}
     }
@@ -431,10 +598,20 @@ fn handle_palette(
 }
 
 fn resolve_prompt(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>, approved: bool) {
-    if let Some(Prompt::Approval { id, .. }) = model.prompt.as_ref() {
+    if let Some(Prompt::Approval {
+        id,
+        preview_fingerprint: Some(fingerprint),
+        ..
+    }) = model.prompt.as_ref()
+    {
+        if approved && !render::approval_fully_visible(model, model.viewport.0, model.viewport.1) {
+            model.notice = Some("Review the remaining approval text before approving".to_owned());
+            return;
+        }
         let command = UiCommand::ResolveApproval {
             id: id.clone(),
             approved,
+            preview_fingerprint: fingerprint.clone(),
         };
         if queue_command(model, commands, command) {
             model.prompt = None;
@@ -444,6 +621,225 @@ fn resolve_prompt(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>, appr
                 "Denial submitted".to_owned()
             });
         }
+    }
+}
+
+fn random_message_identity() -> Result<String, String> {
+    use ring::rand::SecureRandom;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [0_u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "System entropy is unavailable".to_owned())?;
+    let mut identity = String::from("tui-");
+    for byte in bytes {
+        identity.push(char::from(HEX[usize::from(byte >> 4)]));
+        identity.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    Ok(identity)
+}
+
+fn begin_message(model: &mut AppModel, new_session: bool) {
+    if model.pending_message.is_some() {
+        model.notice = Some("A queued or unknown message must be reconciled first".to_owned());
+        return;
+    }
+    if let Some((session_id, _)) = &model.memory_draft {
+        if !new_session
+            && model
+                .selected_session()
+                .is_some_and(|session| &session.id == session_id)
+        {
+            model.screen = Screen::Workspace;
+            model.composer_open = true;
+        } else {
+            model.notice = Some("A memory draft remains bound to its original session".to_owned());
+        }
+        return;
+    }
+    if new_session || model.selected_session().is_none() {
+        if model.sessions.len() >= MAX_SESSIONS {
+            model.notice = Some("Session display capacity reached".to_owned());
+            return;
+        }
+        let id = match random_message_identity() {
+            Ok(id) => id,
+            Err(error) => {
+                model.notice = Some(error);
+                return;
+            }
+        };
+        model.sessions.push(model::SessionSummary {
+            id: id.clone(),
+            title: id,
+            state: model::RunState::Draft,
+            ..model::SessionSummary::default()
+        });
+        model.selected = model.sessions.len() - 1;
+        model.clear_session_view();
+    }
+    model.screen = model::Screen::Workspace;
+    model.composer_open = true;
+}
+
+fn begin_memory(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>, palette: &str) {
+    if model.pending_message.is_some() || model.memory_draft.is_some() || !model.composer.is_empty()
+    {
+        model.notice =
+            Some("Existing input must be resolved or explicitly discarded first".to_owned());
+        return;
+    }
+    let draft = match gateway::MemoryDraft::parse(palette) {
+        Ok(draft) => draft,
+        Err(error) => {
+            model.notice = Some(error.to_owned());
+            return;
+        }
+    };
+    begin_message(model, false);
+    let Some(session) = model.selected_session() else {
+        return;
+    };
+    let requires_input = draft.input_limit() != 0;
+    model.memory_draft = Some((session.id.clone(), draft));
+    if !requires_input {
+        submit_message(model, commands);
+    }
+}
+
+fn submit_message(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>) {
+    if model.pending_message.is_some()
+        || model.memory_draft.is_none() && model.composer.trim().is_empty()
+    {
+        return;
+    }
+    let Some(session) = model.selected_session() else {
+        return;
+    };
+    let memory = if let Some((session_id, draft)) = &model.memory_draft {
+        if session_id != &session.id {
+            model.notice =
+                Some("Memory draft belongs to a different session; nothing was sent".to_owned());
+            return;
+        }
+        match draft.finish(&model.composer) {
+            Ok(command) => Some(command),
+            Err(error) => {
+                model.notice = Some(error.to_owned());
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let idempotency_key = match random_message_identity() {
+        Ok(id) => id,
+        Err(error) => {
+            model.notice = Some(error);
+            return;
+        }
+    };
+    let pending = model::PendingMessage {
+        session_id: session.id.clone(),
+        text: memory.as_ref().map_or_else(
+            || model.composer.clone(),
+            |command| format!("Memory {} (explicit, untrusted data)", command.action()),
+        ),
+        idempotency_key,
+        unconfirmed: false,
+        may_have_been_sent: false,
+        memory,
+    };
+    if queue_command(model, commands, pending.command()) {
+        model.pending_message = Some(pending);
+        model.composer.clear();
+        model.memory_draft = None;
+        model.composer_open = false;
+        model.notice = Some("Awaiting durable message receipt".to_owned());
+    }
+}
+
+fn native_run_command(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>, cancel: bool) {
+    if let Some((session_id, run_id)) = model.active_run.clone() {
+        if model
+            .selected_session()
+            .is_some_and(|session| session.id == session_id)
+        {
+            let command = if cancel {
+                UiCommand::AbortRun { session_id, run_id }
+            } else {
+                UiCommand::QueryRun { session_id, run_id }
+            };
+            let _ = queue_command(model, commands, command);
+        }
+    } else {
+        model.notice = Some("No confirmed run is selected".to_owned());
+    }
+}
+
+fn partial_page_command(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>, next: bool) {
+    let Some((session_id, run_id)) = model.active_run.clone() else {
+        model.notice = Some("No confirmed run is selected".to_owned());
+        return;
+    };
+    let Some((Some(turn), revision)) = model.active_run_version else {
+        model.notice = Some("A bound terminal run revision is required".to_owned());
+        return;
+    };
+    let Some(session) = model
+        .selected_session()
+        .filter(|session| session.id == session_id)
+    else {
+        return;
+    };
+    let state = session.state;
+    if !matches!(
+        state,
+        model::RunState::Completed
+            | model::RunState::CompletedWithChanges
+            | model::RunState::Failed
+            | model::RunState::Cancelled
+            | model::RunState::OutcomeUnknown
+    ) {
+        model.notice = Some("The selected run has not reached a terminal state".to_owned());
+        return;
+    }
+    let request = if next {
+        let Some(page) = model.partial_page.as_ref().filter(|page| {
+            page.request.session_id == session_id
+                && page.request.run_id == run_id
+                && page.request.turn == turn
+                && page.request.revision == revision
+                && page.request.state == state
+        }) else {
+            model.notice = Some("No partial-text continuation is selected".to_owned());
+            return;
+        };
+        let Some(offset) = page.next_offset else {
+            model.notice = Some("End of retained partial text".to_owned());
+            return;
+        };
+        gateway::PartialPageRequest {
+            offset,
+            total_bytes: Some(page.total_bytes),
+            sha256: Some(page.sha256.clone()),
+            ..page.request.clone()
+        }
+    } else {
+        gateway::PartialPageRequest {
+            session_id,
+            run_id,
+            revision,
+            turn,
+            state,
+            offset: 0,
+            total_bytes: None,
+            sha256: None,
+        }
+    };
+    if queue_command(model, commands, UiCommand::ReadPartial(request)) {
+        model.screen = Screen::Workspace;
+        model.notice = Some("Reading retained partial text".to_owned());
     }
 }
 
@@ -467,6 +863,15 @@ fn queue_command(
     commands: &mpsc::Sender<UiCommand>,
     command: UiCommand,
 ) -> bool {
+    let command = if command.requires_connection() {
+        let Some(connection_id) = model.connection_id else {
+            model.notice = Some("Gateway is not ready; no command was sent".to_owned());
+            return false;
+        };
+        command.for_connection(connection_id)
+    } else {
+        command
+    };
     match commands.try_send(command) {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -477,6 +882,28 @@ fn queue_command(
             model.notice = Some("Gateway worker stopped; restart the TUI".to_owned());
             false
         }
+    }
+}
+
+fn acknowledge_rendered_results(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>) {
+    if model.screen != Screen::Workspace || model.viewport.0 < 40 || model.viewport.1 < 10 {
+        return;
+    }
+    while let Some((run_id, revision)) = model.pending_acks.front().cloned() {
+        if !queue_command(
+            model,
+            commands,
+            UiCommand::AcknowledgeRun { run_id, revision },
+        ) {
+            break;
+        }
+        model.pending_acks.pop_front();
+    }
+    if model.pending_acks.is_empty()
+        && let Some(session_id) = model.pending_recovery.clone()
+        && queue_command(model, commands, UiCommand::RecoverRuns(session_id))
+    {
+        model.pending_recovery = None;
     }
 }
 
@@ -499,16 +926,252 @@ fn previous_screen(model: &mut AppModel) {
 
 fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
     match event {
+        WorkerEvent::Accepted {
+            session_id,
+            run_id,
+            idempotency_key,
+        } => {
+            if let Some(pending) = model.pending_message.take() {
+                if pending.idempotency_key != idempotency_key || pending.session_id != session_id {
+                    model.pending_message = Some(pending);
+                    return;
+                }
+                if model
+                    .selected_session()
+                    .is_some_and(|session| session.id == session_id)
+                {
+                    model.transcript.push_back(model::TranscriptEntry {
+                        role: "user".to_owned(),
+                        text: pending.text,
+                    });
+                    while model.transcript.len() > MAX_TRANSCRIPT {
+                        model.transcript.pop_front();
+                    }
+                }
+            }
+            if model
+                .selected_session()
+                .is_some_and(|session| session.id == session_id)
+            {
+                model.active_run = Some((session_id, run_id));
+                model.active_run_version = None;
+            }
+            model.notice = Some("Message accepted durably".to_owned());
+        }
+        WorkerEvent::SendUnconfirmed { idempotency_key } => {
+            if let Some(pending) = model
+                .pending_message
+                .as_mut()
+                .filter(|pending| pending.idempotency_key == idempotency_key)
+            {
+                pending.unconfirmed = true;
+                pending.may_have_been_sent = true;
+            }
+            model.notice = Some(
+                "Message delivery is unknown; retain and reconcile the original key".to_owned(),
+            );
+        }
+        WorkerEvent::SendNotSent {
+            idempotency_key,
+            reason,
+        } => {
+            if let Some(pending) = model
+                .pending_message
+                .as_mut()
+                .filter(|pending| pending.idempotency_key == idempotency_key)
+            {
+                pending.unconfirmed = true;
+                model.notice = Some(if pending.may_have_been_sent {
+                    format!(
+                        "This attempt was not sent; earlier delivery remains unknown. {}",
+                        bounded_owned(reason, MAX_NOTICE_BYTES / 2)
+                    )
+                } else {
+                    format!("Not sent: {}", bounded_owned(reason, MAX_NOTICE_BYTES / 2))
+                });
+            }
+        }
+        WorkerEvent::PartialPage(mut page) => {
+            if model.selected_session().is_none_or(|session| {
+                session.id != page.request.session_id || session.state != page.request.state
+            }) || model.active_run.as_ref().is_none_or(|(session, run)| {
+                *session != page.request.session_id || *run != page.request.run_id
+            }) || model.active_run_version
+                != Some((Some(page.request.turn), page.request.revision))
+            {
+                return;
+            }
+            if model.partial_page.as_ref().is_some_and(|previous| {
+                previous.request == page.request
+                    && previous.end_offset == page.end_offset
+                    && previous.sha256 == page.sha256
+            }) {
+                return;
+            }
+            if page.request.offset > 0
+                && model.partial_page.as_ref().is_none_or(|previous| {
+                    previous.next_offset != Some(page.request.offset)
+                        || previous.sha256 != page.sha256
+                        || previous.total_bytes != page.total_bytes
+                        || previous.request.run_id != page.request.run_id
+                        || previous.request.revision != page.request.revision
+                })
+            {
+                return;
+            }
+            page.text = bounded_owned(
+                crate::diagnostics::sanitize(&page.text),
+                MAX_EVENT_TEXT_BYTES,
+            );
+            model.transcript.push_back(model::TranscriptEntry {
+                role: format!(
+                    "partial [{}..{}/{} bytes]",
+                    page.request.offset, page.end_offset, page.total_bytes
+                ),
+                text: page.text.clone(),
+            });
+            while model.transcript.len() > MAX_TRANSCRIPT {
+                model.transcript.pop_front();
+            }
+            model.notice = Some(format!(
+                "Unconfirmed partial text: bytes {}..{} of {}",
+                page.request.offset, page.end_offset, page.total_bytes
+            ));
+            model.partial_page = Some(page);
+            model.scroll = 0;
+        }
+        WorkerEvent::NativeRun {
+            session_id,
+            run_id,
+            state,
+            turn,
+            text,
+            revision,
+        } => {
+            if model
+                .selected_session()
+                .is_some_and(|session| session.id == session_id)
+            {
+                if let Some(text) = text {
+                    if model
+                        .received_results
+                        .iter()
+                        .any(|(received, current)| received == &run_id && *current >= revision)
+                    {
+                        return;
+                    }
+                    if model.pending_acks.len() >= MAX_TRANSCRIPT {
+                        model.notice = Some("Result acknowledgement capacity reached; retained results remain on the server".to_owned());
+                        return;
+                    }
+                    model.transcript.push_back(model::TranscriptEntry {
+                        role: "assistant".to_owned(),
+                        text,
+                    });
+                    while model.transcript.len() > MAX_TRANSCRIPT {
+                        model.transcript.pop_front();
+                    }
+                    model.received_results.push_back((run_id.clone(), revision));
+                    while model.received_results.len() > MAX_TRANSCRIPT {
+                        model.received_results.pop_front();
+                    }
+                    model.pending_acks.push_back((run_id.clone(), revision));
+                }
+                if let Some((active_session, active_id)) = &model.active_run
+                    && active_session == &session_id
+                {
+                    if active_id != &run_id {
+                        if model.active_run_version.is_none_or(|(active_turn, _)| {
+                            active_turn.is_none() || turn.is_none() || turn <= active_turn
+                        }) {
+                            return;
+                        }
+                    } else if model
+                        .active_run_version
+                        .is_some_and(|(_, current)| revision <= current)
+                    {
+                        return;
+                    }
+                }
+                model.partial_page = None;
+                model.active_run = Some((session_id, run_id));
+                model.active_run_version = Some((turn, revision));
+                if let Some(session) = model.sessions.get_mut(model.selected) {
+                    session.state = state;
+                }
+            }
+        }
+        WorkerEvent::RecoveryAvailable(session_id) => {
+            if model
+                .selected_session()
+                .is_some_and(|session| session.id == session_id)
+            {
+                model.pending_recovery = Some(session_id);
+            }
+        }
+        WorkerEvent::ResultAcknowledged { .. } => {}
         WorkerEvent::Connection(connection) => {
+            model.clear_session_view();
+            model.connection_id = None;
+            if let Some(pending) = model.pending_message.as_mut() {
+                pending.may_have_been_sent |= !pending.unconfirmed;
+                pending.unconfirmed = true;
+            }
+            model.approval_scroll = 0;
             model.connection = bounded_owned(connection, MAX_NOTICE_BYTES);
         }
+        WorkerEvent::Ready {
+            connection_id,
+            description,
+        } => {
+            model.connection_id = Some(connection_id);
+            model.connection = bounded_owned(description, MAX_NOTICE_BYTES);
+        }
         WorkerEvent::Sessions(sessions) => {
+            let selected = model.selected_session().cloned();
+            let previous_id = selected.as_ref().map(|session| session.id.clone());
+            let preserve_draft = selected
+                .as_ref()
+                .filter(|session| {
+                    model.composer_open
+                        || model
+                            .pending_message
+                            .as_ref()
+                            .is_some_and(|pending| pending.session_id == session.id)
+                })
+                .cloned();
             model.sessions = sessions.into_iter().take(MAX_SESSIONS).collect();
-            model.selected = model.selected.min(model.sessions.len().saturating_sub(1));
+            if let Some(draft) = preserve_draft
+                && !model.sessions.iter().any(|session| session.id == draft.id)
+            {
+                model.sessions.truncate(MAX_SESSIONS.saturating_sub(1));
+                model.sessions.push(draft);
+            }
+            model.selected = selected
+                .and_then(|selected| {
+                    model
+                        .sessions
+                        .iter()
+                        .position(|session| session.id == selected.id)
+                })
+                .unwrap_or_else(|| model.selected.min(model.sessions.len().saturating_sub(1)));
+            if previous_id.as_deref() != model.selected_session().map(|session| session.id.as_str())
+            {
+                model.clear_session_view();
+            }
             model.scroll = model.scroll.min(model.sessions.len().saturating_sub(1));
             model.notice = None;
         }
-        WorkerEvent::Message(mut message) => {
+        WorkerEvent::Message {
+            session_id,
+            mut message,
+        } => {
+            if model
+                .selected_session()
+                .is_none_or(|session| session.id != session_id)
+            {
+                return;
+            }
             message.role = bounded_owned(message.role, 128);
             message.text = bounded_owned(message.text, MAX_EVENT_TEXT_BYTES);
             model.transcript.push_back(message);
@@ -516,7 +1179,30 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
                 model.transcript.pop_front();
             }
         }
-        WorkerEvent::Tool(mut tool) => {
+        WorkerEvent::History {
+            session_id,
+            messages,
+        } => {
+            if model
+                .selected_session()
+                .is_some_and(|session| session.id == session_id)
+            {
+                model.transcript = messages.into_iter().take(MAX_TRANSCRIPT).collect();
+                model.partial_page = None;
+                model.tools.clear();
+                model.scroll = 0;
+            }
+        }
+        WorkerEvent::Tool {
+            session_id,
+            mut tool,
+        } => {
+            if model
+                .selected_session()
+                .is_none_or(|session| session.id != session_id)
+            {
+                return;
+            }
             tool.name = bounded_owned(tool.name, 128);
             tool.status = bounded_owned(tool.status, 128);
             tool.summary = bounded_owned(tool.summary, MAX_EVENT_TEXT_BYTES);
@@ -525,12 +1211,38 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
                 model.tools.pop_front();
             }
         }
+        WorkerEvent::SessionPrompt { session_id, prompt } => {
+            if model
+                .selected_session()
+                .is_some_and(|session| session.id == session_id)
+            {
+                apply_worker_event(model, WorkerEvent::Prompt(prompt));
+            }
+        }
         WorkerEvent::Prompt(prompt) => {
+            if model.prompt.is_some() {
+                model.notice =
+                    Some("Another request is pending; the current preview was retained".to_owned());
+                return;
+            }
+            model.approval_scroll = 0;
             model.prompt = Some(match prompt {
-                Prompt::Approval { id, text } => Prompt::Approval {
-                    id: bounded_owned(id, 1_024),
-                    text: bounded_owned(text, MAX_EVENT_TEXT_BYTES),
-                },
+                Prompt::Approval {
+                    id,
+                    text,
+                    preview_fingerprint,
+                } => {
+                    if id.len() > 128 || text.len() > MAX_EVENT_TEXT_BYTES {
+                        model.notice =
+                            Some("Approval preview exceeds the display limit".to_owned());
+                        return;
+                    }
+                    Prompt::Approval {
+                        id: bounded_owned(id, 1_024),
+                        text,
+                        preview_fingerprint,
+                    }
+                }
                 Prompt::Question { id, text } => Prompt::Question {
                     id: bounded_owned(id, 1_024),
                     text: bounded_owned(text, MAX_EVENT_TEXT_BYTES),
@@ -538,7 +1250,23 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
             });
             model.answer.clear();
         }
-        WorkerEvent::Diff(diff) => {
+        WorkerEvent::PromptDismissed(id) => {
+            if matches!(&model.prompt, Some(Prompt::Approval { id: pending, .. }) if pending == &id)
+            {
+                model.prompt = None;
+                model.approval_scroll = 0;
+            }
+        }
+        WorkerEvent::Diff {
+            session_id,
+            lines: diff,
+        } => {
+            if model
+                .selected_session()
+                .is_none_or(|session| session.id != session_id)
+            {
+                return;
+            }
             model.diff = diff
                 .into_iter()
                 .take(MAX_DIFF_LINES)
@@ -546,7 +1274,16 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
                 .collect();
             model.scroll = 0;
         }
-        WorkerEvent::Artifacts(artifacts) => {
+        WorkerEvent::Artifacts {
+            session_id,
+            artifacts,
+        } => {
+            if model
+                .selected_session()
+                .is_none_or(|session| session.id != session_id)
+            {
+                return;
+            }
             model.artifacts = artifacts
                 .into_iter()
                 .take(MAX_ARTIFACTS)
@@ -555,7 +1292,16 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
             model.artifact_content.clear();
             model.scroll = 0;
         }
-        WorkerEvent::ArtifactContent(content) => {
+        WorkerEvent::ArtifactContent {
+            session_id,
+            lines: content,
+        } => {
+            if model
+                .selected_session()
+                .is_none_or(|session| session.id != session_id)
+            {
+                return;
+            }
             model.artifact_content = content
                 .into_iter()
                 .take(MAX_ARTIFACT_LINES)
@@ -633,6 +1379,8 @@ const fn help_text() -> &'static str {
      Options:\n\
      \x20 --gateway <url>  ws:// or wss:// Gateway endpoint.\n\
      \x20                  Default: GTA_CLAW_GATEWAY_URL, else ws://127.0.0.1:18789\n\
+    \x20 --device-profile <alias>  persistent Windows/macOS OS-protected device identity\n\
+    \x20                           Default: ephemeral; no fallback if profile storage fails\n\
      \x20 --no-color       monochrome rendering. Default: on when NO_COLOR is set\n\
      \x20 --plain          print one snapshot and exit instead of taking over the\n\
      \x20                  terminal. Default: on when stdin or stdout is not a TTY\n\
@@ -665,6 +1413,672 @@ const fn help_text() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_session_events_and_selection_cannot_mix_views_or_acknowledgements() {
+        use crate::model::{RunState, ToolActivity};
+
+        let mut model = AppModel {
+            sessions: vec![
+                SessionSummary {
+                    id: "current".to_owned(),
+                    ..SessionSummary::default()
+                },
+                SessionSummary {
+                    id: "other".to_owned(),
+                    ..SessionSummary::default()
+                },
+            ],
+            ..AppModel::default()
+        };
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::Message {
+                session_id: "other".to_owned(),
+                message: TranscriptEntry {
+                    role: "assistant".to_owned(),
+                    text: "not current".to_owned(),
+                },
+            },
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::Tool {
+                session_id: "other".to_owned(),
+                tool: ToolActivity {
+                    name: "private".to_owned(),
+                    status: "running".to_owned(),
+                    summary: "not current".to_owned(),
+                },
+            },
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::SessionPrompt {
+                session_id: "other".to_owned(),
+                prompt: Prompt::Question {
+                    id: "question".to_owned(),
+                    text: "not current".to_owned(),
+                },
+            },
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::Diff {
+                session_id: "other".to_owned(),
+                lines: vec!["not current".to_owned()],
+            },
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::Artifacts {
+                session_id: "other".to_owned(),
+                artifacts: vec!["not current".to_owned()],
+            },
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::ArtifactContent {
+                session_id: "other".to_owned(),
+                lines: vec!["not current".to_owned()],
+            },
+        );
+        assert!(
+            model.diff.is_empty()
+                && model.artifacts.is_empty()
+                && model.artifact_content.is_empty()
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::Accepted {
+                session_id: "other".to_owned(),
+                run_id: "a".repeat(64),
+                idempotency_key: "other-key".to_owned(),
+            },
+        );
+        assert!(
+            model.transcript.is_empty()
+                && model.tools.is_empty()
+                && model.prompt.is_none()
+                && model.active_run.is_none()
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::NativeRun {
+                session_id: "current".to_owned(),
+                run_id: "b".repeat(64),
+                state: RunState::Completed,
+                turn: Some(1),
+                text: Some("current complete result".to_owned()),
+                revision: 4,
+            },
+        );
+        assert_eq!(model.pending_acks.len(), 1);
+        model.select_next();
+        assert_eq!(model.selected_session().expect("next session").id, "other");
+        assert!(
+            model.transcript.is_empty()
+                && model.active_run.is_none()
+                && model.pending_acks.is_empty()
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::Message {
+                session_id: "current".to_owned(),
+                message: TranscriptEntry {
+                    role: "assistant".to_owned(),
+                    text: "late previous event".to_owned(),
+                },
+            },
+        );
+        assert!(model.transcript.is_empty());
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::Message {
+                session_id: "other".to_owned(),
+                message: TranscriptEntry {
+                    role: "assistant".to_owned(),
+                    text: "current event".to_owned(),
+                },
+            },
+        );
+        assert_eq!(model.transcript.len(), 1);
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::Connection("reconnecting".to_owned()),
+        );
+        assert!(model.transcript.is_empty());
+    }
+
+    #[test]
+    fn partial_pages_preserve_unknown_state_and_never_enqueue_result_acknowledgements() {
+        use crate::{
+            gateway::{PartialPage, PartialPageRequest},
+            model::{RunState, SessionSummary},
+            partial_page_command,
+        };
+
+        let run_id = "a".repeat(64);
+        let mut model = AppModel {
+            connection_id: Some(1),
+            screen: Screen::Workspace,
+            sessions: vec![SessionSummary {
+                id: "selected".to_owned(),
+                state: RunState::OutcomeUnknown,
+                ..SessionSummary::default()
+            }],
+            active_run: Some(("selected".to_owned(), run_id.clone())),
+            active_run_version: Some((Some(2), 4)),
+            ..AppModel::default()
+        };
+        let (commands, mut queued) = tokio::sync::mpsc::channel(4);
+        partial_page_command(&mut model, &commands, false);
+        let first = PartialPageRequest {
+            session_id: "selected".to_owned(),
+            run_id,
+            revision: 4,
+            turn: 2,
+            state: RunState::OutcomeUnknown,
+            offset: 0,
+            total_bytes: None,
+            sha256: None,
+        };
+        assert_eq!(
+            queued.try_recv().expect("explicit read"),
+            UiCommand::ReadPartial(first.clone()).for_connection(1)
+        );
+        let page = PartialPage {
+            request: first,
+            text: "untrusted text".to_owned(),
+            end_offset: 14,
+            next_offset: Some(14),
+            total_bytes: 20,
+            sha256: "b".repeat(64),
+        };
+        apply_worker_event(&mut model, WorkerEvent::PartialPage(page.clone()));
+        apply_worker_event(&mut model, WorkerEvent::PartialPage(page));
+        assert_eq!(model.transcript.len(), 1);
+        assert!(model.transcript[0].role.starts_with("partial"));
+        assert_eq!(model.sessions[0].state, RunState::OutcomeUnknown);
+        assert!(model.pending_acks.is_empty() && model.received_results.is_empty());
+        partial_page_command(&mut model, &commands, true);
+        let expected = PartialPageRequest {
+            offset: 14,
+            total_bytes: Some(20),
+            sha256: Some("b".repeat(64)),
+            ..model.partial_page.as_ref().expect("cursor").request.clone()
+        };
+        assert_eq!(
+            queued.try_recv().expect("pinned continuation"),
+            UiCommand::ReadPartial(expected.clone()).for_connection(1)
+        );
+        let last = PartialPage {
+            request: expected,
+            text: "ending".to_owned(),
+            end_offset: 20,
+            next_offset: None,
+            total_bytes: 20,
+            sha256: "b".repeat(64),
+        };
+        model.active_run_version = Some((Some(2), 5));
+        apply_worker_event(&mut model, WorkerEvent::PartialPage(last.clone()));
+        assert_eq!(model.transcript.len(), 1);
+        model.active_run_version = Some((Some(2), 4));
+        apply_worker_event(&mut model, WorkerEvent::PartialPage(last.clone()));
+        assert_eq!(model.transcript.len(), 2);
+        partial_page_command(&mut model, &commands, true);
+        assert!(queued.try_recv().is_err());
+        assert!(model.pending_acks.is_empty());
+        model.clear_session_view();
+        apply_worker_event(&mut model, WorkerEvent::PartialPage(last));
+        assert!(model.transcript.is_empty() && model.partial_page.is_none());
+    }
+
+    #[test]
+    fn native_result_ack_queue_preserves_multiple_results_and_waits_for_workspace_render() {
+        use crate::{acknowledge_rendered_results, model};
+        use tokio::sync::mpsc;
+
+        let mut model = AppModel {
+            connection_id: Some(1),
+            sessions: vec![model::SessionSummary {
+                id: "selected".to_owned(),
+                ..model::SessionSummary::default()
+            }],
+            viewport: (100, 30),
+            ..AppModel::default()
+        };
+        for turn in [2, 1] {
+            apply_worker_event(
+                &mut model,
+                WorkerEvent::NativeRun {
+                    session_id: "selected".to_owned(),
+                    run_id: format!("{turn:064x}"),
+                    state: model::RunState::Completed,
+                    turn: Some(turn),
+                    text: Some("complete result shared text".to_owned()),
+                    revision: 4,
+                },
+            );
+        }
+        assert_eq!(model.pending_acks.len(), 2);
+        assert_eq!(model.transcript.len(), 2);
+        assert_eq!(
+            model
+                .active_run
+                .as_ref()
+                .expect("latest cancellation target")
+                .1,
+            format!("{:064x}", 2)
+        );
+        let (commands, mut receiver) = mpsc::channel(1);
+        acknowledge_rendered_results(&mut model, &commands);
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(model.pending_acks.len(), 2);
+        model.screen = Screen::Workspace;
+        model.viewport = (20, 5);
+        acknowledge_rendered_results(&mut model, &commands);
+        assert!(receiver.try_recv().is_err());
+        model.viewport = (100, 30);
+        acknowledge_rendered_results(&mut model, &commands);
+        assert_eq!(model.pending_acks.len(), 1);
+        assert_eq!(
+            receiver.try_recv().expect("first exact result ACK"),
+            UiCommand::AcknowledgeRun {
+                run_id: format!("{:064x}", 2),
+                revision: 4
+            }
+            .for_connection(1)
+        );
+        acknowledge_rendered_results(&mut model, &commands);
+        assert!(model.pending_acks.is_empty());
+        assert_eq!(
+            receiver.try_recv().expect("second exact result ACK"),
+            UiCommand::AcknowledgeRun {
+                run_id: format!("{:064x}", 1),
+                revision: 4
+            }
+            .for_connection(1)
+        );
+    }
+
+    #[test]
+    fn memory_drafts_are_session_bound_and_paste_never_submits_or_truncates() {
+        let mut model = AppModel {
+            connection_id: Some(1),
+            ..AppModel::default()
+        };
+        let (commands, mut queued) = tokio::sync::mpsc::channel(8);
+        crate::begin_memory(&mut model, &commands, "memory save Note fact 0");
+        let original = model
+            .selected_session()
+            .expect("original session")
+            .id
+            .clone();
+        let text = "line one\n!tool {}\n\u{4e2d}\u{6587}";
+        handle_input(&mut model, &Event::Paste(text.to_owned()), &commands);
+        assert_eq!(model.composer, text);
+        assert!(queued.try_recv().is_err());
+        handle_input(&mut model, &Event::Paste("x".repeat(8_192)), &commands);
+        assert_eq!(model.composer, text);
+        handle_input(&mut model, &Event::Paste("\u{1b}[2J".to_owned()), &commands);
+        assert_eq!(model.composer, text);
+        model.sessions.push(crate::model::SessionSummary {
+            id: "other-session".to_owned(),
+            ..crate::model::SessionSummary::default()
+        });
+        model.selected = 1;
+        model.clear_session_view();
+        assert!(!model.composer_open);
+        crate::begin_message(&mut model, false);
+        assert!(!model.composer_open);
+        crate::submit_message(&mut model, &commands);
+        assert!(queued.try_recv().is_err());
+        assert_eq!(model.composer, text);
+        model.selected = 0;
+        crate::begin_message(&mut model, false);
+        assert!(model.composer_open);
+        crate::submit_message(&mut model, &commands);
+        let UiCommand::ForConnection { command, .. } =
+            queued.try_recv().expect("original-session submit")
+        else {
+            panic!("connection envelope")
+        };
+        let UiCommand::InvokeMemory { session_id, .. } = *command else {
+            panic!("typed memory")
+        };
+        assert_eq!(session_id, original);
+    }
+
+    #[test]
+    fn memory_commands_validate_utf8_cursors_closed_archives_and_encoded_limits() {
+        use crate::gateway::{MemoryCommand, MemoryDraft};
+        for palette in [
+            "memory list",
+            "memory list 32 Note 9",
+            "memory get Note 4 2048",
+            "memory delete Note 0",
+            "memory export 0",
+            "memory export 4 4096",
+        ] {
+            let draft = MemoryDraft::parse(palette).expect("metadata command");
+            assert!(draft.finish("").is_ok());
+        }
+        for palette in [
+            "memory",
+            "memory list 0",
+            "memory list 33",
+            "memory list 1 Note",
+            "memory get Note 1 8193",
+            "memory delete Note -1",
+            "memory save _id fact 0",
+            "memory save id system 0",
+            "memory import 0 true",
+            "memory export 18446744073709551616",
+        ] {
+            assert!(MemoryDraft::parse(palette).is_err(), "{palette}");
+        }
+        let save = MemoryDraft::parse("memory save Note fact 0").expect("save");
+        let content = format!("{}ab", "\u{4e2d}".repeat(2_730));
+        assert_eq!(content.len(), 8_192);
+        assert!(save.finish(&content).is_ok());
+        assert!(save.finish(&format!("{content}x")).is_err());
+        assert!(save.finish(&"\\".repeat(8_192)).is_err());
+        assert!(save.finish("\u{1b}[2J").is_err());
+        assert!(save.finish(" \n ").is_err());
+        assert!(
+            MemoryDraft::parse("memory search 8")
+                .expect("search")
+                .finish(&"x".repeat(4_096))
+                .is_ok()
+        );
+        assert!(MemoryCommand::new(serde_json::json!({"action":"list","after":"Note"})).is_err());
+        assert!(
+            MemoryCommand::new(serde_json::json!({"action":"get","id":"Note","offset":1})).is_err()
+        );
+        assert!(
+            MemoryCommand::new(serde_json::json!({"action":"list","token":"never-a-parameter"}))
+                .is_err()
+        );
+        let import = MemoryDraft::parse("memory import 0 overwrite").expect("import");
+        assert!(
+            import
+                .finish(r#"{"schemaVersion":1,"notebook":{"revision":0,"entries":[]}}"#)
+                .is_ok()
+        );
+        for archive in [
+            r#"{"schemaVersion":1,"schemaVersion":1,"notebook":{"revision":0,"entries":[]}}"#,
+            r#"{"schemaVersion":2,"notebook":{"revision":0,"entries":[]}}"#,
+            r#"{"schemaVersion":1,"notebook":{"revision":0,"revision":0,"entries":[]}}"#,
+            r#"{"schemaVersion":1,"notebook":{"revision":0,"entries":[]},"extra":true}"#,
+            r#"{"schemaVersion":1,"notebook":{"revision":0,"entries":[{"id":"Note","kind":"fact","content":"note","sourceSession":"origin","revision":1}]}}"#,
+            r#"{"schemaVersion":1,"notebook":{"revision":1,"entries":[{"id":"Note","id":"Other","kind":"fact","content":"note","sourceSession":"origin","revision":1}]}}"#,
+        ] {
+            assert!(import.finish(archive).is_err());
+        }
+    }
+
+    #[test]
+    fn memory_palette_keeps_case_data_revisions_and_unknown_retry_identity() {
+        let mut model = AppModel {
+            connection_id: Some(1),
+            ..AppModel::default()
+        };
+        let (commands, mut queued) = tokio::sync::mpsc::channel(8);
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        model.palette_open = true;
+        model.palette = "memory save Mixed.Case preference 7".to_owned();
+        handle_input(&mut model, &enter, &commands);
+        assert!(model.memory_draft.is_some());
+        assert!(queued.try_recv().is_err());
+        model.composer = "retained note\n!goal {\"action\":\"create\"}".to_owned();
+        handle_input(&mut model, &enter, &commands);
+        let sent = queued.try_recv().expect("typed memory send");
+        let UiCommand::ForConnection { command, .. } = &sent else {
+            panic!("connection envelope")
+        };
+        let UiCommand::InvokeMemory {
+            command,
+            idempotency_key,
+            ..
+        } = command.as_ref()
+        else {
+            panic!("memory command")
+        };
+        let envelope: serde_json::Value = serde_json::from_str(
+            command
+                .message()
+                .strip_prefix("!tool ")
+                .expect("direct prefix"),
+        )
+        .expect("JSON");
+        assert_eq!(envelope["arguments"]["id"], "Mixed.Case");
+        assert_eq!(envelope["arguments"]["expectedRevision"], 7);
+        assert_eq!(
+            envelope["arguments"]["content"],
+            "retained note\n!goal {\"action\":\"create\"}"
+        );
+        assert_eq!(command.message().lines().count(), 1);
+        assert!(!format!("{sent:?}").contains("retained note"));
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::SendNotSent {
+                idempotency_key: idempotency_key.clone(),
+                reason: "unsupported".to_owned(),
+            },
+        );
+        assert!(
+            !model
+                .pending_message
+                .as_ref()
+                .expect("pending")
+                .may_have_been_sent
+        );
+        model.palette_open = true;
+        model.palette = "retry-send".to_owned();
+        handle_input(&mut model, &enter, &commands);
+        assert_eq!(queued.try_recv().expect("same typed retry"), sent);
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::SendUnconfirmed {
+                idempotency_key: idempotency_key.clone(),
+            },
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::SendNotSent {
+                idempotency_key: idempotency_key.clone(),
+                reason: "disabled".to_owned(),
+            },
+        );
+        assert!(
+            model
+                .pending_message
+                .as_ref()
+                .expect("pending")
+                .may_have_been_sent
+        );
+        model.palette_open = true;
+        model.palette = "discard-send".to_owned();
+        handle_input(&mut model, &enter, &commands);
+        assert!(model.pending_message.is_some());
+        assert!(queued.try_recv().is_err());
+    }
+
+    #[test]
+    fn native_message_input_preserves_draft_key_and_exact_run_cancellation() {
+        let mut model = crate::model::AppModel {
+            connection_id: Some(1),
+            ..crate::model::AppModel::default()
+        };
+        let (commands, mut queued) = tokio::sync::mpsc::channel(8);
+        let key = |code| {
+            crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            ))
+        };
+        crate::handle_input(
+            &mut model,
+            &key(crossterm::event::KeyCode::Char('c')),
+            &commands,
+        );
+        assert!(model.composer_open);
+        let session = model.selected_session().expect("draft session").id.clone();
+        model.composer = "retained user input".to_owned();
+        crate::apply_worker_event(
+            &mut model,
+            crate::gateway::WorkerEvent::Sessions(Vec::new()),
+        );
+        assert_eq!(
+            model.selected_session().expect("retained draft").id,
+            session
+        );
+        assert_eq!(model.composer, "retained user input");
+        crate::handle_input(
+            &mut model,
+            &key(crossterm::event::KeyCode::Enter),
+            &commands,
+        );
+        let sent = queued.try_recv().expect("one send");
+        let UiCommand::ForConnection {
+            connection_id: 1,
+            command,
+        } = &sent
+        else {
+            panic!("observed connection envelope");
+        };
+        let crate::gateway::UiCommand::SendMessage {
+            session_id,
+            text,
+            idempotency_key,
+        } = command.as_ref()
+        else {
+            panic!("send command");
+        };
+        assert_eq!(session_id, &session);
+        assert_eq!(text, "retained user input");
+        assert!(model.pending_message.is_some());
+        crate::apply_worker_event(
+            &mut model,
+            crate::gateway::WorkerEvent::SendUnconfirmed {
+                idempotency_key: idempotency_key.clone(),
+            },
+        );
+        model.palette_open = true;
+        model.palette = "retry-send".to_owned();
+        crate::handle_input(
+            &mut model,
+            &key(crossterm::event::KeyCode::Enter),
+            &commands,
+        );
+        assert_eq!(
+            queued.try_recv().expect("explicit original-key retry"),
+            sent
+        );
+        let run_id = "a".repeat(64);
+        crate::apply_worker_event(
+            &mut model,
+            crate::gateway::WorkerEvent::Accepted {
+                session_id: session.clone(),
+                run_id: run_id.clone(),
+                idempotency_key: idempotency_key.clone(),
+            },
+        );
+        assert!(model.pending_message.is_none());
+        assert_eq!(model.transcript.len(), 1);
+        crate::handle_input(
+            &mut model,
+            &key(crossterm::event::KeyCode::Char('x')),
+            &commands,
+        );
+        assert_eq!(
+            queued.try_recv().expect("exact cancellation"),
+            crate::gateway::UiCommand::AbortRun {
+                session_id: session.clone(),
+                run_id: run_id.clone()
+            }
+            .for_connection(1)
+        );
+        crate::apply_worker_event(
+            &mut model,
+            crate::gateway::WorkerEvent::NativeRun {
+                session_id: session.clone(),
+                run_id: run_id.clone(),
+                state: crate::model::RunState::Completed,
+                turn: Some(2),
+                text: Some("complete answer".to_owned()),
+                revision: 4,
+            },
+        );
+        crate::apply_worker_event(
+            &mut model,
+            crate::gateway::WorkerEvent::NativeRun {
+                session_id: session.clone(),
+                run_id: "b".repeat(64),
+                state: crate::model::RunState::Running,
+                turn: Some(1),
+                text: None,
+                revision: 9,
+            },
+        );
+        crate::apply_worker_event(
+            &mut model,
+            crate::gateway::WorkerEvent::NativeRun {
+                session_id: session.clone(),
+                run_id: run_id.clone(),
+                state: crate::model::RunState::Running,
+                turn: Some(2),
+                text: None,
+                revision: 2,
+            },
+        );
+        assert_eq!(model.active_run, Some((session, run_id.clone())));
+        assert_eq!(
+            model.selected_session().expect("selected session").state,
+            crate::model::RunState::Completed
+        );
+        assert_eq!(model.pending_acks, [(run_id, 4)]);
+        assert!(
+            queued.try_recv().is_err(),
+            "ACK cannot be queued before the render pass"
+        );
+    }
+
+    #[test]
+    fn native_tui_profile_option_is_explicit_bounded_and_not_repeatable() {
+        let base = [
+            "gta-claw-tui",
+            "--gateway",
+            "ws://127.0.0.1:18789",
+            "--device-profile",
+        ];
+        let valid = crate::Options::parse(
+            base.into_iter()
+                .chain(["work"])
+                .map(std::ffi::OsString::from),
+        )
+        .expect("explicit native profile");
+        assert_eq!(valid.device_profile.as_deref(), Some("work"));
+        for alias in ["", "../private", "with space"] {
+            assert!(
+                crate::Options::parse(
+                    base.into_iter()
+                        .chain([alias])
+                        .map(std::ffi::OsString::from)
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            crate::Options::parse(
+                base.into_iter()
+                    .chain(["work", "--device-profile", "other"])
+                    .map(std::ffi::OsString::from)
+            )
+            .is_err()
+        );
+    }
+
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
@@ -699,14 +2113,69 @@ mod tests {
     }
 
     #[test]
+    fn approval_requires_full_review_and_is_not_replaced_by_another_prompt() {
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(4);
+        let text = format!("{}\nfinal-parameter", "bounded line\n".repeat(40));
+        let mut model = AppModel {
+            connection_id: Some(1),
+            viewport: (60, 16),
+            ..AppModel::default()
+        };
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::Prompt(Prompt::Approval {
+                id: "first".to_owned(),
+                text,
+                preview_fingerprint: Some("a".repeat(64)),
+            }),
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::Prompt(Prompt::Approval {
+                id: "second".to_owned(),
+                text: "replacement".to_owned(),
+                preview_fingerprint: Some("b".repeat(64)),
+            }),
+        );
+        assert!(matches!(&model.prompt, Some(Prompt::Approval { id, .. }) if id == "first"));
+        let first = crate::render::render(&model, 60, 16, true).text();
+        assert!(!first.contains("final-parameter"));
+        handle_input(&mut model, &key(KeyCode::Char('y')), &commands);
+        assert!(
+            receiver.try_recv().is_err(),
+            "unseen parameters must not be approved"
+        );
+        for _ in 0..8 {
+            handle_input(&mut model, &key(KeyCode::PageDown), &commands);
+        }
+        let last = crate::render::render(&model, 60, 16, true).text();
+        assert!(last.contains("final-parameter"));
+        handle_input(&mut model, &key(KeyCode::Char('y')), &commands);
+        let UiCommand::ForConnection {
+            connection_id: 1,
+            command,
+        } = receiver.try_recv().expect("bound approval")
+        else {
+            panic!("approval lacks observed connection");
+        };
+        assert!(
+            matches!(*command, UiCommand::ResolveApproval { id, preview_fingerprint, .. } if id == "first" && preview_fingerprint == "a".repeat(64))
+        );
+        assert!(model.prompt.is_none());
+    }
+
+    #[test]
     fn a_busy_gateway_does_not_consume_an_approval() {
         let (commands, _receiver) = tokio::sync::mpsc::channel(1);
         commands.try_send(UiCommand::Refresh).expect("fill queue");
         let mut model = AppModel {
+            connection_id: Some(1),
             prompt: Some(Prompt::Approval {
                 id: "approval-1".to_owned(),
                 text: "Run tests?".to_owned(),
+                preview_fingerprint: Some("a".repeat(64)),
             }),
+            viewport: (100, 30),
             ..AppModel::default()
         };
         handle_input(&mut model, &key(KeyCode::Char('y')), &commands);
@@ -755,14 +2224,17 @@ mod tests {
         for index in 0..=MAX_TRANSCRIPT {
             apply_worker_event(
                 &mut model,
-                WorkerEvent::Message(TranscriptEntry {
-                    role: "assistant".to_owned(),
-                    text: if index == MAX_TRANSCRIPT {
-                        "x".repeat(20_000)
-                    } else {
-                        index.to_string()
+                WorkerEvent::Message {
+                    session_id: "0".to_owned(),
+                    message: TranscriptEntry {
+                        role: "assistant".to_owned(),
+                        text: if index == MAX_TRANSCRIPT {
+                            "x".repeat(20_000)
+                        } else {
+                            index.to_string()
+                        },
                     },
-                }),
+                },
             );
         }
         assert_eq!(model.transcript.len(), MAX_TRANSCRIPT);

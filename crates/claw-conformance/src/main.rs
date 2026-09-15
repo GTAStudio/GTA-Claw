@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use claw_conformance::{
-    ConformanceError, Contract, Registry, discover_claim_files, generate_report,
+    CANDIDATE_RELEASE, ConformanceError, Contract, Registry, ReleaseBaseline, discover_claim_files,
+    generate_report,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +23,7 @@ struct Arguments {
     contract_root: PathBuf,
     claim_files: Vec<PathBuf>,
     format: OutputFormat,
+    baselines_only: bool,
 }
 
 fn main() -> ExitCode {
@@ -47,6 +49,9 @@ fn run() -> Result<(), String> {
     let contract = Contract::load(&arguments.contract_root)
         .map_err(|error| conformance_error("contract load", &error))?;
     let repository_root = repository_root(&arguments.contract_root)?;
+    if arguments.baselines_only {
+        return print_baselines(&contract, &repository_root, arguments.format);
+    }
     let mut claim_files = discover_claim_files(&repository_root)
         .map_err(|error| conformance_error("claim discovery", &error))?;
     claim_files.extend(arguments.claim_files);
@@ -92,12 +97,49 @@ fn conformance_error(stage: &str, error: &ConformanceError) -> String {
     format!("{stage} failed [{}]: {error}", error.code().as_str())
 }
 
+fn print_baselines(
+    contract: &Contract,
+    repository: &Path,
+    format: OutputFormat,
+) -> Result<(), String> {
+    let candidate =
+        ReleaseBaseline::load(repository.join("compat/releases").join(CANDIDATE_RELEASE))
+            .map_err(|error| conformance_error("candidate metadata", &error))?;
+    if matches!(format, OutputFormat::Human | OutputFormat::Both) {
+        println!("Frozen contract: {}", contract.baseline_sha());
+        println!(
+            "Candidate metadata: {} ({}) Gateway v{}",
+            candidate.release_tag(),
+            candidate.commit_sha(),
+            candidate.gateway_version()
+        );
+        println!(
+            "Candidate contract, local signature verification and runtime acceptance: pending"
+        );
+    }
+    if matches!(format, OutputFormat::Json | OutputFormat::Both) {
+        let summary = serde_json::json!({
+            "schema_version": 1,
+            "frozen_contract": {"commit_sha": contract.baseline_sha()},
+            "candidate": candidate,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary)
+                .map_err(|error| format!("cannot serialize baseline summary: {error}"))?
+        );
+    }
+    Ok(())
+}
+
 fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {
     let mut contract_root = PathBuf::from("compat/upstream");
     let mut claim_files = Vec::new();
     let mut format = OutputFormat::Human;
+    let mut baselines_only = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--baselines" => baselines_only = true,
             "--root" => {
                 contract_root = PathBuf::from(
                     arguments
@@ -126,16 +168,20 @@ fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Argume
             _ => return Err(format!("unknown argument '{argument}'")),
         }
     }
+    if baselines_only && !claim_files.is_empty() {
+        return Err("--baselines cannot be combined with implementation claims".to_owned());
+    }
     Ok(Arguments {
         contract_root,
         claim_files,
         format,
+        baselines_only,
     })
 }
 
 fn print_usage() {
     println!(
-        "Usage: claw-conformance [--root compat/upstream] [--claims FILE]... [--format human|json|both]"
+        "Usage: claw-conformance [--root compat/upstream] [--claims FILE]... [--format human|json|both]\n       claw-conformance --baselines [--root compat/upstream] [--format human|json|both]"
     );
 }
 
@@ -159,6 +205,26 @@ fn repository_root(contract_root: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::{OutputFormat, parse_arguments};
+
+    #[test]
+    fn release_baseline_mode_is_explicit_and_cannot_consume_claims() {
+        let parsed =
+            parse_arguments(["--baselines".to_owned()].into_iter()).expect("parse baseline mode");
+        assert!(parsed.baselines_only);
+        assert!(
+            parse_arguments(
+                ["--baselines", "--claims", "claims.json"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_err()
+        );
+        assert!(
+            !parse_arguments(std::iter::empty())
+                .expect("defaults")
+                .baselines_only
+        );
+    }
 
     #[test]
     fn arguments_accept_multiple_claim_files() {
