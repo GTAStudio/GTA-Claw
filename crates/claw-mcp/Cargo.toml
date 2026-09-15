@@ -29,7 +29,7 @@ rmcp = { version = "=2.2.0", default-features = false, features = [
   "transport-streamable-http-client",
 ] }
 ring = "=0.17.14"
-rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "=0.8.4"
 process-wrap = { version = "=9.1.0", default-features = false, features = [
   "job-object",

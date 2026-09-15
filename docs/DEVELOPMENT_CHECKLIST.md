@@ -128,6 +128,7 @@
 | M5-01 / M5-08 | TUI原生profile、发送/精确取消、多结果ACK、双游标恢复、连接代号拒旧、会话视图隔离、宽字符布局和明确unknown | onboarding、完整流式/快照协调、平台用户验收 |
 | M6-07 | Rust CLI有界只读OpenClaw预览、8项分页、指纹续页、容器识别/秘密内容排除；已有JSON/JSON5深度64/节点16384预算及重复键/非有限值拒绝 | 精确版本/schema、外部根/includes、SQLite/WAL一致快照和导入 |
 | M5-02 / M5-03 / M5-08 | Slint OS profile、历史版本/epoch 拒旧、结果恢复/精确停止/完整审批；unknown独立终态、durable结果及精确ACK revision、旧/非当前会话结果拒ACK | 原生设置/信任、完整流式/展示恢复协调和真实用户/平台验收 |
+| M1 / M6 依赖安全 | Node九类告警依赖及实际内嵌CSV、Restify/Node26兼容修复；JWT10.3+既有ring RS256和19签名夹具；rustls0.23.45/Wasmtime47.0.4；六包828通过/6忽略、严格lint/根check、Node31断言及两类audit零漏洞 | GitHub推送后待复查；cargo-deny既有违规及新增signature双版本未放行，原生OAuth联合失败保留且根因未修复；非发布/实号/设备验收，见[依赖安全记录](ledger/native-dependency-security-20260915.json) |
 | M6 发布 | 没有发布或切换 | 受保护策略/打包器仍锁定 Rust 1.97.1；开发已为 1.98.1，需审查升级，不能改 validator 放行 |
 
 ## OpenClaw / Hermes 差距追踪

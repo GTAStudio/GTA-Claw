@@ -2801,3 +2801,36 @@ receipt. TUI usage/cost views, full export/archive, desktop parity, real interac
 acceptance and prior native credential anomalies remain open. Dependencies, lock, inventory and
 checklist completion marks are unchanged. No production/proxy, user-state migration, Git, deployment
 or real-account action occurred.
+
+## Dependency Security, 2026-09-15
+
+The [dependency record](native-dependency-security-20260915.json) starts from public main
+`9840094c853951bf9ee540dcf24ef01fdab064f5` and a clean worktree. A fresh GitHub query confirmed
+41 open alerts: 39 npm records and two copies of the same Rust JWT advisory. The final local npm
+audit and RustSec audit report zero vulnerabilities. Six affected Rust packages pass 828 tests,
+with six existing ignored entries, strict all-target Clippy and a root workspace all-target check.
+This is not release acceptance: cargo-deny bans still fail on existing dependency-policy debt and
+the JWT library's additional signature 2.x line. No policy exceptions or advisory ignores were added.
+
+Retained Node dependencies now resolve patched versions, including find-my-way 9.7.0. Real execution
+also required Restify 12: version 11 eagerly imported SPDY code using Node 26's removed http_parser.
+An audit-zero tree still failed the CSV prototype test because csv 6.4.1 embeds its own old CommonJS
+parser; csv 6.6.3 fixes the actual path. The persistent
+[legacy regression script](../../scripts/check-legacy-dependencies.ps1) compiles the real service and
+checks 31 assertions on owned HTTP/HTTP2 listeners, parser safety, UUID compatibility, Axios and
+admin rejection. Clean offline npm installation uses no lifecycle scripts. An official checksum-checked
+Node 26.8.2 is isolated under ignored target; the installed global Node and production proxy are untouched.
+
+Teams JWT verification now uses jsonwebtoken 10.3.0's corrected claim validation with existing ring
+RS256 verification only. A trial all-algorithm RustCrypto backend was rejected after audit exposed its
+unpatched RSA side-channel dependency. Nineteen genuinely signed fixtures plus key/signature/activity
+negative tests preserve optional absent nbf, reject malformed claims, and retain issuer, audience,
+expiry, endorsement and service-URL checks. No private signing key is stored. rustls 0.23.45 and
+Wasmtime 47.0.4 also fix additional live RustSec findings. Three independent workspace locks retain only
+the corresponding TLS package changes and pass locked target dependency resolution, not device builds.
+
+The initial combined regression reproduced the existing native OAuth lost-response/readback anomaly.
+Its unchanged isolated test and final combined cohort passed, but all three results remain distinct;
+there is no claimed credential root-cause fix. GitHub closure must be checked after main publication.
+Real accounts, device and native-addon validation, complete supply-chain policy and release gates
+remain open. No deployment, paid request, production proxy restart or user-state migration occurred.

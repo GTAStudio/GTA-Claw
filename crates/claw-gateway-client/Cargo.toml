@@ -15,7 +15,7 @@ claw-security.workspace = true
 fastwebsockets = { version = "=0.10.0", default-features = false, features = ["unstable-split"] }
 httparse = "=1.10.1"
 ring = "=0.17.14"
-rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "=0.8.4"
 secrecy = "=0.10.3"
 serde.workspace = true

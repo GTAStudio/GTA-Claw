@@ -421,6 +421,103 @@ struct TeamsClaims {
     serviceurl: String,
 }
 
+struct TeamsRsaVerifier {
+    modulus: Vec<u8>,
+    exponent: Vec<u8>,
+}
+
+impl jsonwebtoken::signature::Verifier<Vec<u8>> for TeamsRsaVerifier {
+    fn verify(
+        &self,
+        message: &[u8],
+        signature: &Vec<u8>,
+    ) -> Result<(), jsonwebtoken::signature::Error> {
+        ring::signature::RsaPublicKeyComponents {
+            n: &self.modulus,
+            e: &self.exponent,
+        }
+        .verify(
+            &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+            message,
+            signature,
+        )
+        .map_err(|_| jsonwebtoken::signature::Error::new())
+    }
+}
+
+impl jsonwebtoken::crypto::JwtVerifier for TeamsRsaVerifier {
+    fn algorithm(&self) -> Algorithm {
+        Algorithm::RS256
+    }
+}
+
+static TEAMS_JWT_PROVIDER: jsonwebtoken::crypto::CryptoProvider =
+    jsonwebtoken::crypto::CryptoProvider {
+        signer_factory: |_, _| Err(jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into()),
+        verifier_factory: |algorithm, key| {
+            if *algorithm != Algorithm::RS256 || key.family() != jsonwebtoken::AlgorithmFamily::Rsa
+            {
+                return Err(jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into());
+            }
+            let jsonwebtoken::DecodingKeyKind::RsaModulusExponent {
+                n: modulus,
+                e: exponent,
+            } = key.kind()
+            else {
+                return Err(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat.into());
+            };
+            Ok(Box::new(TeamsRsaVerifier {
+                modulus: modulus.clone(),
+                exponent: exponent.clone(),
+            }))
+        },
+        jwk_utils: jsonwebtoken::crypto::JwkUtils::new_unimplemented(),
+    };
+
+fn verify_teams_token(
+    token: &str,
+    app_id: &str,
+    issuer: &str,
+    key: &TeamsRsaKey,
+    activity: &Value,
+) -> Result<(), PortError> {
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !INSTALLED.get_or_init(|| TEAMS_JWT_PROVIDER.install_default().is_ok()) {
+        return Err(invalid("Teams JWT crypto provider is unavailable"));
+    }
+    let decoding_key = DecodingKey::from_rsa_components(&key.modulus, &key.exponent)
+        .map_err(|_| invalid("Teams signing key is invalid"))?;
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_audience(&[app_id]);
+    validation.set_issuer(&[issuer]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+    validation.validate_nbf = true;
+    validation.leeway = 60;
+    let claims = decode::<TeamsClaims>(token, &decoding_key, &validation)
+        .map_err(|_| invalid("Teams bearer token verification failed"))?
+        .claims;
+    if activity.get("channelId").and_then(Value::as_str) != Some("msteams") {
+        return Err(invalid("Teams activity channel is not msteams"));
+    }
+    if !key
+        .endorsements
+        .iter()
+        .any(|endorsement| endorsement == "msteams")
+    {
+        return Err(invalid("Teams signing key is not endorsed for msteams"));
+    }
+    let service_url = activity
+        .get("serviceUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("Teams activity has no service URL"))?;
+    if claims.serviceurl.trim_end_matches('/') != service_url.trim_end_matches('/') {
+        return Err(invalid(
+            "Teams bearer token service URL does not match the activity",
+        ));
+    }
+    Ok(())
+}
+
 impl LegacyTeamsAdapter {
     /// Creates a Teams activity adapter.
     ///
@@ -869,37 +966,7 @@ impl LegacyTeamsAdapter {
             .as_deref()
             .ok_or_else(|| invalid("Teams bearer token key id is missing"))?;
         let (issuer, key) = self.teams_signing_key(key_id, cancellation).await?;
-        let decoding_key = DecodingKey::from_rsa_components(&key.modulus, &key.exponent)
-            .map_err(|_| invalid("Teams signing key is invalid"))?;
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.set_audience(&[self.app_id.as_str()]);
-        validation.set_issuer(&[issuer.as_str()]);
-        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
-        validation.validate_nbf = true;
-        validation.leeway = 60;
-        let claims = decode::<TeamsClaims>(token, &decoding_key, &validation)
-            .map_err(|_| invalid("Teams bearer token verification failed"))?
-            .claims;
-        if activity.get("channelId").and_then(Value::as_str) != Some("msteams") {
-            return Err(invalid("Teams activity channel is not msteams"));
-        }
-        if !key
-            .endorsements
-            .iter()
-            .any(|endorsement| endorsement == "msteams")
-        {
-            return Err(invalid("Teams signing key is not endorsed for msteams"));
-        }
-        let service_url = activity
-            .get("serviceUrl")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid("Teams activity has no service URL"))?;
-        if claims.serviceurl.trim_end_matches('/') != service_url.trim_end_matches('/') {
-            return Err(invalid(
-                "Teams bearer token service URL does not match the activity",
-            ));
-        }
-        Ok(())
+        verify_teams_token(token, &self.app_id, &issuer, &key, activity)
     }
 
     async fn teams_signing_key(
@@ -3504,6 +3571,118 @@ mod tests {
         .expect("completed replay is acknowledged");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn teams_jwt_signed_claims_and_activity_bindings_fail_closed() {
+        #[derive(serde::Deserialize)]
+        struct SignedCase {
+            name: String,
+            payload: String,
+            signature: String,
+            accepted: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            modulus: String,
+            exponent: String,
+            header: String,
+            cases: Vec<SignedCase>,
+        }
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../../tests/fixtures/teams-jwt.json"))
+                .expect("public signed fixtures");
+        assert_eq!(fixture.cases.len(), 19);
+        let key = TeamsRsaKey {
+            modulus: fixture.modulus,
+            exponent: fixture.exponent,
+            endorsements: vec!["msteams".to_owned()],
+        };
+        let activity = serde_json::json!({
+            "channelId": "msteams",
+            "serviceUrl": "https://service.example.test/",
+        });
+        let verify = |token: &str, key: &TeamsRsaKey, activity: &serde_json::Value| {
+            super::verify_teams_token(
+                token,
+                "teams-fixture",
+                "https://issuer.example.test",
+                key,
+                activity,
+            )
+        };
+        for case in &fixture.cases {
+            let token = format!("{}.{}.{}", fixture.header, case.payload, case.signature);
+            let result = verify(&token, &key, &activity);
+            assert_eq!(
+                result.is_ok(),
+                case.accepted,
+                "case {}: {result:?}",
+                case.name
+            );
+        }
+        let valid = &fixture.cases[0];
+        let token = format!("{}.{}.{}", fixture.header, valid.payload, valid.signature);
+        let mut tampered = token.clone();
+        let signature_start = fixture.header.len() + valid.payload.len() + 2;
+        tampered.replace_range(signature_start..=signature_start, "A");
+        assert_ne!(tampered, token);
+        assert!(verify(&tampered, &key, &activity).is_err());
+        let mut changed = key.clone();
+        changed.modulus = "AQAB".to_owned();
+        assert!(verify(&token, &changed, &activity).is_err());
+        changed = key.clone();
+        changed.endorsements.clear();
+        assert!(verify(&token, &changed, &activity).is_err());
+        for activity in [
+            serde_json::json!({"channelId": "other", "serviceUrl": "https://service.example.test"}),
+            serde_json::json!({"channelId": "msteams", "serviceUrl": "https://other.example.test"}),
+            serde_json::json!({"channelId": "msteams"}),
+        ] {
+            assert!(verify(&token, &key, &activity).is_err());
+        }
+        let wrong_algorithm = format!(
+            "eyJhbGciOiJIUzI1NiIsImtpZCI6InRlc3Qtb25seSJ9.{}.{}",
+            valid.payload, valid.signature,
+        );
+        assert!(verify(&wrong_algorithm, &key, &activity).is_err());
+    }
+
+    #[test]
+    fn teams_jwt_backend_rejects_other_algorithms_and_key_types() {
+        let key = jsonwebtoken::DecodingKey::from_rsa_raw_components(&[1; 256], &[1, 0, 1]);
+        for algorithm in [
+            jsonwebtoken::Algorithm::HS256,
+            jsonwebtoken::Algorithm::RS384,
+            jsonwebtoken::Algorithm::PS256,
+            jsonwebtoken::Algorithm::EdDSA,
+        ] {
+            assert!((super::TEAMS_JWT_PROVIDER.verifier_factory)(&algorithm, &key).is_err());
+        }
+        let verifier =
+            (super::TEAMS_JWT_PROVIDER.verifier_factory)(&jsonwebtoken::Algorithm::RS256, &key)
+                .expect("RS256 component verifier");
+        assert_eq!(verifier.algorithm(), jsonwebtoken::Algorithm::RS256);
+        assert!(verifier.verify(b"untrusted", &vec![0; 256]).is_err());
+        for key in [
+            jsonwebtoken::DecodingKey::from_secret(b"not-an-rsa-key"),
+            jsonwebtoken::DecodingKey::from_rsa_der(&[1; 256]),
+        ] {
+            assert!(
+                (super::TEAMS_JWT_PROVIDER.verifier_factory)(
+                    &jsonwebtoken::Algorithm::RS256,
+                    &key,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            (super::TEAMS_JWT_PROVIDER.signer_factory)(
+                &jsonwebtoken::Algorithm::RS256,
+                &jsonwebtoken::EncodingKey::from_rsa_der(&[1; 256]),
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-and-retained-node-dependency-security",
+  "capturedOn": "2026-09-15",
+  "baseCommit": "9840094c853951bf9ee540dcf24ef01fdab064f5",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "initialGitHubAlerts": { "open": 41, "high": 14, "medium": 26, "low": 1, "npm": 39, "rust": 2 },
+  "githubRecheck": "Pending publication; local audit results are not GitHub closure evidence",
+  "sourceFiles": [
+    { "path": "package.json", "sha256": "50580874c0d6cf0482ea8a398485b14eb19420818dc603d81a07ea69166fcf51" },
+    { "path": "package-lock.json", "sha256": "47ef03c3b3b97eed42631efff617c72b20215cf1b00133bb5291bf784b3dc9ea" },
+    { "path": "apps/gta-claw-daemon/Cargo.toml", "sha256": "0d62a7d3d9710aa40499f12e128e8d47ec4c966170f2bb26115ec5e1d9d47f63" },
+    { "path": "apps/gta-claw-daemon/src/adapters/legacy.rs", "sha256": "ff463a5c98ba2f7cad4a295129cf2eec8cbf08639eb2049423357a6f0d3bf6c2" },
+    { "path": "apps/gta-claw-daemon/tests/fixtures/teams-jwt.json", "sha256": "63952226c8543a1386a546b1c47f664c4ed23d985a8b6906939ad0bfee702936" },
+    { "path": "scripts/check-legacy-dependencies.ps1", "sha256": "c15027e5ba06a9613d751d33d83e378c876bcdb7448cf5ab2342fa063f898a39" }
+  ],
+  "cargoLockSha256": "7460323a924655a77c0c4fec247dd1635d72d7b358b889359e86aaf12100f674",
+  "resolvedNpm": {
+    "restify": "12.0.0", "find-my-way": "9.7.0", "axios": "1.20.0",
+    "ws": ["7.5.13", "8.21.3"], "form-data": "4.0.6", "lodash": "4.18.1",
+    "qs": "6.16.0", "csv": "6.6.3", "csv-parse": "7.0.2", "uuid": "11.1.1",
+    "follow-redirects": "1.16.0", "send": "1.2.1"
+  },
+  "resolvedRust": {
+    "jsonwebtoken": "10.3.0", "jwtBackend": "Existing ring 0.17.14, RS256 verification only",
+    "rustls": "0.23.45", "rustls-webpki": "0.103.15", "wasmtime": "47.0.4"
+  },
+  "checks": [
+    {
+      "command": "cargo +stable test -p gta-claw-daemon -p claw-plugin-host -p claw-provider-sdk -p claw-mcp -p claw-gateway-client -p gta-claw-updater --all-targets --no-fail-fast --locked --offline -j 2",
+      "result": "passed", "passed": 828, "failed": 0, "ignored": 6, "testBinaries": 42,
+      "log": "target/security-rust-full-20260915.log",
+      "sha256": "eef7b64453a442b074312633cda318de0b8c72b873d238086a40aa255ad6a93f"
+    },
+    {
+      "command": "cargo +stable clippy -p gta-claw-daemon -p claw-plugin-host -p claw-provider-sdk -p claw-mcp -p claw-gateway-client -p gta-claw-updater --all-targets --locked --offline -j 2 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/security-clippy-20260915.log",
+      "sha256": "7c0c42d1ef4b0be13339afc690400d3a8a2910857a3d64b708f86ab75e50ed1e"
+    },
+    {
+      "command": "cargo +stable check --workspace --all-targets --locked --offline -j 2",
+      "result": "passed", "exitCode": 0, "log": "target/security-root-check-20260915.log"
+    },
+    {
+      "command": "./scripts/check-legacy-dependencies.ps1 -NodePath ./target/security-node-runtime/node-v26.8.2-win-x64/node.exe",
+      "result": "passed", "assertions": 31, "node": "26.8.2", "npm": "11.19.1",
+      "scopeNote": "TypeScript build, real retained server routes and denied admin calls, CommonJS CSV prototype regression, UUID bounds, Axios, HTTP/2 inherited method names"
+    },
+    { "command": "npm ci --offline --ignore-scripts --no-audit --no-fund", "result": "passed", "scopeNote": "Executed using verified isolated Node 26/npm 11, followed by the same runtime checks" },
+    { "command": "npm audit --json", "result": "passed", "vulnerabilities": 0, "scopeNote": "Final full installed dependency tree, registry access via 127.0.0.1:2080" },
+    { "command": "cargo +stable audit --no-fetch", "result": "passed", "vulnerabilities": 0, "dependencies": 499, "advisoryDatabaseCommit": "e2e640471715167f73e22eaf761f2e547adafeec" },
+    { "command": "cargo +stable tree --manifest-path <desktop|android|ios>/Cargo.toml -i rustls --locked --target <platform>", "result": "passed", "scopeNote": "Three actual target-specific invocations; only rustls and webpki lock tables changed. Missing mobile source caches fetched through proxy, no mobile build or device validation" },
+    { "command": "cargo +stable deny --offline --locked check bans", "result": "failed", "scopeNote": "Existing duplicate const-oid, curve25519-dalek, fiat-crypto, getrandom, hybrid-array, r-efi, rand, rand_chacha, rand_core, sha1, toml and TUI wildcard; JWT adds signature 2.2 alongside existing 3.0. No ignore or policy change. JWT 11.0 still uses signature 2.2, so no unrelated major upgrade was applied" }
+  ],
+  "retainedFailures": [
+    {
+      "log": "target/security-rust-tests-20260915.log",
+      "sha256": "83299047b15d963525769b4b511f53ee903d79e4b5d772810fa63f0f82c6669a",
+      "reason": "Unmodified native_oauth_lost_response_survives_client_reopen_without_reusing_old_credentials failed grant-type and new-authorization expectations during initial combined regression; root cause unresolved"
+    },
+    {
+      "log": "target/security-oauth-isolated-20260915.log",
+      "sha256": "d2270823b1d6ce90cf483004e556cf5c24575d19477fab0f2f81a57df482448d",
+      "reason": "Unmodified isolated OAuth rerun passed; neither it nor the final combined pass establishes a credential-storage fix"
+    },
+    { "reason": "Node 26 runtime initially failed importing Restify 11 through spdy/http-deceiver and removed private http_parser; fixed by official Restify 12, not a shim or downgraded runtime" },
+    { "reason": "Updating csv-parse alone produced audit zero but the same prototype test still failed through csv 6.4.1's embedded CommonJS parser; updating csv to 6.6.3 fixed the actual path" },
+    { "reason": "Trial JWT rust_crypto backend introduced rsa 0.9.10/RUSTSEC-2023-0071; removed in favor of existing ring public-key verification, not ignored" },
+    { "reason": "New signed fixture initially incorrectly expected nbf=1.5 to fail; checked library NumericDate parsing and corrected only that positive expectation. String/null/boolean/object/array/negative and future cases still fail" },
+    { "reason": "Fixed local API visibility and PowerShell argument quoting defects before final checks; original outputs remain in session history" }
+  ],
+  "notes": [
+    "Two GitHub JWT records share GHSA-h395-gr6q-cpjc. Actual Teams code enables optional nbf validation and is affected; patched claim logic is exercised with 19 genuinely RS256-signed public fixtures plus signature/key/issuer/audience/endorsement/channel/service-URL rejection",
+    "Only public key components and synthetic payload/signature data are retained; fixture signing key was generated in memory and discarded. No production credential was read or uploaded",
+    "JWT provider permits only ring RSA_PKCS1_2048_8192_SHA256 verification, rejects all signing and other algorithms/key kinds, and fails closed on incompatible process-default initialization. No insecure decode or disabled validation",
+    "Additional live RustSec audit found rustls and four Wasmtime advisories beyond GitHub's initial two Rust records. Existing no-WASI and no-preemption feature scope limits some exploit paths but all were patched without suppressions",
+    "Official Node 26.8.2 ZIP SHA256 cf02f5d0c06c794b84f277177d5cf3743d0924ca49f6641cd435dd7cb6ee9085 verified against upstream checksum over the existing proxy. Isolated ignored runtime only; no global toolchain or proxy change",
+    "Downloads used 127.0.0.1:2080; npm lifecycle scripts were disabled. Tests used owned loopback services and unique native credential fixtures, not paid accounts or deployed services",
+    "Protected historical supply-chain fixtures, deny policies, original inventories and production programs are unchanged. Audit-zero is not proof of whole-product security or release eligibility"
+  ],
+  "unverified": [
+    "Supply-chain bans including newly required signature major-version coexistence need separate resolution; no release-gate pass is claimed",
+    "Intermittent native credential/OAuth failures remain unresolved and the initial joint failure is retained",
+    "Real Teams/cloud accounts, native npm addon lifecycle builds, mobile/other-platform builds and user workflows",
+    "GitHub alert refresh after main publication, release qualification and whole-project acceptance"
+  ]
+}
