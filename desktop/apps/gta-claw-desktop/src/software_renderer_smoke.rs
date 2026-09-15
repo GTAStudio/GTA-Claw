@@ -140,6 +140,90 @@ fn tab_until_connection_action(
 }
 
 #[test]
+fn native_accounting_renders_from_bound_state_at_narrow_and_wide_sizes() {
+    let software_window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+    slint::platform::set_platform(Box::new(SoftwarePlatform {
+        window: software_window.clone(),
+        started: Instant::now(),
+    }))
+    .expect("isolated accounting renderer");
+    let app = AppWindow::new().expect("native accounting component tree");
+    let view = crate::ProductView::attach(&app, crate::product_state::ProductState::native())
+        .expect("native view");
+    let connection = crate::controller::ProductConnection {
+        generation: 0,
+        epoch: 1,
+    };
+    view.state
+        .borrow_mut()
+        .apply_native(crate::controller::ProductUpdate::Ready { connection });
+    app.set_workspace_ready(true);
+    app.set_selected_screen(7);
+    app.show().expect("headless accounting tree");
+    for (index, scenario) in ["missing", "zero", "journal"].into_iter().enumerate() {
+        let mut accounting = serde_json::json!({
+            "available":true,"recordedRounds":1,"completeCounterRounds":1,
+            "partialCounterRounds":0,"unreportedRounds":0,"allPrimaryCountersReported":true,
+            "observedTokens":{"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0},
+            "aggregationOverflow":false,"costCalculated":false,"billingReconciled":false,
+            "recordSource":"terminal_turn","attemptsMayBeUnsent":true,
+        });
+        if scenario == "missing" {
+            accounting = serde_json::Value::Null;
+        } else if scenario == "journal" {
+            accounting["recordSource"] = serde_json::json!("provider_journal");
+            accounting["journalRevision"] = serde_json::json!(2);
+            accounting["journalClosed"] = serde_json::json!(false);
+            accounting["completeCounterRounds"] = serde_json::json!(0);
+            accounting["partialCounterRounds"] = serde_json::json!(1);
+            accounting["allPrimaryCountersReported"] = serde_json::json!(false);
+        }
+        let run = format!("{index:064x}");
+        view.state.borrow_mut().apply_native(crate::controller::ProductUpdate::Response {
+            connection, method: "agent.wait", params: serde_json::json!({"runId":run}),
+            payload: serde_json::json!({"runId":run,"sessionId":"native-session","phase":"outcome_unknown","status":"outcome_unknown","turn":index+1,"revision":4,"durable":true,"result":{"status":"outcome_unknown","text":"Retained run status"},"providerAccounting":accounting}),
+        });
+        let expected = view.state.borrow().accounting_summary();
+        assert!(expected.contains("Billing: unreconciled"));
+        if scenario == "missing" {
+            assert!(expected.contains("Tokens: unknown"));
+        } else if scenario == "zero" {
+            assert!(expected.contains("Tokens (complete): 0"));
+        } else {
+            assert!(expected.contains("Tokens (partial): 0"));
+            assert!(expected.contains("journal r2 (open)"));
+        }
+        for (width, height) in [(1080_u16, 720_u16), (720, 520)] {
+            app.set_layout_width(f32::from(width));
+            software_window.set_size(slint::PhysicalSize::new(
+                u32::from(width),
+                u32::from(height),
+            ));
+            app.set_provider_accounting("".into());
+            let empty = render(&software_window, usize::from(width), usize::from(height));
+            view.apply(&app);
+            assert_eq!(app.get_provider_accounting().as_str(), expected);
+            let populated = render(&software_window, usize::from(width), usize::from(height));
+            assert!(
+                changed_pixel_count(&empty, &populated) > 1_000,
+                "{scenario} {width}x{height}"
+            );
+            assert!(
+                populated
+                    .iter()
+                    .filter(|pixel| **pixel != RgbPixel::default())
+                    .count()
+                    > 10_000
+            );
+        }
+    }
+    view.state.borrow_mut().native_unavailable();
+    view.apply(&app);
+    assert!(app.get_provider_accounting().is_empty());
+    app.hide().expect("hide software accounting tree");
+}
+
+#[test]
 fn native_memory_form_renders_at_narrow_and_wide_sizes_and_closes_on_binding_change() {
     let software_window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
     slint::platform::set_platform(Box::new(SoftwarePlatform {

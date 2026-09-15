@@ -535,7 +535,70 @@ fn transcript_rows(model: &AppModel, columns: usize) -> Vec<String> {
         .transcript
         .iter()
         .flat_map(|entry| wrap_columns(&format!("{}: {}", entry.role, entry.text), columns))
+        .chain(
+            accounting_lines(model)
+                .iter()
+                .flat_map(|line| wrap_columns(line, columns)),
+        )
         .collect()
+}
+
+fn accounting_lines(model: &AppModel) -> Vec<String> {
+    use claw_protocol::native_accounting::{AccountingSource, CounterCoverage};
+    let Some((_, run_id)) = &model.active_run else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!("Usage - {run_id}")];
+    if let Some(accounting) = &model.provider_accounting {
+        let coverage = match accounting.coverage {
+            CounterCoverage::NoRounds => "no recorded attempts",
+            CounterCoverage::Unreported => "unreported",
+            CounterCoverage::Partial => "partial",
+            CounterCoverage::Complete => "complete",
+            CounterCoverage::Overflow => "aggregate overflow",
+        };
+        if let Some(tokens) = accounting.observed_tokens
+            && matches!(
+                accounting.coverage,
+                CounterCoverage::Partial | CounterCoverage::Complete
+            )
+        {
+            lines.push(format!(
+                "Tokens ({coverage}): {} [input {}, output {}]",
+                tokens.total_tokens, tokens.input_tokens, tokens.output_tokens
+            ));
+            lines.push(format!(
+                "Included subsets ({coverage}): cached {}, reasoning {}",
+                tokens.cached_input_tokens, tokens.reasoning_tokens
+            ));
+        } else {
+            lines.push(format!("Tokens: unknown ({coverage})"));
+        }
+        lines.push(format!(
+            "Rounds: {} [complete {}, partial {}, unreported {}]",
+            accounting.recorded_rounds,
+            accounting.complete_counter_rounds,
+            accounting.partial_counter_rounds,
+            accounting.unreported_rounds
+        ));
+        lines.push(match accounting.source {
+            AccountingSource::Unspecified => "Source: not reported".to_owned(),
+            AccountingSource::TerminalTurn => "Source: terminal turn".to_owned(),
+            AccountingSource::ProviderJournal { revision, closed } => format!(
+                "Source: journal r{revision} ({})",
+                if closed { "closed" } else { "open" }
+            ),
+        });
+        if accounting.attempts_may_be_unsent == Some(true) {
+            lines.push("Attempts may include unsent intents".to_owned());
+        }
+    } else {
+        lines.push("Tokens: unknown (accounting unavailable)".to_owned());
+        lines.push("Source: not reported".to_owned());
+    }
+    lines.push("Cost: uncalculated".to_owned());
+    lines.push("Billing: unreconciled".to_owned());
+    lines
 }
 
 pub(crate) fn transcript_row_count(model: &AppModel) -> usize {

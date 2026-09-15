@@ -117,6 +117,7 @@
 | M3-08 | 可选maxObservedTurnTokens启动门槛，完整已观察主计数达到阈值或未知/溢出不再调用下一轮；真实默认/零/正值Gateway与幂等，475通过/4忽略、严格lint及根check | 不是单请求硬限额/货币预算，不回滚已批准工具，不覆盖HTTP/全局配额；全部旧异常未关闭；见[观察门槛记录](ledger/native-observed-budget-20260915.json) |
 | M3-05 / M3-08 / M5-01 | CLI export-partial固定身份/epoch收集有界页并验全文SHA后create-new写明文；不ACK/重放/覆盖，七种实际子进程场景，CLI95通过/1忽略及严格lint | 非atomic rename，本地I/O失败可留文件；TUI/桌面、加密partial、续传/持续保存及旧异常仍开放；见[完整导出记录](ledger/native-partial-export-20260915.json) |
 | M3-08 / M5-01 | TUI partial/partial-next固定连接与选中run终态逐页查看，旧游标拒绝/不新增ACK；七种真实WebSocket与窄宽渲染，全目标66通过/0忽略及严格lint | 续页只固定全文摘要非独立全文校验，有界transcript非归档；费用/桌面/实机与旧异常仍开放；见[TUI部分页记录](ledger/native-tui-partial-20260915.json) |
+| M3-08 / M5-01 / M5-02 | TUI和Slint接入已有providerAccounting，共用有界协议模型；区分缺失/未报/部分/明确零值/溢出、终态与日志来源和未结算费用；九种真实WebSocket、七种桌面状态及多尺寸软件像素，protocol/TUI138与桌面86通过、严格lint/根check | 非货币硬限额/已结算账单，桌面完整partial导出、模型配置生命周期、实号/交互平台与旧凭据异常仍开放；见[客户端用量记录](ledger/native-accounting-clients-20260915.json) |
 | M4-01 / M4-02 | 显式memory_notes接入模型/HTTP/MCP统一审批审计；身份分区、CAS保存/纠正/删除、分页/UTF-8游标、关键词跨会话召回；实际双设备模型夹具及两次重启验证 | 语义/自动召回、完整客户端/来源/备份遗忘、完整磁盘配额与真实模型账号；见[显式记忆记录](ledger/native-explicit-memory-20260914.json) |
 | M4-02 / M5-01 / M5-08 | CLI七种记忆动作使用持久设备与health能力预检；原生直接工具回合零模型请求、绑定审批/持久结果/幂等；固定revision摘要导出页、原子CAS导入、结构化stdin凭据分离；相关四包535测试通过 | 大归档分阶段导入/本地自动收集、TUI/Slint专用管理、语义与全历史/备份遗忘仍开放；见[记忆客户端记录](ledger/native-memory-client-20260914.json) |
 | M1-06 / M2-07 / M4-02 | 记忆全库256个持久笔记本配额在同一redb写事务检查；最后名额竞争、满额已有记录维护、重启和空笔记本保留；写锁等待后再次核权，相关三包301测试通过 | 完整磁盘/归档/产物配额、身份退役、全平台故障仍开放；见[记忆配额记录](ledger/native-memory-quota-20260914.json) |
@@ -128,7 +129,7 @@
 | M5-01 / M5-08 | TUI原生profile、发送/精确取消、多结果ACK、双游标恢复、连接代号拒旧、会话视图隔离、宽字符布局和明确unknown | onboarding、完整流式/快照协调、平台用户验收 |
 | M6-07 | Rust CLI有界只读OpenClaw预览、8项分页、指纹续页、容器识别/秘密内容排除；已有JSON/JSON5深度64/节点16384预算及重复键/非有限值拒绝 | 精确版本/schema、外部根/includes、SQLite/WAL一致快照和导入 |
 | M5-02 / M5-03 / M5-08 | Slint OS profile、历史版本/epoch 拒旧、结果恢复/精确停止/完整审批；unknown独立终态、durable结果及精确ACK revision、旧/非当前会话结果拒ACK | 原生设置/信任、完整流式/展示恢复协调和真实用户/平台验收 |
-| M1 / M6 依赖安全 | Node九类告警依赖及实际内嵌CSV、Restify/Node26兼容修复；JWT10.3+既有ring RS256和19签名夹具；rustls0.23.45/Wasmtime47.0.4；六包828通过/6忽略、严格lint/根check、Node31断言及两类audit零漏洞 | GitHub推送后待复查；cargo-deny既有违规及新增signature双版本未放行，原生OAuth联合失败保留且根因未修复；非发布/实号/设备验收，见[依赖安全记录](ledger/native-dependency-security-20260915.json) |
+| M1 / M6 依赖安全 | Node九类告警依赖及实际内嵌CSV、Restify/Node26兼容修复；JWT10.3+既有ring RS256和19签名夹具；rustls0.23.45/Wasmtime47.0.4；六包828通过/6忽略、严格lint/根check、Node31断言及两类audit零漏洞；main推送后GitHub确认0开放/56已修复，原41告警关闭 | cargo-deny既有违规及新增signature双版本未放行，原生OAuth联合失败保留且根因未修复；非发布/实号/设备验收，见[依赖安全记录](ledger/native-dependency-security-20260915.json) |
 | M6 发布 | 没有发布或切换 | 受保护策略/打包器仍锁定 Rust 1.97.1；开发已为 1.98.1，需审查升级，不能改 validator 放行 |
 
 ## OpenClaw / Hermes 差距追踪

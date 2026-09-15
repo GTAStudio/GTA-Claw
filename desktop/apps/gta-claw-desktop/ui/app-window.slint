@@ -172,6 +172,7 @@ export component AppWindow inherits Window {
     in property <string> memory-binding: "";
     in property <bool> can-retry-memory: false;
     in property <string> memory-result: "";
+    in property <string> provider-accounting: "";
     in-out property <bool> memory-open: false;
     in property <bool> can-answer: false;
     in property <string> approval-prompt: "";
@@ -439,6 +440,7 @@ export component AppWindow inherits Window {
         memory-binding: root.memory-binding;
         can-retry-memory: root.can-retry-memory;
         memory-result: root.memory-result;
+        provider-accounting: root.provider-accounting;
         memory-open <=> root.memory-open;
         can-answer: root.can-answer;
         approval-prompt: root.approval-prompt;

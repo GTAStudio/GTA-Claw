@@ -576,6 +576,15 @@ struct NativeProjection {
     dismissed_approvals: std::collections::BTreeSet<String>,
     queries: std::collections::VecDeque<(&'static str, serde_json::Value)>,
     completed_runs: BTreeMap<String, String>,
+    accounting: BTreeMap<String, NativeAccounting>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeAccounting {
+    run_id: String,
+    revision: u64,
+    connection: crate::controller::ProductConnection,
+    report: Option<claw_protocol::native_accounting::ProviderAccounting>,
 }
 
 static EMPTY_DELIVERABLE: DeliverableSummary = DeliverableSummary {
@@ -987,7 +996,60 @@ impl ProductState {
             else {
                 return;
             };
+            let Ok(accounting) = claw_protocol::native_accounting::ProviderAccounting::parse(
+                &payload["providerAccounting"],
+            ) else {
+                if self.selected_run.id == session {
+                    self.record_message(
+                        TranscriptRole::System,
+                        "Provider accounting could not be verified.",
+                        "The result has not been acknowledged.",
+                    );
+                }
+                return;
+            };
+            if accounting.is_some() && payload["turn"].as_u64().is_none() {
+                return;
+            }
+            let Some(connection) = self.native.as_ref().and_then(|native| native.connection) else {
+                return;
+            };
+            if self
+                .native
+                .as_ref()
+                .and_then(|native| native.accounting.get(session))
+                .is_some_and(|current| {
+                    current.connection == connection
+                        && current.run_id == run
+                        && (revision < current.revision
+                            || (revision == current.revision && current.report != accounting))
+                })
+                || !self.ensure_native_session(session)
+                || !self.accept_native_turn(session, payload)
+            {
+                return;
+            }
             self.native_event("chat", &serde_json::json!({"sessionId": session, "runId": run, "turn": payload["turn"], "status": status, "text": text}));
+            if self.native.as_ref().is_some_and(|native| {
+                native
+                    .completed_runs
+                    .get(session)
+                    .is_some_and(|current| current == run)
+            }) {
+                self.native
+                    .as_mut()
+                    .expect("native mode")
+                    .accounting
+                    .insert(
+                        session.to_owned(),
+                        NativeAccounting {
+                            run_id: run.to_owned(),
+                            revision,
+                            connection,
+                            report: accounting,
+                        },
+                    );
+            }
             if self.selected_run.id == session
                 && self.native.as_ref().is_some_and(|native| {
                     native
@@ -1431,6 +1493,7 @@ impl ProductState {
         if let Some(native) = &mut self.native {
             native.ready = false;
             native.memory_results.clear();
+            native.accounting.clear();
             for (session, params) in &native.pending_submissions {
                 if params["message"]
                     .as_str()
@@ -1444,6 +1507,78 @@ impl ProductState {
             native.queries.clear();
             native.history_requests.clear();
         }
+    }
+
+    pub(crate) fn accounting_summary(&self) -> String {
+        use claw_protocol::native_accounting::{AccountingSource, CounterCoverage};
+        let Some(native) = self.native.as_ref().filter(|native| native.ready) else {
+            return String::new();
+        };
+        let Some(run) = native
+            .active_runs
+            .get(&self.selected_run.id)
+            .or_else(|| native.completed_runs.get(&self.selected_run.id))
+        else {
+            return String::new();
+        };
+        let report = native
+            .accounting
+            .get(&self.selected_run.id)
+            .filter(|snapshot| {
+                snapshot.run_id == *run && Some(snapshot.connection) == native.connection
+            })
+            .and_then(|snapshot| snapshot.report.as_ref());
+        let mut lines = vec![format!("Run: {run}")];
+        if let Some(report) = report {
+            let coverage = match report.coverage {
+                CounterCoverage::Complete => "complete",
+                CounterCoverage::Partial => "partial",
+                CounterCoverage::Unreported => "unreported",
+                CounterCoverage::NoRounds => "no recorded attempts",
+                CounterCoverage::Overflow => "aggregate overflow",
+            };
+            if let Some(tokens) = report.observed_tokens
+                && matches!(
+                    report.coverage,
+                    CounterCoverage::Complete | CounterCoverage::Partial
+                )
+            {
+                lines.push(format!(
+                    "Tokens ({coverage}): {} [input {}, output {}]",
+                    tokens.total_tokens, tokens.input_tokens, tokens.output_tokens
+                ));
+                lines.push(format!(
+                    "Included subsets ({coverage}): cached {}, reasoning {}",
+                    tokens.cached_input_tokens, tokens.reasoning_tokens
+                ));
+            } else {
+                lines.push(format!("Tokens: unknown ({coverage})"));
+            }
+            lines.push(format!(
+                "Rounds: {} [complete {}, partial {}, unreported {}]",
+                report.recorded_rounds,
+                report.complete_counter_rounds,
+                report.partial_counter_rounds,
+                report.unreported_rounds
+            ));
+            lines.push(match report.source {
+                AccountingSource::Unspecified => "Source: not reported".to_owned(),
+                AccountingSource::TerminalTurn => "Source: terminal turn".to_owned(),
+                AccountingSource::ProviderJournal { revision, closed } => format!(
+                    "Source: provider journal r{revision} ({})",
+                    if closed { "closed" } else { "open" }
+                ),
+            });
+            if report.attempts_may_be_unsent == Some(true) {
+                lines.push("Attempts may include unsent intents".to_owned());
+            }
+        } else {
+            lines.push("Tokens: unknown (accounting unavailable)".to_owned());
+            lines.push("Source: not reported".to_owned());
+        }
+        lines.push("Cost: uncalculated".to_owned());
+        lines.push("Billing: unreconciled".to_owned());
+        lines.join("\n")
     }
 
     fn native_content_changed(&mut self, session: &str) {
@@ -2522,6 +2657,119 @@ mod native_tests {
                 .iter()
                 .any(|message| message.text == "new local message")
         );
+    }
+
+    #[test]
+    fn native_accounting_preserves_unknown_partial_zero_and_connection_identity() {
+        for scenario in [
+            "missing",
+            "unreported",
+            "partial",
+            "zero",
+            "journal",
+            "overflow",
+            "invalid",
+        ] {
+            let mut state = ProductState::native();
+            let current = connection(0);
+            state.apply_native(ProductUpdate::Ready {
+                connection: current,
+            });
+            while state.next_native_query().is_some() {}
+            let mut accounting = json!({
+                "available":true,"recordedRounds":1,
+                "completeCounterRounds":u16::from(matches!(scenario, "zero" | "journal" | "overflow" | "invalid")),
+                "partialCounterRounds":u16::from(scenario == "partial"),
+                "unreportedRounds":u16::from(matches!(scenario, "unreported" | "missing")),
+                "allPrimaryCountersReported":matches!(scenario, "zero" | "journal" | "invalid"),
+                "observedTokens":{"inputTokens":0,"outputTokens":0,"totalTokens":u16::from(scenario == "invalid"),"cachedInputTokens":0,"reasoningTokens":0},
+                "aggregationOverflow":scenario == "overflow","costCalculated":false,"billingReconciled":false,
+                "recordSource":"terminal_turn","attemptsMayBeUnsent":true,
+            });
+            if scenario == "missing" {
+                accounting = serde_json::Value::Null;
+            } else if scenario == "journal" {
+                accounting["recordSource"] = json!("provider_journal");
+                accounting["journalRevision"] = json!(2);
+                accounting["journalClosed"] = json!(false);
+            } else if scenario == "overflow" {
+                accounting["observedTokens"] = serde_json::Value::Null;
+            }
+            let run = "e".repeat(64);
+            let payload = json!({"runId":run,"sessionId":"native-session","phase":"outcome_unknown","turn":2,"revision":4,"durable":true,"result":{"status":"outcome_unknown","text":"retained status"},"providerAccounting":accounting});
+            let update = |connection, payload| ProductUpdate::Response {
+                connection,
+                method: "agent.wait",
+                params: json!({"runId":run}),
+                payload,
+            };
+            state.apply_native(update(current, payload.clone()));
+            if scenario == "invalid" {
+                assert!(
+                    !state
+                        .transcript()
+                        .iter()
+                        .any(|entry| entry.text == "retained status")
+                );
+                assert!(state.next_native_query().is_none());
+                assert!(state.accounting_summary().is_empty());
+                continue;
+            }
+            let summary = state.accounting_summary();
+            assert!(summary.contains("Cost: uncalculated"));
+            assert!(summary.contains("Billing: unreconciled"));
+            assert_eq!(state.selected_run().state, RunState::OutcomeUnknown);
+            if matches!(scenario, "zero" | "journal") {
+                assert!(summary.contains("Tokens (complete): 0"));
+            } else if scenario == "partial" {
+                assert!(summary.contains("Tokens (partial): 0"));
+            } else {
+                assert!(summary.contains("Tokens: unknown"));
+            }
+            if scenario == "journal" {
+                assert!(summary.contains("journal r2 (open)"));
+            }
+            while state.next_native_query().is_some() {}
+            let transcript_len = state.transcript().len();
+            state.apply_native(update(current, payload.clone()));
+            assert_eq!(
+                state.next_native_query(),
+                Some(("agent.wait", json!({"runId":run,"acknowledgeRevision":4})))
+            );
+            assert_eq!(state.transcript().len(), transcript_len);
+            assert!(state.next_native_query().is_none());
+            if scenario == "zero" {
+                let mut conflicting = payload.clone();
+                conflicting["providerAccounting"]["observedTokens"]["inputTokens"] = json!(1);
+                conflicting["providerAccounting"]["observedTokens"]["totalTokens"] = json!(1);
+                state.apply_native(update(current, conflicting));
+                assert!(state.next_native_query().is_none());
+                assert_eq!(state.accounting_summary(), summary);
+            }
+            let mut older = payload.clone();
+            older["revision"] = json!(3);
+            older["providerAccounting"] = serde_json::Value::Null;
+            state.apply_native(update(current, older));
+            assert_eq!(state.accounting_summary(), summary);
+            while state.next_native_query().is_some() {}
+            let mut other = payload.clone();
+            other["sessionId"] = json!("another-session");
+            other["providerAccounting"] = serde_json::Value::Null;
+            state.apply_native(update(current, other));
+            assert_eq!(state.accounting_summary(), summary);
+            assert!(
+                !std::iter::from_fn(|| state.next_native_query())
+                    .any(|(_, params)| params.get("acknowledgeRevision").is_some())
+            );
+            state.apply_native(ProductUpdate::Reset { generation: 1 });
+            state.apply_native(ProductUpdate::Ready {
+                connection: connection(1),
+            });
+            state.apply_native(update(current, payload));
+            assert!(!state.accounting_summary().contains("journal r2"));
+            state.native_unavailable();
+            assert!(state.accounting_summary().is_empty());
+        }
     }
 
     #[test]

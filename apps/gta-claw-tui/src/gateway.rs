@@ -676,6 +676,8 @@ pub enum WorkerEvent {
         text: Option<String>,
         /// Exact durable record revision.
         revision: u64,
+        /// Validated observed usage, not an invoice or replay authorization.
+        provider_accounting: Option<claw_protocol::native_accounting::ProviderAccounting>,
     },
     /// Another recovery page is ready after the current page has been rendered.
     RecoveryAvailable(String),
@@ -1926,6 +1928,17 @@ async fn send_native_run(
     } else {
         RunState::parse(status)
     };
+    let provider_accounting =
+        claw_protocol::native_accounting::ProviderAccounting::parse(&run["providerAccounting"])
+            .map_err(|error| WorkerError(error.to_string()))?;
+    if provider_accounting.is_some()
+        && (run["turn"].as_u64().is_none()
+            || !matches!(run["phase"].as_str(), Some("finished" | "outcome_unknown")))
+    {
+        return Err(WorkerError(
+            "Accounting lacks a terminal run and turn binding".to_owned(),
+        ));
+    }
     let text = if run["result"].is_null() {
         None
     } else {
@@ -1967,6 +1980,7 @@ async fn send_native_run(
             turn: run["turn"].as_u64(),
             text,
             revision,
+            provider_accounting,
         })
         .await
         .map_err(|_| WorkerError("render loop stopped".to_owned()))

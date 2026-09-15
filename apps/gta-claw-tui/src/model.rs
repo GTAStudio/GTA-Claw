@@ -311,6 +311,8 @@ pub struct AppModel {
     pub active_run_version: Option<(Option<u64>, u64)>,
     /// Last explicitly viewed partial page, never eligible for acknowledgement.
     pub partial_page: Option<crate::gateway::PartialPage>,
+    /// Observed usage for the selected native run; absence is not zero cost.
+    pub provider_accounting: Option<claw_protocol::native_accounting::ProviderAccounting>,
     /// Complete results eligible for acknowledgement only after workspace rendering.
     pub pending_acks: VecDeque<(String, u64)>,
     /// Bounded identities of terminal results already added to this session view.
@@ -351,6 +353,7 @@ impl Default for AppModel {
             active_run: None,
             active_run_version: None,
             partial_page: None,
+            provider_accounting: None,
             pending_acks: VecDeque::new(),
             received_results: VecDeque::new(),
             pending_recovery: None,
@@ -410,6 +413,7 @@ impl AppModel {
         self.active_run = None;
         self.active_run_version = None;
         self.partial_page = None;
+        self.provider_accounting = None;
         self.pending_acks.clear();
         self.received_results.clear();
         self.pending_recovery = None;

@@ -2834,3 +2834,39 @@ Its unchanged isolated test and final combined cohort passed, but all three resu
 there is no claimed credential root-cause fix. GitHub closure must be checked after main publication.
 Real accounts, device and native-addon validation, complete supply-chain policy and release gates
 remain open. No deployment, paid request, production proxy restart or user-state migration occurred.
+
+Post-publication queries after `084795e77f14f552735329fcf5c8755d48930baa` now independently report
+zero open alerts and 56 fixed records, including the original 41. The push's earlier alert message
+preceded GitHub's asynchronous refresh. This is alert closure evidence, not waiver of cargo-deny,
+protected release workflows or product acceptance.
+
+## TUI and Desktop Accounting
+
+The [client accounting record](native-accounting-clients-20260915.json) reports 138 passing
+protocol/TUI tests and 86 passing desktop tests, with no failures or ignored cases in these cohorts.
+Both strict all-target Clippy checks and the root workspace all-target check pass. It records the
+13 source witnesses, not a frozen whole-project input manifest.
+
+A shared closed native protocol model validates round counts, exact coverage, observed/subset totals,
+overflow and terminal-turn versus journal provenance. Missing, unreported and partial counters never
+become complete zeroes; actual complete zeroes stay visible. Unsupported monetary/settlement claims
+are rejected rather than silently shown as paid or free. This does not change sealed upstream payloads.
+
+TUI now carries providerAccounting from send_native_run through the worker event and selected run
+model to its scrollable workspace. Nine real WebSocket scenarios verify propagation and rejection
+before ACK eligibility. Selection, older turns/revisions and disconnects preserve the existing
+identity rules. Six terminal dimensions verify wrapping and separation. The summary does not append
+assistant text, create ACKs or replay unknown work.
+
+Desktop consumes the same parser, saves a connection/run/revision-bound snapshot and binds a read-only
+Usage region in the actual Slint session tree. Seven state cases preserve unknown/partial/zero/open
+journal semantics. Repeated identical snapshots still allow a lost ACK to be confirmed, while stale
+or same-revision conflicting accounting cannot overwrite or acknowledge. Actual software rendering
+at 1080x720 and 720x520 checks state-to-widget values, nonblank/changed pixels and disconnect clearing.
+These are headless native component tests, not physical desktop or macOS user acceptance.
+
+Both clients explicitly show uncalculated cost and unreconciled billing, including zero token totals.
+Persisted intent is not proof of a sent request. Monetary limits/pricing/invoices, unified model
+configuration, full desktop partial paging/export and real account/platform workflows remain open.
+Earlier native credential/OAuth anomalies and supply-chain policy gaps remain unchanged. No real
+account, OS window, device, deployment or production/proxy operation was performed.

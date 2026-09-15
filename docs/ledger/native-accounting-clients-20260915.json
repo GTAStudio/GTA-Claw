@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-provider-accounting-tui-and-desktop",
+  "capturedOn": "2026-09-15",
+  "baseCommit": "084795e77f14f552735329fcf5c8755d48930baa",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "cargoLockSha256": "7460323a924655a77c0c4fec247dd1635d72d7b358b889359e86aaf12100f674",
+  "sourceFiles": [
+    { "path": "crates/claw-protocol/src/native_accounting.rs", "sha256": "9792c4dfce2e4ddd6270c2f89e539d3af8216035263c660282ee9ca05745cfc1" },
+    { "path": "crates/claw-protocol/src/lib.rs", "sha256": "397c4fbaaea3c759551f4c4d62fc7853f186389c977db232bcf4903b201cdb8c" },
+    { "path": "apps/gta-claw-tui/src/gateway.rs", "sha256": "26ca3a9ce99e0400b9e28aeb153276bca26c0936bbcb4924a208644ae3f35aa2" },
+    { "path": "apps/gta-claw-tui/src/model.rs", "sha256": "beb11d9558990e891dc6aba4d9b7e68941a5c06ba743c1d2b300308ac5c72704" },
+    { "path": "apps/gta-claw-tui/src/lib.rs", "sha256": "5155e956899eb1b338ceddc8e890531a8a2f7eed4b23abc890ca7397b19c9e7b" },
+    { "path": "apps/gta-claw-tui/src/render.rs", "sha256": "fd8a665ca4f36b0c81476b4f711fbac013f6918797fd9ef9b97c459253b646b3" },
+    { "path": "apps/gta-claw-tui/tests/gateway_double.rs", "sha256": "2a21d7b7dbb4373edce1d647b5c401778ceec308fb4397e6a53262adfdda5280" },
+    { "path": "apps/gta-claw-tui/tests/rendering.rs", "sha256": "e77fd5a633555830cd00dce924fc2a60aceafbed9536b18fd2fb718c06480431" },
+    { "path": "desktop/apps/gta-claw-desktop/src/product_state.rs", "sha256": "4d6fa7882369ba1540dd9c8e71b39cb10f99713624b70191f66885fdbedbd9c0" },
+    { "path": "desktop/apps/gta-claw-desktop/src/main.rs", "sha256": "af884f12e4f14688ea3288c54c275fa6a47a767b77eb5afc4ee00ea2e935fd09" },
+    { "path": "desktop/apps/gta-claw-desktop/src/software_renderer_smoke.rs", "sha256": "357e76de6cbf1ad40d05f2494f32f08623c4f6f3ca2b5974c53924cc5b7329fa" },
+    { "path": "desktop/apps/gta-claw-desktop/ui/app-window.slint", "sha256": "cd73f4914bab78f47a205d7f545382e386b351ada111e435d0575681158fb614" },
+    { "path": "desktop/apps/gta-claw-desktop/ui/modules/product-shell.slint", "sha256": "23af6c8b81fe06e008a728b0de8800605cf7acc4798f738c065a4e8f19f02362" }
+  ],
+  "checks": [
+    {
+      "command": "cargo +stable test -p claw-protocol -p gta-claw-tui --all-targets --locked --offline -j 2",
+      "result": "passed", "passed": 138, "failed": 0, "ignored": 0, "testBinaries": 13,
+      "log": "target/native-accounting-tui-tests-20260915.log",
+      "sha256": "3a13deceb81ed3dcfcd409a62844557945e3d297d7678d2316061736b9175a12",
+      "scopeNote": "69 protocol and 69 TUI tests; only a private wire-DTO lint explanation was added afterward"
+    },
+    {
+      "command": "cargo +stable clippy -p claw-protocol -p gta-claw-tui --all-targets --locked --offline -j 2 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-accounting-tui-clippy-final-20260915.log",
+      "sha256": "6f75e15542edb9019d790b1f2bc18074453e20f182e438dc77c8c44a6eb4507b"
+    },
+    {
+      "command": "cargo +stable test --manifest-path desktop/Cargo.toml --bin gta-claw-desktop --locked --offline -j 2",
+      "result": "passed", "passed": 86, "failed": 0, "ignored": 0,
+      "log": "target/native-accounting-desktop-tests-20260915.log",
+      "sha256": "9e1a3bbf18c268c76820d95b52d458506232f6df830b322329433b94781133d8"
+    },
+    {
+      "command": "cargo +stable clippy --manifest-path desktop/Cargo.toml --all-targets --locked --offline -j 2 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-accounting-desktop-clippy-20260915.log",
+      "sha256": "21d83a93a2fb7891dbd1c3826f09ab64ed79a189bb1c71c6ad1d3b0fe10a8278"
+    },
+    { "command": "cargo +stable check --workspace --all-targets --locked --offline -j 2", "result": "passed", "exitCode": 0, "log": "target/native-accounting-root-check-20260915.log" }
+  ],
+  "behaviorEvidence": [
+    "missing_partial_zero_and_journal_accounting_remain_distinct",
+    "no_rounds_overflow_and_legacy_provenance_are_not_inferred_zero_usage",
+    "inconsistent_or_unsupported_accounting_is_rejected",
+    "accounting_is_current_run_scoped_and_cannot_acknowledge_text",
+    "accounting_wraps_without_overlapping_and_does_not_turn_missing_usage_into_zero",
+    "native_tui_accounting_crosses_real_worker_without_granting_ack_or_replay",
+    "native_accounting_preserves_unknown_partial_zero_and_connection_identity",
+    "native_accounting_renders_from_bound_state_at_narrow_and_wide_sizes"
+  ],
+  "retainedFailures": [
+    { "reason": "Initial 40x10 TUI rendering split the billing label; separate short cost/billing rows and a shorter journal label passed the unchanged layout dimensions. Initial output is in session history" },
+    { "log": "target/native-accounting-tui-clippy-20260915.log", "reason": "Private wire DTO mirrors existing flat boolean fields; a localized explained expectation was added, public state remains typed, all strict lints then pass" }
+  ],
+  "notes": [
+    "The shared closed native summary parser lives beside native_approval in claw-protocol, not in the transport-only client crate or sealed upstream contracts; no dependency change",
+    "Missing/null, no rounds, unreported, partial, complete explicit zero and aggregate overflow remain distinct. Checked total/subset/round bounds, source/journal revision/closure and unsupported pricing claims fail closed",
+    "TUI send_native_run forwards validated accounting only for a terminal run with a turn binding; selected run/revision rules apply, selection/disconnect clears it, and the existing scrollable workspace renders it separately from transcript text and ACK queues",
+    "Nine actual loopback WebSocket scenarios prove wire propagation, malformed/untied summary refusal and no extra ACK or replay. TUI rendering checks 40/80/120 columns at 10/24 rows",
+    "Desktop stores summaries by session/run/revision/connection, uses the same validator and feeds the existing Slint session layout. Older or same-revision conflicting summaries cannot overwrite or ACK; identical snapshots retain legitimate acknowledgement recovery without duplicating text",
+    "Seven desktop state cases and software-rendered ProductState-to-Slint properties at 1080x720 and 720x520 verify missing/zero/open journal semantics, nonblank changed pixels and disconnect clearing. No OS window or real account was opened",
+    "Cost remains uncalculated and billing unreconciled, including complete zero token reports. Observed stop thresholds are not money limits, intents may be unsent, and outcome_unknown is never converted to success or retry permission",
+    "Existing complete-result ACK behavior is separate from accounting; partial text has not been promoted to a complete answer. No provider execution, storage policy or retry behavior changed"
+  ],
+  "unverified": [
+    "Real provider accounts, actual interactive TTY/OS desktop use and macOS/device acceptance",
+    "Full desktop partial-text paging/export, in-flight HTTP streaming persistence and complete archive UX",
+    "Unified model configuration lifecycle, versioned prices, monetary reservations and remote invoice reconciliation",
+    "Earlier native credential/OAuth anomalies and cargo-deny policy debt remain open; release and complete M3/M5 acceptance are not claimed"
+  ]
+}

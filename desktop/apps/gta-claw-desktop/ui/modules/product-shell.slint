@@ -1159,6 +1159,7 @@ component SessionScreen {
     in property <string> memory-binding: "";
     in property <bool> can-retry-memory: false;
     in property <string> memory-result: "";
+    in property <string> provider-accounting: "";
     in-out property <bool> memory-open: false;
     changed memory-binding => { root.memory-open = false; }
     changed memory-open => { if root.memory-open { center-scroll.viewport-y = 0px; } }
@@ -1286,6 +1287,12 @@ component SessionScreen {
                         spacing: Metrics.space-1;
                         Text { text: @tr("Memory result"); color: DesignTokens.text-secondary; font-size: Metrics.type-caption; }
                         TextEdit { height: 180px; text: root.memory-result; read-only: true; wrap: word-wrap; accessible-label: @tr("Memory result, untrusted data"); }
+                    }
+
+                    if root.provider-accounting != "" : VerticalLayout {
+                        spacing: Metrics.space-1;
+                        Text { text: @tr("Usage"); color: DesignTokens.text-secondary; font-size: Metrics.type-small; font-weight: 700; accessible-role: text; }
+                        TextEdit { height: 180px; text: root.provider-accounting; read-only: true; wrap: word-wrap; accessible-label: @tr("Observed provider usage and unreconciled billing"); }
                     }
 
                     if (root.narrow) : Card {
@@ -1896,6 +1903,7 @@ export component ProductShell inherits FocusScope {
     in property <string> memory-binding: "";
     in property <bool> can-retry-memory: false;
     in property <string> memory-result: "";
+    in property <string> provider-accounting: "";
     in-out property <bool> memory-open: false;
     in property <bool> can-answer: false;
     in property <string> approval-prompt: "";
@@ -2132,6 +2140,7 @@ export component ProductShell inherits FocusScope {
                 memory-binding: root.memory-binding;
                 can-retry-memory: root.can-retry-memory;
                 memory-result: root.memory-result;
+                provider-accounting: root.provider-accounting;
                 memory-open <=> root.memory-open;
                 can-answer: root.can-answer;
                 approval-prompt: root.approval-prompt;

@@ -1047,6 +1047,7 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
             turn,
             text,
             revision,
+            provider_accounting,
         } => {
             if model
                 .selected_session()
@@ -1096,6 +1097,7 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
                 model.partial_page = None;
                 model.active_run = Some((session_id, run_id));
                 model.active_run_version = Some((turn, revision));
+                model.provider_accounting = provider_accounting;
                 if let Some(session) = model.sessions.get_mut(model.selected) {
                     session.state = state;
                 }
@@ -1510,6 +1512,7 @@ mod tests {
                 turn: Some(1),
                 text: Some("current complete result".to_owned()),
                 revision: 4,
+                provider_accounting: None,
             },
         );
         assert_eq!(model.pending_acks.len(), 1);
@@ -1657,6 +1660,7 @@ mod tests {
                     turn: Some(turn),
                     text: Some("complete result shared text".to_owned()),
                     revision: 4,
+                    provider_accounting: None,
                 },
             );
         }
@@ -2008,6 +2012,7 @@ mod tests {
                 turn: Some(2),
                 text: Some("complete answer".to_owned()),
                 revision: 4,
+                provider_accounting: None,
             },
         );
         crate::apply_worker_event(
@@ -2019,6 +2024,7 @@ mod tests {
                 turn: Some(1),
                 text: None,
                 revision: 9,
+                provider_accounting: None,
             },
         );
         crate::apply_worker_event(
@@ -2030,6 +2036,7 @@ mod tests {
                 turn: Some(2),
                 text: None,
                 revision: 2,
+                provider_accounting: None,
             },
         );
         assert_eq!(model.active_run, Some((session, run_id.clone())));
@@ -2042,6 +2049,70 @@ mod tests {
             queued.try_recv().is_err(),
             "ACK cannot be queued before the render pass"
         );
+    }
+
+    #[test]
+    fn accounting_is_current_run_scoped_and_cannot_acknowledge_text() {
+        use claw_protocol::native_accounting::{AccountingSource, ProviderAccounting};
+        let accounting = ProviderAccounting::parse(&serde_json::json!({
+            "available":true,"recordedRounds":1,"completeCounterRounds":1,
+            "partialCounterRounds":0,"unreportedRounds":0,"allPrimaryCountersReported":true,
+            "observedTokens":{"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0},
+            "aggregationOverflow":false,"costCalculated":false,"billingReconciled":false,
+            "recordSource":"provider_journal","journalRevision":2,"journalClosed":false,
+            "attemptsMayBeUnsent":true,
+        })).expect("valid accounting");
+        let mut model = AppModel {
+            sessions: vec![
+                crate::model::SessionSummary {
+                    id: "owned".to_owned(),
+                    ..crate::model::SessionSummary::default()
+                },
+                crate::model::SessionSummary {
+                    id: "other".to_owned(),
+                    ..crate::model::SessionSummary::default()
+                },
+            ],
+            ..AppModel::default()
+        };
+        let event = |session: &str, run: &str, turn, revision, provider_accounting| {
+            WorkerEvent::NativeRun {
+                session_id: session.to_owned(),
+                run_id: run.to_owned(),
+                turn: Some(turn),
+                revision,
+                state: crate::model::RunState::OutcomeUnknown,
+                text: None,
+                provider_accounting,
+            }
+        };
+        apply_worker_event(
+            &mut model,
+            event("owned", "current", 2, 4, accounting.clone()),
+        );
+        assert_eq!(model.provider_accounting, accounting);
+        assert_eq!(
+            model.provider_accounting.as_ref().expect("present").source,
+            AccountingSource::ProviderJournal {
+                revision: 2,
+                closed: false
+            }
+        );
+        assert!(model.transcript.is_empty() && model.pending_acks.is_empty());
+        apply_worker_event(&mut model, event("owned", "current", 2, 3, None));
+        apply_worker_event(&mut model, event("owned", "old", 1, 8, None));
+        apply_worker_event(&mut model, event("other", "different", 9, 8, None));
+        assert_eq!(model.provider_accounting, accounting);
+        assert_eq!(
+            model.selected_session().expect("selected").state,
+            crate::model::RunState::OutcomeUnknown
+        );
+        apply_worker_event(&mut model, event("owned", "new", 3, 1, None));
+        assert!(model.provider_accounting.is_none());
+        apply_worker_event(&mut model, event("owned", "new", 3, 2, accounting));
+        model.select_next();
+        assert!(model.provider_accounting.is_none() && model.active_run.is_none());
+        assert!(model.pending_acks.is_empty());
     }
 
     #[test]

@@ -9,7 +9,14 @@
   "wholeProjectAccepted": false,
   "platform": "windows-x86_64",
   "initialGitHubAlerts": { "open": 41, "high": 14, "medium": 26, "low": 1, "npm": 39, "rust": 2 },
-  "githubRecheck": "Pending publication; local audit results are not GitHub closure evidence",
+  "githubRecheck": {
+    "date": "2026-09-15",
+    "publishedCommit": "084795e77f14f552735329fcf5c8755d48930baa",
+    "command": "gh api --paginate /repos/GTAStudio/GTA-Claw/dependabot/alerts?per_page=100 --jq .[].state",
+    "open": 0,
+    "fixed": 56,
+    "scopeNote": "Full post-push API queries twice report only fixed records; the original 41 open alerts are resolved. The push's earlier 41-alert message preceded asynchronous reanalysis. Authorized admin fast-forward bypass was used; protected workflow/release eligibility was not claimed"
+  },
   "sourceFiles": [
     { "path": "package.json", "sha256": "50580874c0d6cf0482ea8a398485b14eb19420818dc603d81a07ea69166fcf51" },
     { "path": "package-lock.json", "sha256": "47ef03c3b3b97eed42631efff617c72b20215cf1b00133bb5291bf784b3dc9ea" },
@@ -87,6 +94,6 @@
     "Supply-chain bans including newly required signature major-version coexistence need separate resolution; no release-gate pass is claimed",
     "Intermittent native credential/OAuth failures remain unresolved and the initial joint failure is retained",
     "Real Teams/cloud accounts, native npm addon lifecycle builds, mobile/other-platform builds and user workflows",
-    "GitHub alert refresh after main publication, release qualification and whole-project acceptance"
+    "Release qualification and whole-project acceptance; GitHub closure is verified separately above"
   ]
 }

@@ -11,6 +11,63 @@ use gta_claw_tui::render::{flush, flush_changes, render};
 use gta_claw_tui::terminal::{TerminalControl, TerminalSession};
 
 #[test]
+fn accounting_wraps_without_overlapping_and_does_not_turn_missing_usage_into_zero() {
+    use claw_protocol::native_accounting::ProviderAccounting;
+    let mut value = serde_json::json!({
+        "available":true,"recordedRounds":1,"completeCounterRounds":1,
+        "partialCounterRounds":0,"unreportedRounds":0,"allPrimaryCountersReported":true,
+        "observedTokens":{"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0},
+        "aggregationOverflow":false,"costCalculated":false,"billingReconciled":false,
+        "recordSource":"provider_journal","journalRevision":2,"journalClosed":false,
+        "attemptsMayBeUnsent":true,
+    });
+    for mode in ["complete", "partial", "unreported", "missing"] {
+        value["completeCounterRounds"] = serde_json::json!(u16::from(mode == "complete"));
+        value["partialCounterRounds"] = serde_json::json!(u16::from(mode == "partial"));
+        value["unreportedRounds"] =
+            serde_json::json!(u16::from(matches!(mode, "unreported" | "missing")));
+        value["allPrimaryCountersReported"] = serde_json::json!(mode == "complete");
+        let accounting = if mode == "missing" {
+            None
+        } else {
+            ProviderAccounting::parse(&value).expect("valid report")
+        };
+        for width in [40, 80, 120] {
+            for height in [10, 24] {
+                let mut model = AppModel {
+                    screen: Screen::Workspace,
+                    active_run: Some(("owned".to_owned(), "a".repeat(64))),
+                    provider_accounting: accounting.clone(),
+                    ..AppModel::default()
+                };
+                let split = width * 2 / 3;
+                let mut visible = String::new();
+                for scroll in 0..40 {
+                    model.scroll = scroll;
+                    let grid = render(&model, width, height, true);
+                    for row in 6..height - 2 {
+                        assert_eq!(grid.cell(split, row).expect("separator").symbol, '|');
+                        visible.push_str(&grid.line(row));
+                        visible.push('\n');
+                    }
+                }
+                assert!(visible.contains("Billing:"), "{mode} {width}x{height}");
+                assert!(visible.contains("unreconciled"));
+                if matches!(mode, "complete" | "partial") {
+                    assert!(visible.contains(&format!("Tokens ({mode}): 0")));
+                    assert!(visible.contains("journal r2"));
+                    assert!(visible.contains("open"));
+                } else {
+                    assert!(visible.contains("Tokens: unknown"));
+                    assert!(!visible.contains("Tokens (complete): 0"));
+                }
+                assert!(model.transcript.is_empty() && model.pending_acks.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
 fn composer_tail_keeps_latest_wide_character_input_visible_at_small_widths() {
     let model = AppModel {
         screen: Screen::Workspace,

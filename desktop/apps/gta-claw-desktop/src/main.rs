@@ -143,6 +143,7 @@ fn apply_product_state(window: &AppWindow, models: &ProductModels, state: &Produ
     window.set_memory_binding(state.memory_binding().into());
     window.set_can_retry_memory(state.retry_native_memory().is_some());
     window.set_memory_result(state.memory_result().into());
+    window.set_provider_accounting(state.accounting_summary().into());
     window.set_can_answer(selected_run.state == RunState::WaitingForAnswer);
     window.set_approval_prompt(state.approval_prompt().into());
     window.set_approval_scope(state.approval_scope().into());

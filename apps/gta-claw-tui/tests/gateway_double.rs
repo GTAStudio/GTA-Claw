@@ -393,6 +393,204 @@ async fn native_tui_memory_preflights_capabilities_and_preserves_exact_submissio
 }
 
 #[tokio::test]
+async fn native_tui_accounting_crosses_real_worker_without_granting_ack_or_replay() {
+    use claw_protocol::native_accounting::{AccountingSource, CounterCoverage};
+    for scenario in [
+        "missing",
+        "unreported",
+        "partial",
+        "zero",
+        "journal",
+        "overflow",
+        "bad-total",
+        "nonterminal",
+        "missing-turn",
+    ] {
+        let valid = !matches!(scenario, "bad-total" | "nonterminal" | "missing-turn");
+        let rounds = if matches!(scenario, "journal" | "overflow") {
+            2
+        } else {
+            1
+        };
+        let mut accounting = json!({
+            "available":true,"recordedRounds":rounds,
+            "completeCounterRounds":if scenario == "overflow" {2} else {u16::from(matches!(scenario, "zero" | "journal" | "bad-total" | "nonterminal" | "missing-turn"))},
+            "partialCounterRounds":u16::from(scenario == "partial"),
+            "unreportedRounds":u16::from(matches!(scenario, "unreported" | "journal" | "missing")),
+            "allPrimaryCountersReported":matches!(scenario, "zero" | "bad-total" | "nonterminal" | "missing-turn"),
+            "observedTokens":{"inputTokens":0,"outputTokens":0,"totalTokens":u16::from(scenario == "bad-total"),"cachedInputTokens":0,"reasoningTokens":0},
+            "aggregationOverflow":scenario == "overflow","costCalculated":false,"billingReconciled":false,
+            "recordSource":"terminal_turn","attemptsMayBeUnsent":true,
+        });
+        if scenario == "missing" {
+            accounting = serde_json::Value::Null;
+        } else if scenario == "journal" {
+            accounting["recordSource"] = json!("provider_journal");
+            accounting["journalRevision"] = json!(2);
+            accounting["journalClosed"] = json!(false);
+            accounting["observedTokens"] = json!({"inputTokens":5,"outputTokens":2,"totalTokens":7,"cachedInputTokens":1,"reasoningTokens":1});
+        } else if scenario == "overflow" {
+            accounting["observedTokens"] = serde_json::Value::Null;
+        }
+        let unexpected = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&unexpected);
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let accounting = accounting.clone();
+            let observed = std::sync::Arc::clone(&observed);
+            async move {
+                complete_handshake(&mut socket, AUTHENTICATED_MAX_FRAME_BYTES).await;
+                let sessions = receive_request(&mut socket).await;
+                send_json(&mut socket, json!({"type":"res","id":sessions.id().as_str(),"ok":true,"payload":{"sessions":[]}})).await;
+                let submission = receive_request(&mut socket).await;
+                assert_eq!(submission.method().as_str(), "chat.send");
+                send_json(&mut socket, json!({"type":"res","id":submission.id().as_str(),"ok":true,"payload":{"durable":true,"sessionId":"accounting-session","runId":"a".repeat(64)}})).await;
+                let query = receive_request(&mut socket).await;
+                assert_eq!(query.method().as_str(), "agent.wait");
+                let parameters: serde_json::Value = serde_json::from_str(query.params().value().expect("read params").as_json()).expect("read JSON");
+                assert_eq!(parameters, json!({"runId":"a".repeat(64),"timeoutMs":0}));
+                let mut payload = json!({
+                    "durable":true,"sessionId":"accounting-session","runId":"a".repeat(64),
+                    "revision":4,"turn":2,"phase":"outcome_unknown","status":"outcome_unknown",
+                    "result":null,"providerAccounting":accounting,
+                });
+                if scenario == "bad-total" {
+                    payload["result"] = json!({"status":"completed","text":"not eligible for ACK"});
+                } else if scenario == "nonterminal" {
+                    payload["phase"] = json!("executing");
+                } else if scenario == "missing-turn" {
+                    payload.as_object_mut().expect("object").remove("turn");
+                }
+                send_json(&mut socket, json!({"type":"res","id":query.id().as_str(),"ok":true,"payload":payload})).await;
+                loop {
+                    match socket.read_frame().await {
+                        Ok(frame) if frame.opcode == fastwebsockets::OpCode::Text => { observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+                        Ok(frame) if frame.opcode == fastwebsockets::OpCode::Close => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        })).await;
+        let mut worker = spawn_gateway_worker(GatewayOptions {
+            url: gateway.url.clone(),
+            token: None,
+            device_profile: None,
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !matches!(
+                worker.events.recv().await.expect("startup"),
+                WorkerEvent::Sessions(_)
+            ) {}
+        })
+        .await
+        .expect("ready worker");
+        worker
+            .commands
+            .send(
+                UiCommand::SendMessage {
+                    session_id: "accounting-session".to_owned(),
+                    text: "fixture".to_owned(),
+                    idempotency_key: "accounting-fixture-key".to_owned(),
+                }
+                .for_connection(1),
+            )
+            .await
+            .expect("explicit submission");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match worker.events.recv().await.expect("accounting update") {
+                    WorkerEvent::NativeRun {
+                        session_id,
+                        run_id,
+                        state,
+                        text,
+                        revision,
+                        provider_accounting,
+                        ..
+                    } => {
+                        assert!(valid, "{scenario}");
+                        assert_eq!(session_id, "accounting-session");
+                        assert_eq!(run_id, "a".repeat(64));
+                        assert_eq!(state, RunState::OutcomeUnknown);
+                        assert_eq!(revision, 4);
+                        assert!(text.is_none());
+                        if scenario == "missing" {
+                            assert!(provider_accounting.is_none());
+                        } else {
+                            let report = provider_accounting.expect("validated accounting");
+                            let coverage = match scenario {
+                                "zero" => CounterCoverage::Complete,
+                                "partial" | "journal" => CounterCoverage::Partial,
+                                "overflow" => CounterCoverage::Overflow,
+                                _ => CounterCoverage::Unreported,
+                            };
+                            assert_eq!(report.coverage, coverage);
+                            if scenario == "journal" {
+                                assert_eq!(
+                                    report.source,
+                                    AccountingSource::ProviderJournal {
+                                        revision: 2,
+                                        closed: false
+                                    }
+                                );
+                                assert_eq!(
+                                    report
+                                        .observed_tokens
+                                        .expect("observed subset")
+                                        .total_tokens,
+                                    7
+                                );
+                            }
+                        }
+                        break;
+                    }
+                    WorkerEvent::Notice(notice) => {
+                        assert!(!valid, "{scenario}: {notice}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("bounded accounting result");
+        worker
+            .commands
+            .send(
+                UiCommand::AcknowledgeRun {
+                    run_id: "a".repeat(64),
+                    revision: 4,
+                }
+                .for_connection(1),
+            )
+            .await
+            .expect("attempted ACK");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let WorkerEvent::Notice(notice) =
+                    worker.events.recv().await.expect("local ACK rejection")
+                {
+                    assert!(
+                        notice.contains("not delivered completely"),
+                        "{scenario}: {notice}"
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("ACK refused locally");
+        worker.shutdown().await;
+        gateway.shutdown().await;
+        assert_eq!(
+            unexpected.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{scenario}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn native_tui_send_cancel_and_result_ack_keep_exact_run_and_revision() {
     let baseline = ReleaseBaseline::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compat/releases/v2026.9.4"),
