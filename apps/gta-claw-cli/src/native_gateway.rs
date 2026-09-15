@@ -148,6 +148,211 @@ fn check_partial_page(
     Ok(reply)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountingRunReply {
+    run_id: String,
+    session_id: String,
+    revision: u64,
+    turn: Option<u64>,
+    status: String,
+    accounting: AccountingPageReply,
+    durable: bool,
+    acknowledged: bool,
+    automatic_replay: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountingPageReply {
+    available: bool,
+    offset: Option<usize>,
+    end_offset: Option<usize>,
+    next_offset: Option<usize>,
+    total_rounds: Option<usize>,
+    sha256: Option<String>,
+    summary: Option<Value>,
+    rounds: Option<Vec<AccountingRoundReply>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountingRoundReply {
+    round: usize,
+    response: Option<AccountingResponseReply>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountingResponseReply {
+    provider: String,
+    model: String,
+    response_id: Option<String>,
+    usage_reporting: String,
+    finish_reason: String,
+    observed_tokens: claw_protocol::native_accounting::ObservedTokens,
+}
+
+fn check_accounting_page(encoded: &str, parameters: &Value) -> Result<(), DiagnosticFailure> {
+    use claw_protocol::native_accounting::ProviderAccounting;
+    let invalid = || {
+        DiagnosticFailure::protocol(
+            "invalid_accounting_page",
+            "Gateway accounting page changed identity, counters, provenance or snapshot",
+        )
+    };
+    if encoded.len() > 64 * 1024 {
+        return Err(invalid());
+    }
+    let reply: AccountingRunReply = serde_json::from_str(encoded).map_err(|_| invalid())?;
+    if parameters["runId"].as_str() != Some(&reply.run_id)
+        || parameters["accountingPage"]["revision"].as_u64() != Some(reply.revision)
+        || reply.revision == 0
+        || reply.session_id.is_empty()
+        || reply.session_id.len() > 128
+        || reply.session_id.chars().any(char::is_control)
+        || !reply.durable
+        || reply.acknowledged
+        || reply.automatic_replay
+        || !matches!(
+            reply.status.as_str(),
+            "completed" | "completed_with_changes" | "cancelled" | "failed" | "outcome_unknown"
+        )
+    {
+        return Err(invalid());
+    }
+    let page = reply.accounting;
+    if !page.available {
+        if parameters["accountingPage"]["offset"].as_u64() != Some(0)
+            || parameters["accountingPage"].get("sha256").is_some()
+            || page.offset.is_some()
+            || page.end_offset.is_some()
+            || page.next_offset.is_some()
+            || page.total_rounds.is_some()
+            || page.sha256.is_some()
+            || page.summary.is_some()
+            || page.rounds.is_some()
+        {
+            return Err(invalid());
+        }
+        return Ok(());
+    }
+    let offset = page.offset.ok_or_else(invalid)?;
+    let end = page.end_offset.ok_or_else(invalid)?;
+    let total = page.total_rounds.ok_or_else(invalid)?;
+    let rounds = page.rounds.ok_or_else(invalid)?;
+    let digest = page.sha256.ok_or_else(invalid)?;
+    let summary = ProviderAccounting::parse(&page.summary.ok_or_else(invalid)?)
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+    if reply.turn.is_none()
+        || parameters["accountingPage"]["offset"].as_u64() != u64::try_from(offset).ok()
+        || rounds.len() > 16
+        || offset.checked_add(rounds.len()) != Some(end)
+        || end > total
+        || total != usize::from(summary.recorded_rounds)
+        || (offset > 0
+            && (rounds.is_empty() || parameters["accountingPage"]["sha256"].as_str().is_none()))
+        || page.next_offset.map_or(end != total, |next| {
+            next != end || next >= total || rounds.is_empty()
+        })
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || parameters["accountingPage"]["sha256"]
+            .as_str()
+            .is_some_and(|expected| expected != digest)
+    {
+        return Err(invalid());
+    }
+    let mut counts = [0_u16; 3];
+    let mut totals = [0_u128; 4];
+    for (index, round) in rounds.iter().enumerate() {
+        if round.round != offset + index {
+            return Err(invalid());
+        }
+        let Some(response) = &round.response else {
+            counts[2] += 1;
+            continue;
+        };
+        let identity_valid = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 512
+                && !value
+                    .chars()
+                    .any(|character| character.is_control() || character.is_whitespace())
+        };
+        if !identity_valid(&response.provider)
+            || !identity_valid(&response.model)
+            || response
+                .response_id
+                .as_deref()
+                .is_some_and(|identity| !identity_valid(identity))
+            || !matches!(
+                response.finish_reason.as_str(),
+                "stop" | "tool_calls" | "length" | "content_filter"
+            )
+        {
+            return Err(invalid());
+        }
+        let tokens = &response.observed_tokens;
+        if tokens.input_tokens.checked_add(tokens.output_tokens) != Some(tokens.total_tokens)
+            || tokens.cached_input_tokens > tokens.input_tokens
+            || tokens.reasoning_tokens > tokens.output_tokens
+        {
+            return Err(invalid());
+        }
+        match response.usage_reporting.as_str() {
+            "complete" => counts[0] += 1,
+            "partial" => counts[1] += 1,
+            "unreported" if tokens.total_tokens == 0 => counts[2] += 1,
+            _ => return Err(invalid()),
+        }
+        for (accumulated, count) in totals.iter_mut().zip([
+            tokens.input_tokens,
+            tokens.output_tokens,
+            tokens.cached_input_tokens,
+            tokens.reasoning_tokens,
+        ]) {
+            *accumulated += u128::from(count);
+        }
+    }
+    let complete_page = offset == 0 && end == total;
+    for (count, expected) in counts.into_iter().zip([
+        summary.complete_counter_rounds,
+        summary.partial_counter_rounds,
+        summary.unreported_rounds,
+    ]) {
+        if count > expected || (complete_page && count != expected) {
+            return Err(invalid());
+        }
+    }
+    if let Some(observed) = summary.observed_tokens {
+        for (count, expected) in totals.into_iter().zip([
+            observed.input_tokens,
+            observed.output_tokens,
+            observed.cached_input_tokens,
+            observed.reasoning_tokens,
+        ]) {
+            if count > u128::from(expected) || (complete_page && count != u128::from(expected)) {
+                return Err(invalid());
+            }
+        }
+    } else if complete_page && total > 0 && totals[0] + totals[1] <= u128::from(u64::MAX) {
+        return Err(invalid());
+    }
+    if complete_page {
+        let raw: Value = serde_json::from_str(encoded).map_err(|_| invalid())?;
+        let snapshot =
+            json!({"summary":raw["accounting"]["summary"],"rounds":raw["accounting"]["rounds"]});
+        if memory_sha256(&serde_json::to_vec(&snapshot).map_err(|_| invalid())?) != digest {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Eq, PartialEq)]
 struct PartialExportIdentity {
     session_id: String,
@@ -374,6 +579,220 @@ fn explicit_tool_message(name: &str, arguments: &Value) -> Result<String, &'stat
 #[cfg(test)]
 mod explicit_tool_tests {
     use super::*;
+
+    #[test]
+    fn accounting_run_command_is_bounded_read_only_and_pins_continuations() {
+        let base: Vec<OsString> = [
+            "accounting-run",
+            &"a".repeat(64),
+            "4",
+            "--device-profile",
+            "work",
+            "--endpoint",
+            "ws://127.0.0.1:18789/",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let parsed = parse(&base, 0).ok().expect("accounting read");
+        assert_eq!(parsed.scope, Scope::OperatorRead);
+        assert_eq!(parsed.method, "agent.wait");
+        assert_eq!(
+            parsed.params,
+            json!({"runId":"a".repeat(64),"accountingPage":{"revision":4,"offset":0}})
+        );
+        assert!(parsed.partial_export.is_none() && parsed.memory.is_none());
+        let mut continuation = base.clone();
+        continuation.extend(
+            ["--offset", "16", "--sha256", &"b".repeat(64)]
+                .into_iter()
+                .map(OsString::from),
+        );
+        assert_eq!(
+            parse(&continuation, 0)
+                .ok()
+                .expect("pinned continuation")
+                .params["accountingPage"],
+            json!({"revision":4,"offset":16,"sha256":"b".repeat(64)})
+        );
+        for extra in [
+            vec!["--offset", "1"],
+            vec!["--offset", "1025"],
+            vec!["--offset", "-1"],
+            vec!["--offset", "0.5"],
+            vec!["--offset", "0", "--offset", "0"],
+            vec!["--sha256", "bad"],
+            vec!["--wait-ms", "0"],
+            vec!["--limit", "16"],
+            vec!["--idempotency-key", "read-only"],
+            vec!["--after", "0"],
+            vec!["--destination", "output.json"],
+        ] {
+            let mut invalid = base.clone();
+            invalid.extend(extra.into_iter().map(OsString::from));
+            assert!(parse(&invalid, 0).is_err());
+        }
+        let mut invalid = base;
+        invalid[2] = "0".into();
+        assert!(parse(&invalid, 0).is_err());
+    }
+
+    fn stamp_accounting_fixture(page: &mut Value) {
+        page["accounting"]["sha256"] = json!(memory_sha256(
+            &serde_json::to_vec(&json!({
+                "summary":page["accounting"]["summary"],"rounds":page["accounting"]["rounds"],
+            }))
+            .expect("snapshot JSON")
+        ));
+    }
+
+    fn accounting_fixture() -> Value {
+        let mut page = json!({
+            "runId":"a".repeat(64),"sessionId":"owned-session","revision":4,"turn":2,
+            "status":"outcome_unknown","durable":true,"acknowledged":false,"automaticReplay":false,
+            "accounting":{"available":true,"offset":0,"endOffset":2,"nextOffset":null,"totalRounds":2,
+                "summary":{"available":true,"recordedRounds":2,"completeCounterRounds":1,"partialCounterRounds":0,
+                    "unreportedRounds":1,"allPrimaryCountersReported":false,"aggregationOverflow":false,
+                    "costCalculated":false,"billingReconciled":false,"recordSource":"provider_journal",
+                    "journalRevision":2,"journalClosed":false,"attemptsMayBeUnsent":true,
+                    "observedTokens":{"inputTokens":5,"outputTokens":2,"totalTokens":7,"cachedInputTokens":1,"reasoningTokens":1}},
+                "rounds":[{"round":0,"response":{"provider":"actual-provider","model":"actual-model",
+                    "responseId":"remote-response","usageReporting":"complete","finishReason":"length",
+                    "observedTokens":{"inputTokens":5,"outputTokens":2,"totalTokens":7,"cachedInputTokens":1,"reasoningTokens":1}}},
+                    {"round":1,"response":null}]},
+        });
+        stamp_accounting_fixture(&mut page);
+        page
+    }
+
+    #[test]
+    fn accounting_pages_validate_counts_and_provenance_even_with_a_matching_digest() {
+        let parameters = json!({"runId":"a".repeat(64),"accountingPage":{"revision":4,"offset":0}});
+        let original = accounting_fixture();
+        assert!(check_accounting_page(&original.to_string(), &parameters).is_ok());
+        for (pointer, value) in [
+            ("/runId", json!("b".repeat(64))),
+            ("/sessionId", json!("")),
+            ("/revision", json!(5)),
+            ("/turn", Value::Null),
+            ("/status", json!("running")),
+            ("/durable", json!(false)),
+            ("/acknowledged", json!(true)),
+            ("/automaticReplay", json!(true)),
+            ("/accounting/offset", json!(1)),
+            ("/accounting/endOffset", json!(1)),
+            ("/accounting/nextOffset", json!(0)),
+            ("/accounting/totalRounds", json!(1025)),
+            ("/accounting/summary/completeCounterRounds", json!(0)),
+            ("/accounting/summary/costCalculated", json!(true)),
+            ("/accounting/summary/billingReconciled", json!(true)),
+            ("/accounting/summary/journalRevision", json!(0)),
+            ("/accounting/summary/recordSource", json!("future-source")),
+            ("/accounting/summary/observedTokens/totalTokens", json!(9)),
+            ("/accounting/rounds/0/round", json!(1)),
+            ("/accounting/rounds/1/round", json!(0)),
+            (
+                "/accounting/rounds/0/response/provider",
+                json!("bad\nidentity"),
+            ),
+            (
+                "/accounting/rounds/0/response/model",
+                json!("x".repeat(513)),
+            ),
+            ("/accounting/rounds/0/response/responseId", json!("")),
+            (
+                "/accounting/rounds/0/response/finishReason",
+                json!("unknown"),
+            ),
+            (
+                "/accounting/rounds/0/response/usageReporting",
+                json!("unreported"),
+            ),
+            (
+                "/accounting/rounds/0/response/observedTokens/cachedInputTokens",
+                json!(6),
+            ),
+            (
+                "/accounting/rounds/0/response/observedTokens/reasoningTokens",
+                json!(3),
+            ),
+            (
+                "/accounting/rounds/0/response/observedTokens/totalTokens",
+                json!(8),
+            ),
+        ] {
+            let mut changed = original.clone();
+            *changed.pointer_mut(pointer).expect("fixture field") = value;
+            stamp_accounting_fixture(&mut changed);
+            assert!(
+                check_accounting_page(&changed.to_string(), &parameters).is_err(),
+                "{pointer}"
+            );
+        }
+        let mut changed = original.clone();
+        changed["accounting"]["rounds"][0]["response"]["prompt"] = json!("private-content");
+        stamp_accounting_fixture(&mut changed);
+        assert!(check_accounting_page(&changed.to_string(), &parameters).is_err());
+        changed = original.clone();
+        changed["accounting"]["summary"]["observedTokens"]["inputTokens"] = json!(6);
+        changed["accounting"]["summary"]["observedTokens"]["totalTokens"] = json!(8);
+        stamp_accounting_fixture(&mut changed);
+        assert!(check_accounting_page(&changed.to_string(), &parameters).is_err());
+        changed = original.clone();
+        changed["accounting"]["sha256"] = json!("0".repeat(64));
+        assert!(check_accounting_page(&changed.to_string(), &parameters).is_err());
+        changed = original.clone();
+        changed["accounting"] = json!({"available":false});
+        assert!(check_accounting_page(&changed.to_string(), &parameters).is_ok());
+        changed["accounting"]["rounds"] = json!([]);
+        assert!(check_accounting_page(&changed.to_string(), &parameters).is_err());
+        let mut zero = original;
+        let zero_tokens = json!({"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0});
+        zero["accounting"]["summary"]["observedTokens"] = zero_tokens.clone();
+        zero["accounting"]["rounds"][0]["response"]["observedTokens"] = zero_tokens;
+        stamp_accounting_fixture(&mut zero);
+        assert!(check_accounting_page(&zero.to_string(), &parameters).is_ok());
+    }
+
+    #[test]
+    fn accounting_continuations_require_snapshot_and_contiguous_rounds() {
+        let mut snapshot = accounting_fixture();
+        snapshot["accounting"]["totalRounds"] = json!(17);
+        snapshot["accounting"]["endOffset"] = json!(17);
+        snapshot["accounting"]["summary"]["recordedRounds"] = json!(17);
+        snapshot["accounting"]["summary"]["unreportedRounds"] = json!(16);
+        let first = snapshot["accounting"]["rounds"][0].clone();
+        snapshot["accounting"]["rounds"] = json!(
+            std::iter::once(first)
+                .chain((1..17).map(|round| json!({"round":round,"response":null})))
+                .collect::<Vec<_>>()
+        );
+        stamp_accounting_fixture(&mut snapshot);
+        let digest = snapshot["accounting"]["sha256"].clone();
+        let mut first = snapshot.clone();
+        first["accounting"]["rounds"]
+            .as_array_mut()
+            .expect("rounds")
+            .truncate(16);
+        first["accounting"]["endOffset"] = json!(16);
+        first["accounting"]["nextOffset"] = json!(16);
+        let mut parameters =
+            json!({"runId":"a".repeat(64),"accountingPage":{"revision":4,"offset":0}});
+        assert!(check_accounting_page(&first.to_string(), &parameters).is_ok());
+        assert!(check_accounting_page(&snapshot.to_string(), &parameters).is_err());
+        let mut last = snapshot;
+        last["accounting"]["offset"] = json!(16);
+        last["accounting"]["rounds"] = json!([{"round":16,"response":null}]);
+        parameters["accountingPage"]["offset"] = json!(16);
+        assert!(check_accounting_page(&last.to_string(), &parameters).is_err());
+        parameters["accountingPage"]["sha256"] = digest;
+        assert!(check_accounting_page(&last.to_string(), &parameters).is_ok());
+        last["accounting"]["rounds"][0]["round"] = json!(15);
+        assert!(check_accounting_page(&last.to_string(), &parameters).is_err());
+        last["accounting"]["rounds"][0]["round"] = json!(16);
+        parameters["accountingPage"]["sha256"] = json!("0".repeat(64));
+        assert!(check_accounting_page(&last.to_string(), &parameters).is_err());
+    }
 
     #[test]
     fn partial_export_pages_pin_all_identity_fields_and_verify_the_complete_utf8_digest() {
@@ -786,7 +1205,7 @@ pub(super) fn parse(
             }
             (method, scope, params)
         }
-        "run" | "ack-run" | "partial-run" | "export-partial" => {
+        "run" | "ack-run" | "partial-run" | "export-partial" | "accounting-run" => {
             let id = positional()?;
             if id.len() != 64
                 || !id
@@ -796,13 +1215,18 @@ pub(super) fn parse(
                 return Err(invalid());
             }
             let mut params = json!({"runId": id});
-            if matches!(command, "ack-run" | "partial-run" | "export-partial") {
+            if matches!(
+                command,
+                "ack-run" | "partial-run" | "export-partial" | "accounting-run"
+            ) {
                 let revision = positional()?
                     .parse::<u64>()
                     .ok()
                     .filter(|revision| *revision > 0)
                     .ok_or_else(invalid)?;
-                if matches!(command, "partial-run" | "export-partial") {
+                if command == "accounting-run" {
+                    params["accountingPage"] = json!({"revision":revision,"offset":0});
+                } else if matches!(command, "partial-run" | "export-partial") {
                     params["partialPage"] = json!({"revision":revision,"offset":0});
                 } else {
                     params["acknowledgeRevision"] = json!(revision);
@@ -924,7 +1348,7 @@ pub(super) fn parse(
                 .ok_or_else(invalid)?;
             params["limit"] = json!(limit);
         } else if arguments[index] == "--offset" {
-            if command != "partial-run" || partial_offset_seen {
+            if !matches!(command, "partial-run" | "accounting-run") || partial_offset_seen {
                 return Err(invalid());
             }
             index += 1;
@@ -933,12 +1357,30 @@ pub(super) fn parse(
                 .ok_or_else(invalid)?
                 .parse::<usize>()
                 .ok()
-                .filter(|offset| *offset <= 4 * 1024 * 1024)
+                .filter(|offset| {
+                    *offset
+                        <= if command == "accounting-run" {
+                            1024
+                        } else {
+                            4 * 1024 * 1024
+                        }
+                })
                 .ok_or_else(invalid)?;
-            params["partialPage"]["offset"] = json!(offset);
+            params[if command == "accounting-run" {
+                "accountingPage"
+            } else {
+                "partialPage"
+            }]["offset"] = json!(offset);
             partial_offset_seen = true;
         } else if arguments[index] == "--sha256" {
-            if command != "partial-run" || params["partialPage"].get("sha256").is_some() {
+            let page = if command == "accounting-run" {
+                "accountingPage"
+            } else {
+                "partialPage"
+            };
+            if !matches!(command, "partial-run" | "accounting-run")
+                || params[page].get("sha256").is_some()
+            {
                 return Err(invalid());
             }
             index += 1;
@@ -952,7 +1394,7 @@ pub(super) fn parse(
             {
                 return Err(invalid());
             }
-            params["partialPage"]["sha256"] = json!(digest);
+            params[page]["sha256"] = json!(digest);
         } else if arguments[index] == "--wait-ms" {
             if command != "run" || wait_seen {
                 return Err(invalid());
@@ -994,11 +1436,16 @@ pub(super) fn parse(
             parse_failure("send requires an explicit --idempotency-key", arguments)
         })?);
     }
-    if command == "partial-run"
-        && params["partialPage"]["offset"]
+    let page = if command == "accounting-run" {
+        "accountingPage"
+    } else {
+        "partialPage"
+    };
+    if matches!(command, "partial-run" | "accounting-run")
+        && params[page]["offset"]
             .as_u64()
             .is_some_and(|offset| offset > 0)
-        && params["partialPage"].get("sha256").is_none()
+        && params[page].get("sha256").is_none()
     {
         return Err(invalid());
     }
@@ -2031,6 +2478,15 @@ pub(super) async fn run(command: NativeCommand) -> RenderedResult {
                     )
                 })?;
                 check_partial_page(encoded.as_json(), &parameters)?;
+            }
+            if parameters.get("accountingPage").is_some() {
+                let encoded = response.payload().value().ok_or_else(|| {
+                    DiagnosticFailure::protocol(
+                        "invalid_accounting_page",
+                        "Gateway accounting page is missing",
+                    )
+                })?;
+                check_accounting_page(encoded.as_json(), &parameters)?;
             }
             let payload = response
                 .payload()

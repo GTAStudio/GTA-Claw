@@ -256,6 +256,7 @@ commands:
     gateway abort <session>     cancel the current turn in that session
     gateway run <run-id>        query a durable run; optional --wait-ms <0..120000>
     gateway partial-run <run-id> <revision>  read partial text; --offset <bytes> --sha256 <digest>
+    gateway accounting-run <run-id> <revision>  read usage rounds; --offset <rounds> --sha256 <digest>
     gateway export-partial <run-id> <revision> --destination <absolute-file>
                                                             export all verified partial-text pages without ACK or replay
     gateway results <session>   list pending results; optional --after <cursor>

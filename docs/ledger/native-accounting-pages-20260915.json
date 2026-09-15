@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-owner-bound-provider-round-accounting-pages",
+  "capturedOn": "2026-09-15",
+  "baseCommit": "85f2b4017396abf11d6df758ce96f2bdd95a6b12",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "cargoLockSha256": "7460323a924655a77c0c4fec247dd1635d72d7b358b889359e86aaf12100f674",
+  "sourceFiles": [
+    { "path": "apps/gta-claw-daemon/src/adapters/agent_runtime.rs", "sha256": "45402f4206be908474101b396a809af7565f18a5c46434a8bb6e2cc41f0610be" },
+    { "path": "apps/gta-claw-daemon/src/adapters/runtime_gateway.rs", "sha256": "15071faa543914888fc1836bf8bdbdb3a533e0b4985faa76978ce762369226b5" },
+    { "path": "apps/gta-claw-daemon/tests/production_composition.rs", "sha256": "613ae210e98cba817bea6fee94346dfff95b24ae2776bdbac358c2f9ed38fc75" },
+    { "path": "apps/gta-claw-cli/src/native_gateway.rs", "sha256": "c324617bcf4a06b28f37df600bbf0869fe0eac5817be8798f2e7fc17046fcc34" },
+    { "path": "apps/gta-claw-cli/src/lib.rs", "sha256": "835b3151de94983bb108ec33c6dd69791db97d237c1eadb7482af225ec6598af" },
+    { "path": "apps/gta-claw-cli/tests/gateway_health.rs", "sha256": "6ea90f3a4006f57c855bd44cfea3aa1526dcb796a1e0976f4d8f20101d8b7839" }
+  ],
+  "checks": [
+    {
+      "command": "cargo +stable test -p gta-claw-cli -p gta-claw-daemon --all-targets --no-fail-fast --locked --offline -j 2",
+      "result": "passed", "exitCode": 0, "passed": 340, "failed": 0, "ignored": 5, "testBinaries": 14,
+      "log": "target/native-accounting-pages-tests-20260915.log",
+      "sha256": "ccf56dd0feb52feb97a7a9b3e448b0bd296ac7fcbc29bf38b50fe0b106bc6da7",
+      "scopeNote": "99 CLI and 241 daemon passing tests. The runtime initialization error line is the existing passing runtime_initialization_failure_is_typed_and_non_panicking fault-injection test"
+    },
+    {
+      "command": "cargo +stable clippy -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline -j 2 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-accounting-pages-clippy-20260915.log",
+      "sha256": "24547c96e1a5e5d11222e57c6034f292a75a24cb2783d1d24697d9f6fd2e9660"
+    }
+  ],
+  "behaviorEvidence": [
+    "gateway_accounting_pages_pin_rounds_provenance_and_unknown_reports",
+    "native_accounting_page_requires_a_bound_read_without_other_operations",
+    "accounting_run_command_is_bounded_read_only_and_pins_continuations",
+    "accounting_pages_validate_counts_and_provenance_even_with_a_matching_digest",
+    "accounting_continuations_require_snapshot_and_contiguous_rounds",
+    "accounting_run_cli_verifies_pages_with_one_read_and_no_ack_or_replay",
+    "bound_explicit_memory_model_calls_keep_notes_scoped_to_the_gateway_device",
+    "bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection"
+  ],
+  "retainedFailures": [
+    { "reason": "First daemon compile failed because the test lacked its JSON macro import and SHA-2 0.11 output no longer implements LowerHex. Reused neighboring digest encoding and added the test import; the identical focused test then passed. Original output remains in session history" },
+    { "reason": "First CLI partial regression required seven minutes of fresh dependency compilation and moved to the background. Its actual completion notification confirmed four tests passed; no duplicate build or assumed completion was used" }
+  ],
+  "notes": [
+    "Native agent.wait accountingPage requires the current terminal run revision, validates authenticated device ownership before record access, and refuses mixed partial/ACK/wait operations. It reads terminal TurnRecord or falls back to the independent provider journal",
+    "One page contains at most 16 of 1024 already-bounded contiguous rounds. Summary and all round responses are hashed as ordered UTF-8 JSON; continuation carries that SHA256 and refuses source, journal generation/closure or response changes",
+    "Rows expose only stored provider/model/response identity, primary coverage, token/subset counts and confirmed finish reason. Missing response remains null; no record is unavailable, while an existing zero-round record remains an available empty snapshot",
+    "CLI gateway accounting-run asks only operator.read on one connection and sends one RPC. Closed typed validation checks identities, bounds, page continuity, provenance, aggregate/subset arithmetic, reporting classes and unsupported settlement flags before any page output",
+    "Complete single-page snapshots independently verify their full digest. Individual continuation pages only pin the full snapshot digest, check local rows against totals, and are not a full local archive or cryptographic per-page proof",
+    "Nine real CLI subprocess/WebSocket cases cover full/zero/missing/unreported/open journal/continuation and three invalid pages. Request counters prove no ACK/replay and invalid replies do not render response metadata, content or the stdin credential",
+    "Existing real Chat, Responses and Anthropic daemon fixtures now read complete two-round and partial-terminal pages. The Chat process-interruption/restart fixture reads the original open journal. Model invocation counts remain unchanged, results remain pending and another paired read-only device receives no accounting payload",
+    "The extension supports manual response-by-response billing comparison, not a price calculation, settled invoice, hard monetary cap or permission to replay unknown external effects. costCalculated and billingReconciled stay false",
+    "No dependency/lock, sealed contract, runtime retry, credential policy or provider execution change. These two packages' full targets and strict Clippy are the scoped gate; prior root-check receipts are not relabeled as current full-root testing",
+    "No real model/cloud account, device, deployment, production proxy restart, node switch or user-state migration occurred. Original credential/OAuth anomaly evidence and cargo-deny policy debt remain open"
+  ],
+  "unverified": [
+    "Automatic full multi-page accounting export with whole-snapshot verification, TUI/desktop detailed round inspectors and provider invoice ingestion",
+    "Versioned prices, charge allocation, billing reconciliation, monetary reservation and rolling/global quotas",
+    "Complete model configuration product workflow, real accounts, cross-platform client acceptance and release gates",
+    "Earlier intermittent native credential/OAuth failures and supply-chain duplicate-version policy gaps"
+  ]
+}

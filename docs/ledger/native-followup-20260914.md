@@ -2895,3 +2895,31 @@ Clippy and an independently completed root all-target check pass. The first root
 incomplete and is retained separately, not relabeled successful. Unified typed
 configuration, full provider-specific cleanup, monetary budgeting/invoice reconciliation and real
 account/platform acceptance remain open. Earlier credential/OAuth failures remain unresolved.
+
+## Provider Round Accounting Pages
+
+The [round-page record](native-accounting-pages-20260915.json) reports 340 passing tests and five
+existing ignored entries across CLI/daemon full targets, plus strict all-target Clippy. The six source
+witnesses describe this slice; no new full-root or platform acceptance is inferred from older checks.
+
+Native agent.wait adds mutually exclusive accountingPage reads bound to the authenticated device and
+current terminal run revision. The handler reads the terminal turn or recovered independent journal,
+never runs a provider. Each page contains at most 16 of the existing 1024 bounded rounds. A SHA-256
+over the summary and full round sequence fixes record source, journal generation/closure and response
+metadata across pages. Unknown responses stay null; unavailable and known empty records differ.
+
+CLI gateway accounting-run exposes this as one explicit operator.read RPC, with bounded offset and
+digest continuation. Closed typed replies validate identity, count/subset arithmetic, provenance,
+contiguous rows and unchanged safety flags before rendering. A complete single page verifies its full
+digest; one continuation only pins the whole snapshot and cannot independently verify all its bytes.
+No prompt, answer, reasoning or tool argument is included; no ACK, budget change or replay is issued.
+
+Nine actual CLI subprocess cases prove valid and invalid pages, minimal scopes, no credential/invalid
+metadata output and exactly one request. Existing three-dialect production fixtures now read complete
+and partial-terminal rounds and refuse a second paired reader. The owned Chat interruption/restart
+case retains its open journal and original request counts. Existing result-pending checks still pass.
+
+This provides response identities and observed counters for manual bill comparison, not monetary
+prices, hard limits or settled invoices. Automatic complete export, detailed GUI round inspectors,
+invoice ingestion and real provider billing remain separate. Earlier credential/OAuth failures and
+supply-chain policy debt are unchanged. No real account, device, deployment or production/proxy change.

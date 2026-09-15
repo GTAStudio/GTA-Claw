@@ -354,6 +354,31 @@ Reading does not ACK, retry or clear an unknown outcome. See the
 [journal record](../../docs/ledger/native-provider-journal-20260915.json) and the earlier
 [accounting record](../../docs/ledger/native-provider-accounting-20260915.json).
 
+For a response-by-response comparison, read the retained rounds using the current terminal run
+revision from `gateway run`:
+
+```powershell
+gta-claw-cli gateway accounting-run $runId $revision --endpoint ws://127.0.0.1:18789 --device-profile work
+gta-claw-cli gateway accounting-run $runId $revision --offset $nextOffset --sha256 $sha256 --endpoint ws://127.0.0.1:18789 --device-profile work
+```
+
+Each invocation requests only `operator.read` and returns at most 16 of the retained 1024 rounds.
+The offset is a round index, not a byte offset. Use the returned `accounting.nextOffset` and
+`accounting.sha256` for the next explicit read. A changed run revision, source, journal revision,
+closure state or recorded response refuses continuation. The SHA-256 covers the UTF-8 JSON of
+`{"summary":<summary>,"rounds":<all rounds>}` with the server's original field order. A complete
+single page verifies this entire digest locally; an individual continuation only binds that digest
+and cannot independently prove the entire snapshot. There is no automatic multi-page export yet.
+
+Each reported response includes its actual provider/model/response identity, reporting coverage,
+observed token counters and finish reason. `response:null` is an unconfirmed attempt, not a zero-cost
+request. `accounting.available:false` means no retained accounting record; an available record with
+zero rounds is separately represented. Pages contain no prompt, answer, reasoning or tool arguments.
+An open recovered journal and `outcome_unknown` stay open/unknown. Reads never ACK results, repeat
+provider calls, change budgets or reconcile invoices. Counters are not monetary cost, and cached/
+reasoning counters are included subsets, not extra totals. See the
+[round-page record](../../docs/ledger/native-accounting-pages-20260915.json).
+
 The daemon's native OpenAI/Anthropic `GTA_CLAW_PROVIDER_POLICY` may optionally include
 `"maxObservedTurnTokens":10000`. This is fixed at runtime startup and defaults to no threshold.
 Before another model round, the runtime requires complete prior primary counters and checks their

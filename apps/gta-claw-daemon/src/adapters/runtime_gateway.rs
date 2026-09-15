@@ -449,12 +449,13 @@ struct RunParams {
     #[serde(default)]
     timeout_ms: u64,
     acknowledge_revision: Option<u64>,
-    partial_page: Option<PartialRunPageParams>,
+    partial_page: Option<RunPageParams>,
+    accounting_page: Option<RunPageParams>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct PartialRunPageParams {
+struct RunPageParams {
     revision: u64,
     offset: usize,
     sha256: Option<String>,
@@ -463,20 +464,34 @@ struct PartialRunPageParams {
 impl RunParams {
     fn decode(params: Value) -> Result<Self, ()> {
         let params: Self = serde_json::from_value(params).map_err(|_| ())?;
-        if let Some(page) = &params.partial_page
-            && (params.timeout_ms != 0
-                || params.acknowledge_revision.is_some()
-                || page.revision == 0
-                || page.offset > claw_runtime::stream::MAX_ASSEMBLED_BYTES
-                || (page.offset > 0 && page.sha256.is_none())
-                || page.sha256.as_ref().is_some_and(|digest| {
-                    digest.len() != 64
-                        || !digest
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                }))
-        {
+        if params.partial_page.is_some() && params.accounting_page.is_some() {
             return Err(());
+        }
+        for (page, limit) in [
+            (
+                params.partial_page.as_ref(),
+                claw_runtime::stream::MAX_ASSEMBLED_BYTES,
+            ),
+            (
+                params.accounting_page.as_ref(),
+                claw_application::ports::provider::MAX_PROVIDER_ROUND_RECORDS,
+            ),
+        ] {
+            if let Some(page) = page
+                && (params.timeout_ms != 0
+                    || params.acknowledge_revision.is_some()
+                    || page.revision == 0
+                    || page.offset > limit
+                    || (page.offset > 0 && page.sha256.is_none())
+                    || page.sha256.as_ref().is_some_and(|digest| {
+                        digest.len() != 64
+                            || !digest
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    }))
+            {
+                return Err(());
+            }
         }
         Ok(params)
     }
@@ -566,6 +581,22 @@ impl MethodHandler for RuntimeSessionHandler {
                 }
                 "agent.wait" => {
                     let params = RunParams::decode(params).map_err(|()| invalid())?;
+                    if let Some(page) = params.accounting_page {
+                        return runtime
+                            .gateway_accounting_run(
+                                context.device_id,
+                                &params.run_id,
+                                page.revision,
+                                page.offset,
+                                page.sha256.as_deref(),
+                            )
+                            .await
+                            .map_err(|error| state_dispatch_error(context.method, &error))?
+                            .ok_or(DispatchError::NotFound {
+                                kind: "run",
+                                id: params.run_id,
+                            });
+                    }
                     if let Some(page) = params.partial_page {
                         return runtime
                             .gateway_partial_run(
@@ -663,6 +694,38 @@ mod tests {
             call_id: ToolCallId::new("call").expect("call"),
             tool_name: "write-file".to_owned(),
             arguments: r#"{"path":"example.txt"}"#.to_owned(),
+        }
+    }
+
+    #[test]
+    fn native_accounting_page_requires_a_bound_read_without_other_operations() {
+        let valid = json!({"runId":"owned-run","accountingPage":{"revision":3,"offset":0}});
+        assert!(RunParams::decode(valid.clone()).is_ok());
+        let mut next = valid.clone();
+        next["accountingPage"]["offset"] = json!(16);
+        assert!(RunParams::decode(next.clone()).is_err());
+        next["accountingPage"]["sha256"] = json!("a".repeat(64));
+        assert!(RunParams::decode(next).is_ok());
+        for (field, value) in [
+            ("revision", json!(0)),
+            ("offset", json!(1025)),
+            ("offset", json!(-1)),
+            ("offset", json!(0.5)),
+            ("sha256", json!("A".repeat(64))),
+            ("includeContent", json!(true)),
+        ] {
+            let mut changed = valid.clone();
+            changed["accountingPage"][field] = value;
+            assert!(RunParams::decode(changed).is_err());
+        }
+        for (field, value) in [
+            ("timeoutMs", json!(1)),
+            ("acknowledgeRevision", json!(3)),
+            ("partialPage", json!({"revision":3,"offset":0})),
+        ] {
+            let mut changed = valid.clone();
+            changed[field] = value;
+            assert!(RunParams::decode(changed).is_err());
         }
     }
 

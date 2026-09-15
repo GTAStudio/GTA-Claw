@@ -955,6 +955,170 @@ async fn partial_export_cli_collects_verified_pages_without_ack_or_overwriting_f
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accounting_run_cli_verifies_pages_with_one_read_and_no_ack_or_replay() {
+    use std::fmt::Write as _;
+    for scenario in [
+        "complete",
+        "zero",
+        "missing",
+        "unreported",
+        "journal",
+        "continuation",
+        "bad-digest",
+        "bad-count",
+        "extra-content",
+    ] {
+        let expected_success = !matches!(scenario, "bad-digest" | "bad-count" | "extra-content");
+        let zero = matches!(scenario, "zero" | "unreported");
+        let tokens = json!({"inputTokens":if zero {0} else {5},"outputTokens":if zero {0} else {2},"totalTokens":if zero {0} else {7},"cachedInputTokens":0,"reasoningTokens":0});
+        let summary = json!({
+            "available":true,"recordedRounds":1,"completeCounterRounds":u16::from(!matches!(scenario,"unreported" | "journal")),
+            "partialCounterRounds":u16::from(scenario == "journal"),"unreportedRounds":u16::from(scenario == "unreported"),
+            "allPrimaryCountersReported":!matches!(scenario,"unreported" | "journal"),"observedTokens":tokens,
+            "aggregationOverflow":false,"costCalculated":false,"billingReconciled":false,
+            "recordSource":"terminal_turn","attemptsMayBeUnsent":true,
+        });
+        let response = json!({"provider":"fixture","model":"untrusted-model-fixture","responseId":"synthetic-response",
+            "usageReporting":if scenario == "journal" {"partial"} else {"complete"},"finishReason":"length","observedTokens":tokens});
+        let mut snapshot = json!({"summary":summary,"rounds":[{"round":0,"response":if scenario == "unreported" {Value::Null} else {response.clone()}}]});
+        if scenario == "journal" {
+            snapshot["summary"]["recordSource"] = json!("provider_journal");
+            snapshot["summary"]["journalRevision"] = json!(2);
+            snapshot["summary"]["journalClosed"] = json!(false);
+        } else if scenario == "continuation" {
+            snapshot["summary"]["recordedRounds"] = json!(17);
+            snapshot["summary"]["unreportedRounds"] = json!(16);
+            snapshot["summary"]["allPrimaryCountersReported"] = json!(false);
+            snapshot["rounds"] = json!((0..17).map(|round| json!({"round":round,"response":if round == 16 {response.clone()} else {Value::Null}})).collect::<Vec<_>>());
+        }
+        let mut digest = String::with_capacity(64);
+        for byte in ring::digest::digest(
+            &ring::digest::SHA256,
+            &serde_json::to_vec(&snapshot).expect("snapshot"),
+        )
+        .as_ref()
+        {
+            write!(digest, "{byte:02x}").expect("digest");
+        }
+        let mut parameters =
+            json!({"runId":"a".repeat(64),"accountingPage":{"revision":4,"offset":0}});
+        let mut page = json!({
+            "runId":"a".repeat(64),"sessionId":"owned-session","revision":4,"turn":0,"status":"outcome_unknown",
+            "durable":true,"acknowledged":false,"automaticReplay":false,
+            "accounting":{"available":true,"offset":0,"endOffset":1,"nextOffset":null,"totalRounds":1,"sha256":digest,"summary":snapshot["summary"],"rounds":snapshot["rounds"]},
+        });
+        if scenario == "missing" {
+            page["accounting"] = json!({"available":false});
+        } else if scenario == "continuation" {
+            parameters["accountingPage"]["offset"] = json!(16);
+            parameters["accountingPage"]["sha256"] = json!(digest);
+            page["accounting"]["offset"] = json!(16);
+            page["accounting"]["endOffset"] = json!(17);
+            page["accounting"]["totalRounds"] = json!(17);
+            page["accounting"]["rounds"] = json!([snapshot["rounds"][16]]);
+        } else if scenario == "bad-digest" {
+            page["accounting"]["sha256"] = json!("0".repeat(64));
+        } else if scenario == "bad-count" {
+            page["accounting"]["rounds"][0]["response"]["observedTokens"]["totalTokens"] = json!(8);
+        } else if scenario == "extra-content" {
+            page["accounting"]["rounds"][0]["response"]["prompt"] =
+                json!("private-content-must-not-render");
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&calls);
+        let expected = parameters.clone();
+        let returned = page.clone();
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let calls = Arc::clone(&captured);
+            let expected = expected.clone();
+            let page = page.clone();
+            async move {
+                send_challenge(&mut socket).await;
+                let (connect, params) = receive_connect(&mut socket).await;
+                support::verify_connect_proof(&params);
+                assert_eq!(
+                    params
+                        .scopes
+                        .as_ref()
+                        .expect("requested scopes")
+                        .iter()
+                        .map(claw_protocol::gateway::Name::as_str)
+                        .collect::<Vec<_>>(),
+                    ["operator.read"]
+                );
+                send_hello(
+                    &mut socket,
+                    connect.id(),
+                    "accounting-fixture",
+                    4,
+                    AUTHENTICATED_MAX_FRAME_BYTES,
+                    "operator",
+                    &["operator.read"],
+                )
+                .await;
+                let request = receive_request(&mut socket).await;
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(request.method().as_str(), "agent.wait");
+                let actual: Value =
+                    serde_json::from_str(request.params().value().expect("parameters").as_json())
+                        .expect("request JSON");
+                assert_eq!(actual, expected);
+                send_json(
+                    &mut socket,
+                    json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":page}),
+                )
+                .await;
+                loop {
+                    match socket.read_frame().await {
+                        Ok(frame) if frame.opcode == fastwebsockets::OpCode::Text => {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(frame) if frame.opcode == fastwebsockets::OpCode::Close => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        }))
+        .await;
+        let mut arguments: Vec<OsString> = ["gateway", "accounting-run", &"a".repeat(64), "4"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        if scenario == "continuation" {
+            arguments.extend(
+                ["--offset", "16", "--sha256", &digest]
+                    .into_iter()
+                    .map(OsString::from),
+            );
+        }
+        arguments.extend(gateway_arguments(gateway.url.as_str()).into_iter().skip(2));
+        let output = run_cli(arguments, Some(TOKEN)).await;
+        assert_eq!(
+            output.status.success(),
+            expected_success,
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let document: Value = serde_json::from_slice(&output.stdout).expect("pure JSON result");
+        let stdout = String::from_utf8(output.stdout).expect("UTF8 JSON");
+        if expected_success {
+            assert_eq!(document["method"], "agent.wait");
+            assert_eq!(document["result"], returned);
+            assert_eq!(document["shutdown_clean"], true);
+        } else {
+            assert!(stdout.contains("invalid_accounting_page"));
+            assert!(!stdout.contains("untrusted-model-fixture"));
+            assert!(!stdout.contains("private-content-must-not-render"));
+        }
+        assert!(!stdout.contains(TOKEN));
+        assert!(output.stderr.is_empty());
+        gateway.shutdown().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{scenario}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_run_cli_rejects_corrupt_pages_without_rendering_their_text() {
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&calls);

@@ -1079,6 +1079,30 @@ fn run_bound_typed_memory_model_calls(dialect: &str) {
             assert_eq!(result["providerAccounting"]["costCalculated"],false);
             assert_eq!(result["providerAccounting"]["billingReconciled"],false);
             assert_eq!(result["providerAccounting"]["recordSource"],"terminal_turn");
+            let params = json!({"runId":accepted["runId"],"accountingPage":{"revision":result["revision"],"offset":0}});
+            let page = client.request(request_id("accounting-rounds"), method("agent.wait"), &params).await.expect("owned accounting page");
+            assert!(page.ok(), "{page:?}");
+            let page: Value = serde_json::from_str(page.payload().value().expect("page").as_json()).expect("page JSON");
+            assert_eq!(page["accounting"]["totalRounds"], 2);
+            assert_eq!(page["accounting"]["summary"], result["providerAccounting"]);
+            assert_eq!(page["acknowledged"], false);
+            assert_eq!(page["automaticReplay"], false);
+            assert!(page.get("result").is_none());
+            for (index, round) in page["accounting"]["rounds"].as_array().expect("rounds").iter().enumerate() {
+                assert_eq!(round["round"], index);
+                assert_eq!(round["response"]["usageReporting"], "complete");
+                assert_eq!(round["response"]["observedTokens"]["totalTokens"], 7);
+                assert!(round["response"]["provider"].as_str().is_some_and(|identity| !identity.is_empty()));
+                assert!(round["response"]["model"].as_str().is_some_and(|identity| !identity.is_empty()));
+                assert!(round["response"]["responseId"].as_str().is_some_and(|identity| !identity.is_empty()));
+                assert!(round["response"].get("text").is_none());
+            }
+            for (case, field, value) in [("revision", "revision", json!(result["revision"].as_u64().expect("revision") + 1)), ("digest", "sha256", json!("0".repeat(64))), ("offset", "offset", json!(1))] {
+                let mut invalid = params.clone();
+                invalid["accountingPage"][field] = value;
+                let refused = client.request(request_id(&format!("accounting-{case}")), method("agent.wait"), &invalid).await.expect("refused accounting read");
+                assert!(!refused.ok(), "{case}");
+            }
             client.shutdown().await.expect("client shutdown");
         });
     }
@@ -1165,6 +1189,16 @@ fn run_bound_typed_memory_model_calls(dialect: &str) {
             assert_eq!(unknown["providerAccounting"]["completeCounterRounds"],1);
             assert_eq!(unknown["providerAccounting"]["observedTokens"]["totalTokens"],7);
             assert_eq!(unknown["providerAccounting"]["billingReconciled"],false);
+            let page = client.request(RequestId::new("recovered-accounting",4096).expect("id"), method("agent.wait"),
+                &json!({"runId":interrupted_run,"accountingPage":{"revision":unknown["revision"],"offset":0}})).await.expect("recovered accounting page");
+            assert!(page.ok(), "{page:?}");
+            let page: Value = serde_json::from_str(page.payload().value().expect("page").as_json()).expect("page JSON");
+            assert_eq!(page["status"], "outcome_unknown");
+            assert_eq!(page["accounting"]["summary"], unknown["providerAccounting"]);
+            assert_eq!(page["accounting"]["totalRounds"], 1);
+            assert_eq!(page["accounting"]["rounds"][0]["response"]["observedTokens"]["totalTokens"], 7);
+            assert_eq!(page["acknowledged"], false);
+            assert_eq!(page["automaticReplay"], false);
             assert_eq!(requests.lock().expect("no automatic inference").len(),7);
             let new_run = client.request(RequestId::new("new-authorized-turn",4096).expect("id"),method("chat.send"),&json!({"sessionKey":"memory-model-first","message":"new explicit request after interruption, do not repeat the save","idempotencyKey":"new-after-interruption"})).await.expect("fresh submission");
             assert!(new_run.ok());
@@ -2045,6 +2079,20 @@ fn bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection(
                 assert_eq!(accounted["providerAccounting"]["observedTokens"]["totalTokens"],7);
                 assert_eq!(accounted["providerAccounting"]["costCalculated"],false);
                 assert_eq!(accounted["providerAccounting"]["billingReconciled"],false);
+                let accounting_page = client.request(
+                    RequestId::new(format!("accounting-round-page-{ordinal}"),4096).expect("accounting page id"),
+                    GatewayMethodName::Core(resolve_core_method("agent.wait").expect("agent.wait")),
+                    &json!({"runId":run,"accountingPage":{"revision":terminal["revision"],"offset":0}}),
+                ).await.expect("partial terminal accounting page");
+                assert!(accounting_page.ok(), "{accounting_page:?}");
+                let accounting_page: Value = serde_json::from_str(accounting_page.payload().value().expect("page").as_json()).expect("page JSON");
+                assert_eq!(accounting_page["status"], "outcome_unknown");
+                assert_eq!(accounting_page["accounting"]["summary"], accounted["providerAccounting"]);
+                assert_eq!(accounting_page["accounting"]["rounds"][0]["response"]["observedTokens"]["totalTokens"], 7);
+                assert!(matches!(accounting_page["accounting"]["rounds"][0]["response"]["finishReason"].as_str(), Some("length" | "content_filter")));
+                assert_eq!(accounting_page["acknowledged"], false);
+                assert_eq!(accounting_page["automaticReplay"], false);
+                assert!(!accounting_page.to_string().contains("unconfirmed-native-answer"));
                 let page_params = json!({"runId":run,"partialPage":{"revision":terminal["revision"],"offset":0}});
                 let page = client.request(
                     RequestId::new(format!("partial-page-{ordinal}"),4096).expect("page request id"),
@@ -2110,10 +2158,18 @@ fn bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection(
             assert!(request(daemon.http,"POST","/api/v1/admin/rpc",Some("operator-token"),Some(&approval)).starts_with("HTTP/1.1 200"));
             let (foreign_client,_) = GatewayClient::start(foreign_config()).expect("paired other device");
             foreign_client.wait_ready().await.expect("other device ready");
+            let foreign_page = foreign_page.expect("owned page parameters");
+            let denied_accounting = foreign_client.request(
+                RequestId::new("foreign-accounting-page",4096).expect("accounting request id"),
+                GatewayMethodName::Core(resolve_core_method("agent.wait").expect("agent.wait")),
+                &json!({"runId":foreign_page["runId"],"accountingPage":foreign_page["partialPage"]}),
+            ).await.expect("other device accounting refusal");
+            assert!(!denied_accounting.ok(), "another paired reader cannot read provider accounting");
+            assert!(denied_accounting.payload().value().is_none());
             let denied = foreign_client.request(
                 RequestId::new("foreign-partial-page",4096).expect("request id"),
                 GatewayMethodName::Core(resolve_core_method("agent.wait").expect("agent.wait")),
-                &foreign_page.expect("owned page parameters"),
+                &foreign_page,
             ).await.expect("other device receives refusal");
             assert!(!denied.ok(),"another paired device cannot read retained partial text");
             assert!(!format!("{denied:?}").contains("unconfirmed-native-answer"));

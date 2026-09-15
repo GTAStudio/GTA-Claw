@@ -1420,6 +1420,63 @@ fn partial_text_page(
     }))
 }
 
+fn provider_round_page(
+    records: &[claw_application::ports::provider::ProviderRoundRecord],
+    journal: Option<(u64, bool)>,
+    offset: usize,
+    expected_sha256: Option<&str>,
+) -> Result<Value, RuntimePortError> {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+    if offset > records.len()
+        || (offset > 0 && (offset == records.len() || expected_sha256.is_none()))
+        || journal.is_some_and(|(revision, _)| revision == 0)
+    {
+        return Err(RuntimePortError::Invalid(
+            "accounting page cursor is invalid".to_owned(),
+        ));
+    }
+    let mut summary = provider_accounting_summary(records)?;
+    summary["recordSource"] = json!(if journal.is_some() {
+        "provider_journal"
+    } else {
+        "terminal_turn"
+    });
+    summary["attemptsMayBeUnsent"] = json!(true);
+    if let Some((revision, closed)) = journal {
+        summary["journalRevision"] = json!(revision);
+        summary["journalClosed"] = json!(closed);
+    }
+    let rounds: Vec<Value> = records.iter().map(|record| json!({
+        "round":record.round,
+        "response":record.response.as_ref().map(|response| json!({
+            "provider":response.provider,"model":response.model,"responseId":response.response_id,
+            "usageReporting":response.usage_reporting.label(),"finishReason":response.finish_reason.label(),
+            "observedTokens":{"inputTokens":response.input_tokens,"outputTokens":response.output_tokens,
+                "totalTokens":response.input_tokens + response.output_tokens,
+                "cachedInputTokens":response.cached_input_tokens,"reasoningTokens":response.reasoning_tokens},
+        })),
+    })).collect();
+    let snapshot = json!({"summary":summary,"rounds":rounds});
+    let bytes = serde_json::to_vec(&snapshot)
+        .map_err(|_| RuntimePortError::Invalid("accounting snapshot encoding failed".to_owned()))?;
+    let mut sha256 = String::with_capacity(64);
+    for byte in sha2::Sha256::digest(&bytes) {
+        write!(sha256, "{byte:02x}").expect("bounded digest string");
+    }
+    if expected_sha256.is_some_and(|expected| expected != sha256) {
+        return Err(RuntimePortError::Conflict(
+            "accounting snapshot changed".to_owned(),
+        ));
+    }
+    let end = offset.saturating_add(16).min(records.len());
+    Ok(json!({
+        "available":true,"offset":offset,"endOffset":end,"totalRounds":records.len(),
+        "nextOffset":(end < records.len()).then_some(end),"sha256":sha256,
+        "summary":snapshot["summary"],"rounds":&snapshot["rounds"].as_array().expect("encoded rounds")[offset..end],
+    }))
+}
+
 fn provider_accounting_summary(
     records: &[claw_application::ports::provider::ProviderRoundRecord],
 ) -> Result<Value, RuntimePortError> {
@@ -2824,6 +2881,56 @@ impl AgentRuntime {
         Ok(Some(json!({
             "runId":run.id(),"sessionId":run.session_id(),"revision":run.revision(),"turn":run.turn(),
             "status":run.result().map(claw_state::RunResult::status),"partial":partial,
+            "durable":true,"acknowledged":false,"automaticReplay":false,
+        })))
+    }
+
+    pub(super) async fn gateway_accounting_run(
+        &self,
+        device: &str,
+        id: &str,
+        revision: u64,
+        offset: usize,
+        expected_sha256: Option<&str>,
+    ) -> Result<Option<Value>, RuntimePortError> {
+        let Some(run) = self.state.load_run(id, "gateway", device).await? else {
+            return Ok(None);
+        };
+        if revision == 0 || run.revision() != revision || run.result().is_none() {
+            return Err(RuntimePortError::Conflict(
+                "accounting read requires the current terminal run revision".to_owned(),
+            ));
+        }
+        let stored = if let Some(turn) = run.turn() {
+            let session = SessionId::new(run.session_id()).map_err(|_| {
+                RuntimePortError::Invalid("stored run session is invalid".to_owned())
+            })?;
+            let turn = TurnId::new(turn);
+            if let Some(record) = self.state.load_turn(&session, turn).await? {
+                Some((record.provider_rounds, None))
+            } else {
+                self.state
+                    .load_provider_journal(&session, turn)
+                    .await?
+                    .map(|journal| (journal.rounds, Some((journal.revision, journal.closed))))
+            }
+        } else {
+            None
+        };
+        let accounting = match stored {
+            Some((records, journal)) => {
+                provider_round_page(&records, journal, offset, expected_sha256)?
+            }
+            None if offset == 0 && expected_sha256.is_none() => json!({"available":false}),
+            None => {
+                return Err(RuntimePortError::NotFound(
+                    "accounting records are not available".to_owned(),
+                ));
+            }
+        };
+        Ok(Some(json!({
+            "runId":run.id(),"sessionId":run.session_id(),"revision":run.revision(),"turn":run.turn(),
+            "status":run.result().map(claw_state::RunResult::status),"accounting":accounting,
             "durable":true,"acknowledged":false,"automaticReplay":false,
         })))
     }
@@ -4334,6 +4441,59 @@ fn command_outcome_json(outcome: CommandOutcome) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gateway_accounting_pages_pin_rounds_provenance_and_unknown_reports() {
+        use claw_application::ports::provider::{
+            ProviderResponseFinish, ProviderResponseReport, ProviderRoundRecord, UsageReporting,
+        };
+        use serde_json::json;
+        let report = ProviderResponseReport {
+            provider: "actual-provider".to_owned(),
+            model: "actual-model".to_owned(),
+            response_id: Some("actual-response".to_owned()),
+            usage_reporting: UsageReporting::Complete,
+            input_tokens: 5,
+            output_tokens: 2,
+            cached_input_tokens: 1,
+            reasoning_tokens: 1,
+            finish_reason: ProviderResponseFinish::Length,
+        };
+        let mut rounds: Vec<ProviderRoundRecord> = (0..17)
+            .map(|round| ProviderRoundRecord {
+                round,
+                response: (round != 16).then(|| report.clone()),
+            })
+            .collect();
+        let first =
+            super::provider_round_page(&rounds, Some((18, false)), 0, None).expect("first page");
+        assert_eq!(first["rounds"].as_array().expect("round array").len(), 16);
+        assert_eq!(first["nextOffset"], 16);
+        assert_eq!(first["totalRounds"], 17);
+        assert_eq!(first["summary"]["recordSource"], "provider_journal");
+        assert_eq!(first["summary"]["journalClosed"], false);
+        assert_eq!(first["summary"]["unreportedRounds"], 1);
+        assert_eq!(first["summary"]["billingReconciled"], false);
+        let digest = first["sha256"].as_str().expect("digest");
+        let next = super::provider_round_page(&rounds, Some((18, false)), 16, Some(digest))
+            .expect("next page");
+        assert_eq!(next["rounds"], json!([{"round":16,"response":null}]));
+        assert_eq!(next["endOffset"], 17);
+        assert!(next["nextOffset"].is_null());
+        assert!(super::provider_round_page(&rounds, Some((19, false)), 16, Some(digest)).is_err());
+        assert!(super::provider_round_page(&rounds, Some((18, true)), 16, Some(digest)).is_err());
+        assert!(super::provider_round_page(&rounds, None, 16, Some(digest)).is_err());
+        assert!(super::provider_round_page(&rounds, Some((18, false)), 16, None).is_err());
+        rounds[0].response.as_mut().expect("reported").input_tokens += 1;
+        assert!(super::provider_round_page(&rounds, Some((18, false)), 16, Some(digest)).is_err());
+        assert!(super::provider_round_page(&rounds, None, 17, Some(digest)).is_err());
+        let empty = super::provider_round_page(&[], None, 0, None).expect("known empty turn");
+        assert_eq!(empty["available"], true);
+        assert_eq!(empty["summary"]["available"], false);
+        assert_eq!(empty["rounds"], json!([]));
+        assert_eq!(first["rounds"][0]["response"]["finishReason"], "length");
+        assert!(first["rounds"][0]["response"].get("text").is_none());
+    }
+
     #[test]
     fn gateway_accounting_summary_distinguishes_missing_partial_zero_and_overflow() {
         use claw_application::ports::provider::{
