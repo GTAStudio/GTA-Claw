@@ -1044,8 +1044,16 @@ async fn model_catalogue_cli_validates_metadata_without_selection_refresh_or_rep
         "availability-not_initialized",
         "availability-retired",
         "availability-private-secret",
+        "freshness-fresh",
+        "freshness-expired",
+        "freshness-unknown",
+        "freshness-unbounded",
+        "freshness-missing",
+        "freshness-contradiction",
+        "freshness-private-secret",
     ] {
         let availability_reason = scenario.strip_prefix("availability-");
+        let freshness_state = scenario.strip_prefix("freshness-");
         let count = if scenario == "continuation" { 9 } else { 1 };
         let mut snapshot = json!({"provider":"fixture","providerGeneration":1,"selectedModel":"private-model-0","selectionPinned":true,"observedAtMs":12345,
             "source":"provider_sdk_catalogue","liveCapabilitiesVerified":false,
@@ -1092,6 +1100,14 @@ async fn model_catalogue_cli_validates_metadata_without_selection_refresh_or_rep
         if let Some(reason) = availability_reason {
             page = json!({"schemaVersion":1,"available":false,"unavailableReason":reason,"selectionChanged":false,"networkContacted":false});
         }
+        if let Some(state) = freshness_state.filter(|state| *state != "missing") {
+            page["cacheFreshness"] = json!({"state":state,
+                "ageMs":if state == "unknown" {None} else {Some(if state == "expired" {1000} else {1})},
+                "maxAgeMs":(state != "unbounded").then_some(1000)});
+            if state == "contradiction" {
+                page["cacheFreshness"]["state"] = json!("expired");
+            }
+        }
         let calls = Arc::new(AtomicUsize::new(0));
         let captured = Arc::clone(&calls);
         let expected_digest = digest.clone();
@@ -1133,6 +1149,9 @@ async fn model_catalogue_cli_validates_metadata_without_selection_refresh_or_rep
                 if availability_reason.is_some() {
                     expected["nativeCatalogPage"]["includeAvailability"] = json!(true);
                 }
+                if freshness_state.is_some() {
+                    expected["nativeCatalogPage"]["includeFreshness"] = json!(true);
+                }
                 if offset > 0 {
                     expected["nativeCatalogPage"]["sha256"] = json!(digest);
                 }
@@ -1159,6 +1178,9 @@ async fn model_catalogue_cli_validates_metadata_without_selection_refresh_or_rep
         if availability_reason.is_some() {
             arguments.push("--availability".into());
         }
+        if freshness_state.is_some() {
+            arguments.push("--freshness".into());
+        }
         if offset > 0 {
             arguments.extend(
                 ["--offset", "8", "--sha256", &digest]
@@ -1178,6 +1200,10 @@ async fn model_catalogue_cli_validates_metadata_without_selection_refresh_or_rep
                 | "availability-authentication_pending"
                 | "availability-not_initialized"
                 | "availability-retired"
+                | "freshness-fresh"
+                | "freshness-expired"
+                | "freshness-unknown"
+                | "freshness-unbounded"
         );
         let stdout = String::from_utf8(output.stdout).expect("JSON output");
         assert_eq!(output.status.success(), success, "{scenario}: {stdout}");
@@ -1188,6 +1214,9 @@ async fn model_catalogue_cli_validates_metadata_without_selection_refresh_or_rep
             if let Some(reason) = availability_reason {
                 assert_eq!(document["result"]["unavailableReason"], reason);
                 assert_eq!(document["result"]["available"], false);
+            }
+            if let Some(state) = freshness_state {
+                assert_eq!(document["result"]["cacheFreshness"]["state"], state);
             }
             if scenario == "aliases" {
                 assert_eq!(document["result"]["models"][0]["id"], "private-model-0");
@@ -1545,6 +1574,7 @@ async fn accounting_export_cli_pins_all_pages_and_writes_only_verified_new_files
             assert_eq!(document["result"]["snapshotVerified"], true);
             assert_eq!(document["result"]["costCalculated"], false);
             assert_eq!(document["result"]["billingReconciled"], false);
+            verify_offline_estimates_of_export(&destination, scenario == "empty").await;
         } else if scenario == "existing-target" {
             assert_eq!(
                 fs::read(&destination).expect("original"),
@@ -1565,6 +1595,156 @@ async fn accounting_export_cli_pins_all_pages_and_writes_only_verified_new_files
         let _ = fs::remove_file(destination);
         gateway.shutdown().await;
         assert_eq!(calls.load(Ordering::SeqCst), expected_calls, "{scenario}");
+    }
+}
+
+async fn verify_offline_estimates_of_export(source: &std::path::Path, empty: bool) {
+    use std::fmt::Write as _;
+    let sha256 = |bytes: &[u8]| {
+        let mut digest = String::with_capacity(64);
+        for byte in ring::digest::digest(&ring::digest::SHA256, bytes).as_ref() {
+            write!(digest, "{byte:02x}").expect("file digest");
+        }
+        digest
+    };
+    let original = fs::read(source).expect("actual exported accounting");
+    let rates_path = source.with_extension("rates.json");
+    let altered_path = source.with_extension("altered.json");
+    let scenarios: &[&str] = if empty {
+        &["valid"]
+    } else {
+        &[
+            "valid",
+            "missing-rate",
+            "explicit-free",
+            "fractional-rate",
+            "source-changed",
+            "rates-changed",
+            "snapshot-digest",
+            "duplicate-rate",
+            "float-rate",
+            "unknown-rate-field",
+            "unknown-export-field",
+            "oversized-rates",
+            "linked-input",
+        ]
+    };
+    for scenario in scenarios {
+        let mut rates = json!({"schemaVersion":1,"kind":"gta-claw.token-rate-card","currency":"USD","revision":"fixture-prices",
+            "tokenBasis":"all_reported_input_output","rates":[{"provider":"fixture","model":"private-model-must-not-render",
+                "inputMicrounitsPerMillion":3_000_000,"outputMicrounitsPerMillion":15_000_000}]});
+        match *scenario {
+            "missing-rate" => rates["rates"][0]["model"] = json!("another-exact-model"),
+            "explicit-free" => rates["rates"][0]["inputMicrounitsPerMillion"] = json!(0),
+            "fractional-rate" => rates["rates"][0]["inputMicrounitsPerMillion"] = json!(1),
+            "duplicate-rate" => rates["rates"] = json!([rates["rates"][0], rates["rates"][0]]),
+            "float-rate" => rates["rates"][0]["inputMicrounitsPerMillion"] = json!(1.5),
+            "unknown-rate-field" => rates["apiKey"] = json!("private-fixture-secret"),
+            _ => {}
+        }
+        let rate_bytes = if *scenario == "oversized-rates" {
+            vec![b' '; 64 * 1024 + 1]
+        } else {
+            serde_json::to_vec(&rates).expect("rate card")
+        };
+        fs::write(&rates_path, &rate_bytes).expect("owned rate card");
+        let source_path = if matches!(*scenario, "snapshot-digest" | "unknown-export-field") {
+            let mut archive: Value = serde_json::from_slice(&original).expect("export JSON");
+            if *scenario == "snapshot-digest" {
+                archive["snapshot"]["accounting"]["sha256"] = json!("f".repeat(64));
+            } else {
+                archive["privateNote"] = json!("private-fixture-secret");
+            }
+            fs::write(
+                &altered_path,
+                serde_json::to_vec(&archive).expect("altered export"),
+            )
+            .expect("owned invalid export");
+            &altered_path
+        } else {
+            if *scenario == "linked-input" {
+                fs::hard_link(source, &altered_path).expect("owned source hard link");
+            }
+            source
+        };
+        let actual_source = fs::read(source_path).expect("reviewed input bytes");
+        let source_hash = if *scenario == "source-changed" {
+            "a".repeat(64)
+        } else {
+            sha256(&actual_source)
+        };
+        let rates_hash = if *scenario == "rates-changed" {
+            "b".repeat(64)
+        } else {
+            sha256(&rate_bytes)
+        };
+        let output = run_cli(
+            vec![
+                "accounting".into(),
+                "estimate".into(),
+                "--source".into(),
+                source_path.as_os_str().to_owned(),
+                "--rates".into(),
+                rates_path.as_os_str().to_owned(),
+                "--expected-sha256".into(),
+                source_hash.into(),
+                "--rates-sha256".into(),
+                rates_hash.into(),
+                "--json".into(),
+            ],
+            None,
+        )
+        .await;
+        let success = matches!(
+            *scenario,
+            "valid" | "missing-rate" | "explicit-free" | "fractional-rate"
+        );
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(output.stderr.is_empty(), "{scenario}");
+        let receipt = parse_json(&output);
+        assert_eq!(receipt["operation"], "accounting.estimate");
+        assert_eq!(receipt["sourceModified"], false);
+        assert_eq!(receipt["ratesModified"], false);
+        assert_eq!(receipt["networkContacted"], false);
+        assert_eq!(receipt["credentialsResolved"], false);
+        assert!(!receipt.to_string().contains("private-fixture-secret"));
+        if success {
+            assert_eq!(receipt["snapshotVerified"], true);
+            assert_eq!(receipt["runStatus"], "outcome_unknown");
+            let estimate = &receipt["estimate"];
+            assert_eq!(estimate["billingReconciled"], false);
+            assert_eq!(estimate["actualCostKnown"], false);
+            assert_eq!(estimate["recordedRounds"], if empty { 0 } else { 17 });
+            if empty || *scenario == "missing-rate" {
+                assert_eq!(estimate["totalEstimate"], Value::Null);
+                assert_eq!(estimate["knownSubtotal"], Value::Null);
+                assert_eq!(estimate["observedUsageEstimateComplete"], false);
+            } else {
+                assert_eq!(
+                    estimate["totalEstimate"],
+                    match *scenario {
+                        "explicit-free" => "0.000000000000",
+                        "fractional-rate" => "0.000000000017",
+                        _ => "0.000051000000",
+                    }
+                );
+                assert_eq!(estimate["observedUsageEstimateComplete"], true);
+            }
+        }
+        assert_eq!(fs::read(source).expect("unchanged export"), original);
+        assert_eq!(
+            fs::read(&rates_path).expect("unchanged rate card"),
+            rate_bytes
+        );
+        fs::remove_file(&rates_path).expect("owned rate cleanup");
+        if altered_path.exists() {
+            fs::remove_file(&altered_path).expect("owned altered input cleanup");
+        }
     }
 }
 

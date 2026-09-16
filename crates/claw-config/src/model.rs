@@ -402,6 +402,7 @@ pub struct ProviderConfig {
     pub(crate) base_url: Option<String>,
     pub(crate) credential_origin: Option<String>,
     pub(crate) request_timeout_ms: Option<u64>,
+    pub(crate) catalogue_max_age_ms: Option<u64>,
     pub(crate) completion_api: Option<ProviderCompletionApi>,
     pub(crate) max_observed_turn_tokens: Option<u64>,
 }
@@ -452,6 +453,12 @@ impl ProviderConfig {
     #[must_use]
     pub const fn request_timeout_ms(&self) -> Option<u64> {
         self.request_timeout_ms
+    }
+
+    /// Optional maximum model-catalogue age; absence preserves unbounded caching.
+    #[must_use]
+    pub const fn catalogue_max_age_ms(&self) -> Option<u64> {
+        self.catalogue_max_age_ms
     }
 
     /// Returns the OpenAI-only completion dialect.

@@ -664,7 +664,7 @@ fn parse_accounting_page(
 /// An explicit model catalogue operation, distinct from chat or model selection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelCatalogueAction {
-    /// Reads the first cached page with explicit lifecycle availability details.
+    /// Reads the first cached page with lifecycle and cache-age policy details.
     Availability,
     /// Reads a cached page without contacting the provider.
     Read {
@@ -699,9 +699,9 @@ impl ModelCatalogueRequest {
             return Err(invalid());
         }
         match &self.action {
-            ModelCatalogueAction::Availability => {
-                Ok(json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true}}))
-            }
+            ModelCatalogueAction::Availability => Ok(
+                json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true,"includeFreshness":true}}),
+            ),
             ModelCatalogueAction::Read { offset, sha256 } => {
                 if *offset > 1024
                     || *offset > 0 && sha256.is_none()
@@ -730,7 +730,7 @@ impl ModelCatalogueRequest {
         let encoded = value.to_string();
         match &self.action {
             ModelCatalogueAction::Availability => {
-                claw_protocol::native_models::validate_page(&encoded, 0, None)
+                claw_protocol::native_models::validate_freshness_page(&encoded)
             }
             ModelCatalogueAction::Read { offset, sha256 } => {
                 claw_protocol::native_models::validate_page(&encoded, *offset, sha256.as_deref())
@@ -2683,9 +2683,9 @@ mod tests {
         request.action = ModelCatalogueAction::Availability;
         assert_eq!(
             request.parameters().expect("availability read"),
-            json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true}})
+            json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true,"includeFreshness":true}})
         );
-        assert!(request.check_response(&unavailable).is_ok());
+        assert!(request.check_response(&unavailable).is_err());
         let mut detailed = unavailable.clone();
         detailed["unavailableReason"] = json!("authentication_pending");
         assert!(request.check_response(&detailed).is_ok());

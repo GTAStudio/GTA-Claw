@@ -1899,8 +1899,15 @@ mod tests {
             "availability-private-remote-error",
             "availability-refused",
             "availability-ready",
+            "freshness-fresh",
+            "freshness-expired",
+            "freshness-unknown",
+            "freshness-unbounded",
+            "freshness-missing",
+            "freshness-private-remote-error",
         ] {
             let availability = scenario.strip_prefix("availability-");
+            let freshness_state = scenario.strip_prefix("freshness-");
             let paged = scenario == "pages";
             let refresh = matches!(scenario, "refresh" | "refresh-refused" | "wrong-receipt");
             let digest = if paged {
@@ -1938,6 +1945,11 @@ mod tests {
                     if let Some(reason) = availability.filter(|reason| *reason != "ready") {
                         page = json!({"schemaVersion":1,"available":false,"unavailableReason":reason,"selectionChanged":false,"networkContacted":false});
                     }
+                    if let Some(state) = freshness_state.filter(|state| *state != "missing").or_else(|| (scenario == "availability-ready").then_some("unbounded")) {
+                        page["cacheFreshness"] = json!({"state":state,
+                            "ageMs":if state == "unknown" {None} else {Some(if state == "expired" {1000} else {1})},
+                            "maxAgeMs":(state != "unbounded").then_some(1000)});
+                    }
                     for ordinal in 0..if paged || refresh {2} else {1} {
                         let request = receive_request(&mut socket).await;
                         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1945,7 +1957,10 @@ mod tests {
                         let actual: Value = serde_json::from_str(request.params().value().expect("params").as_json()).expect("request JSON");
                         if ordinal == 0 {
                             let mut expected = json!({"nativeCatalogPage":{"offset":0}});
-                            if availability.is_some() {expected["nativeCatalogPage"]["includeAvailability"] = json!(true);}
+                            if availability.is_some() || freshness_state.is_some() {
+                                expected["nativeCatalogPage"]["includeAvailability"] = json!(true);
+                                expected["nativeCatalogPage"]["includeFreshness"] = json!(true);
+                            }
                             assert_eq!(actual, expected);
                         } else if paged {
                             assert_eq!(actual, json!({"nativeCatalogPage":{"offset":8,"sha256":digest}}));
@@ -1995,7 +2010,7 @@ mod tests {
             .await
             .expect("ready deadline");
             while state.next_native_query().is_some() {}
-            for action in if availability.is_some() {
+            for action in if availability.is_some() || freshness_state.is_some() {
                 vec![3]
             } else if paged {
                 vec![0, 1]
@@ -2062,8 +2077,21 @@ mod tests {
                     assert!(text.contains("Provider catalogue is not initialized"));
                 }
                 "availability-retired" => assert!(text.contains("Provider has been shut down")),
-                "availability-private-remote-error" | "availability-refused" => {
+                "availability-private-remote-error"
+                | "availability-refused"
+                | "freshness-missing"
+                | "freshness-private-remote-error" => {
                     assert!(text.contains("could not be verified"));
+                }
+                "freshness-fresh"
+                | "freshness-expired"
+                | "freshness-unknown"
+                | "freshness-unbounded" => {
+                    assert!(text.contains(&format!("Cache: {}", freshness_state.expect("state"))));
+                    assert!(
+                        state.native_model_catalogue(2).is_some(),
+                        "expired metadata remains explicitly refreshable"
+                    );
                 }
                 "pages" => assert!(
                     text.contains("fixture-model-8") && state.native_model_catalogue(1).is_none()

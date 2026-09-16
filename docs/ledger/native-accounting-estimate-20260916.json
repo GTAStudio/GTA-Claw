@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "stage": "offline-explicit-flat-token-rate-estimate",
+  "capturedOn": "2026-09-16",
+  "baseCommit": "7e256b51ce7bac92ddd9de65cb3ba5396ebcce95",
+  "taskIds": ["M3-05", "M3-08", "M5-01"],
+  "platform": "windows-x86_64",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "cargoLockSha256": "03ae0a54ee93bb13ccaf84f53747742ef5fd48103ef6032b07e4793baeae7834",
+  "sourceFiles": [
+    { "path": "apps/gta-claw-cli/src/accounting_cost.rs", "sha256": "f260df7c3ad20ede15e47ed5836c5b02118cf4290b5388f13f3ca49c4840868c" },
+    { "path": "apps/gta-claw-cli/src/lib.rs", "sha256": "492a23e2a3583ab2d664fce1553aa0fd4e11c10438a1fb954cb2d2ad3f7ed4cf" },
+    { "path": "apps/gta-claw-cli/tests/gateway_health.rs", "sha256": "fcca20fe5c1f5856246ef32f31d8bf618b81de0925a3124f9b30b3f394c1bd11" },
+    { "path": "apps/gta-claw-cli/src/state_snapshot.rs", "sha256": "bdc0dbd55681a83a24c92169d84612658506d612a2ef4ff39f434e2c78bf35ed" },
+    { "path": "crates/claw-protocol/src/native_accounting.rs", "sha256": "b7ac4f7c618454a7c571ea33fd17708386dcaa00b6d202375d0c4aea9e0bd013" }
+  ],
+  "checks": [
+    {
+      "command": "cargo +stable test -p gta-claw-cli --all-targets --no-fail-fast --locked --offline -j 1",
+      "result": "passed", "exitCode": 0, "passed": 117, "failed": 0, "ignored": 2, "testBinaries": 5,
+      "log": "target/native-accounting-estimate-final-tests-20260916.log",
+      "sha256": "1a030568dcbfda72be02d5a6133bc95117368fc0b02d045658b8c717882ea5a4"
+    },
+    {
+      "command": "cargo +stable clippy -p gta-claw-cli --all-targets --locked --offline -j 1 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-accounting-estimate-verified-clippy-20260916.log",
+      "sha256": "c777fcf52d1690505a5ec345168f179025433d0a0798faeb1a63de9beec61548"
+    },
+    {
+      "command": "cargo +stable check --workspace --all-targets --locked --offline -j 1",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-accounting-estimate-final-check-20260916.log",
+      "sha256": "08e3e5141ecb240c3d16ef9baf0ac6ffb399aacd4795ec71d76d0947f2d9e3f8"
+    }
+  ],
+  "behaviorEvidence": [
+    "estimate_command_requires_two_reviewed_local_files_without_network_options",
+    "estimates_exact_flat_rates_without_double_counting_or_inventing_missing_usage",
+    "rate_cards_reject_ambiguous_float_duplicate_or_unbounded_inputs",
+    "accounting_export_cli_pins_all_pages_and_writes_only_verified_new_files"
+  ],
+  "notes": [
+    "accounting estimate is an offline read-only command requiring two explicit local files and their separately reviewed SHA-256 values. It neither connects to a daemon/provider nor reads live credentials, legacy floating-point prices, environment model overrides or a user's current configuration",
+    "The source must be a closed schema-v1 gta-claw.provider-accounting export. The raw snapshot is independently validated with the existing complete ordered-digest/counter/provenance contract before estimating; copying an arbitrary page or tampering with the full digest is refused",
+    "The operator-supplied closed rate card has one three-uppercase-letter currency label, a bounded revision, explicit all_reported_input_output basis, and at most 128 unique exact provider/model pairs. Integer input/output microunits per million tokens are bounded to 1000000000000 each. The source is at most 4 MiB and rate card at most 64 KiB",
+    "Each complete primary-counter report multiplies total input and output by the corresponding flat rate using checked u128 arithmetic. Exact amounts are strings in currency units with 12 decimal places. Cached input and reasoning output remain included subsets and are never charged a second time. There is no floating point, rounding, foreign-exchange conversion, tier selection or hidden cache-discount assumption",
+    "Missing reports and unreported attempts, partial counters, and missing exact rates are separately counted and not priced. Known complete rounds can have a knownSubtotal while totalEstimate stays null. No recorded rounds produces null rather than fabricated free usage; an explicit complete zero report or explicit zero rate can produce an exact zero estimate",
+    "observedUsageEstimateComplete describes only the captured complete reports covered by the supplied flat rates. actualCostKnown, billingReconciled and isInvoice always remain false. The original runStatus, including outcome_unknown, is retained; the estimate does not settle an open provider journal or account for requests absent from the export",
+    "Reads reuse pinned-parent/no-follow sandbox validation and Windows exclusive read handles. Both hashes and complete snapshot validity are checked before calculation. Input files are not overwritten, no output artifact is created, and error messages are static rather than raw untrusted file text. A success receipt identifies both exact file digests and the original accounting digest",
+    "Pure tests cover cached/reasoning subset treatment, mixed missing/partial reports, exact-ID rate lookup, explicit zero, fractional rates, u64 maximum usage, 1024-round capacity, duplicate JSON/rate entries, unsupported basis, unknown fields, float/negative/string/bool/oversized rates and malformed command paths/options",
+    "The existing real export-accounting CLI integration now feeds its actual verified multi-page output into accounting estimate. Thirteen nonempty-export cases plus the empty-export case exercise correct estimates, no exact rate, explicit free/fractional rates, changed file hashes, corrupt inner digest, duplicate/float/unknown rates, unknown export fields, oversized rate files and hard-linked input rejection. The Gateway request count stays unchanged and both input files remain byte-identical",
+    "The first new integration build lacked a fully qualified Path type; corrected before the actual scenario run. Strict lint required two statement semicolons and a clearer rate-lookup name. All final tests and root check ran after formatting; final Clippy preceded formatting of the corrected expression only",
+    "This increment adds no dependencies, daemon accounting fields, billing flags, inference retries, live pricing fetches, UI controls or monetary budget enforcement. Earlier cache/model/accounting ledgers remain historical; only the new CLI command and extended dispatcher/export test have later source hashes",
+    "No Git write, real account, paid request, deployment, production proxy change or user-state migration occurred. The two ignored CLI helpers remain separately identified; passing these tests does not resolve original native credential intermittency"
+  ],
+  "unverified": [
+    "Whether a supplied rate card matches a real account, region, contract or historical billing period",
+    "Cache read/write discounts, tiers, batch pricing, tool fees, taxes and currency conversion",
+    "Complete live invoice reconciliation and in-flight monetary reservations or hard limits",
+    "GUI estimation workflows, all-platform runtime qualification and whole-project acceptance"
+  ]
+}

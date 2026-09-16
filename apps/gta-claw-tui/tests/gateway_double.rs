@@ -612,8 +612,15 @@ async fn native_tui_model_catalogue_reads_and_refreshes_without_chat_ack_or_sele
         "availability-retired",
         "availability-private-remote-secret",
         "availability-refused",
+        "freshness-fresh",
+        "freshness-expired",
+        "freshness-unknown",
+        "freshness-unbounded",
+        "freshness-missing",
+        "freshness-private-remote-secret",
     ] {
         let availability = scenario.strip_prefix("availability-");
+        let freshness_state = scenario.strip_prefix("freshness-");
         let snapshot = json!({"provider":"fixture","providerGeneration":1,"selectedModel":"fixture-model-0","selectionPinned":true,
             "observedAtMs":123,"source":"provider_sdk_catalogue","liveCapabilitiesVerified":false,
             "models":(0..9).map(|ordinal|json!({"id":format!("fixture-model-{ordinal}"),"displayName":null,
@@ -640,7 +647,12 @@ async fn native_tui_model_catalogue_reads_and_refreshes_without_chat_ack_or_sele
         if let Some(reason) = availability {
             first = json!({"schemaVersion":1,"available":false,"unavailableReason":reason,"selectionChanged":false,"networkContacted":false});
         }
-        let mut actions = if availability.is_some() {
+        if let Some(state) = freshness_state.filter(|state| *state != "missing") {
+            first["cacheFreshness"] = json!({"state":state,
+                "ageMs":if state == "unknown" {None} else {Some(if state == "expired" {1000} else {1})},
+                "maxAgeMs":(state != "unbounded").then_some(1000)});
+        }
+        let mut actions = if availability.is_some() || freshness_state.is_some() {
             vec![ModelCatalogueAction::Availability]
         } else {
             vec![ModelCatalogueAction::Read {
@@ -689,7 +701,7 @@ async fn native_tui_model_catalogue_reads_and_refreshes_without_chat_ack_or_sele
                         assert_eq!(request.method().as_str(),"models.list");
                         let actual:Value = serde_json::from_str(request.params().value().expect("params").as_json()).expect("JSON");
                         let expected = match action {
-                            ModelCatalogueAction::Availability => json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true}}),
+                            ModelCatalogueAction::Availability => json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true,"includeFreshness":true}}),
                             ModelCatalogueAction::Read {offset,sha256} => {
                                 let mut params = json!({"nativeCatalogPage":{"offset":offset}});
                                 if let Some(digest) = sha256 {params["nativeCatalogPage"]["sha256"] = json!(digest);}
@@ -754,6 +766,8 @@ async fn native_tui_model_catalogue_reads_and_refreshes_without_chat_ack_or_sele
                                         scenario,
                                         "availability-private-remote-secret"
                                             | "availability-refused"
+                                            | "freshness-missing"
+                                            | "freshness-private-remote-secret"
                                     )),
                                 "{scenario}: {result:?}"
                             );
@@ -761,6 +775,9 @@ async fn native_tui_model_catalogue_reads_and_refreshes_without_chat_ack_or_sele
                                 Ok(page) => {
                                     if let Some(reason) = availability {
                                         assert_eq!(page["unavailableReason"], reason);
+                                    }
+                                    if let Some(state) = freshness_state {
+                                        assert_eq!(page["cacheFreshness"]["state"], state);
                                     }
                                 }
                                 Err(error) => assert!(!error.contains("private-remote")),

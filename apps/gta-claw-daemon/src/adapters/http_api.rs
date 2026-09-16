@@ -215,6 +215,8 @@ pub struct ProviderAdapter {
     role_prompt: RwLock<String>,
     models: RwLock<Vec<ModelDescriptor>>,
     catalogue_observed_at_ms: std::sync::atomic::AtomicU64,
+    catalogue_refreshed_at: RwLock<Option<Instant>>,
+    catalogue_max_age: Option<std::time::Duration>,
     history: Mutex<ConversationHistory>,
     history_config: ProviderHistoryConfig,
     model_tools: Arc<dyn ModelToolCatalog>,
@@ -259,6 +261,8 @@ impl ProviderAdapter {
             role_prompt: RwLock::new(role_prompt.into()),
             models: RwLock::new(Vec::new()),
             catalogue_observed_at_ms: std::sync::atomic::AtomicU64::new(0),
+            catalogue_refreshed_at: RwLock::new(None),
+            catalogue_max_age: None,
             history: Mutex::new(ConversationHistory::default()),
             history_config,
             model_tools,
@@ -277,10 +281,43 @@ impl ProviderAdapter {
         let models = self.provider.list_models(context).await?;
         Self::validate_catalogue(&self.provider_name, &models, &self.default_model())?;
         self.validate_model_aliases(&models)?;
-        *self.models.write().unwrap_or_else(PoisonError::into_inner) = models;
+        let mut cached = self.models.write().unwrap_or_else(PoisonError::into_inner);
+        *cached = models;
+        *self
+            .catalogue_refreshed_at
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
         self.catalogue_observed_at_ms
             .store(Self::catalogue_time(), Ordering::Release);
+        drop(cached);
         Ok(())
+    }
+
+    fn catalogue_age_at(&self, now: Instant) -> Option<std::time::Duration> {
+        self.catalogue_refreshed_at
+            .read()
+            .ok()
+            .and_then(|refreshed| *refreshed)
+            .and_then(|refreshed| now.checked_duration_since(refreshed))
+    }
+
+    fn catalogue_is_fresh_at(&self, now: Instant) -> bool {
+        self.catalogue_max_age
+            .is_none_or(|max_age| self.catalogue_age_at(now).is_some_and(|age| age < max_age))
+    }
+
+    fn catalogue_freshness_at(
+        &self,
+        now: Instant,
+    ) -> claw_protocol::native_models::CatalogueFreshness {
+        let age_ms = self
+            .catalogue_age_at(now)
+            .and_then(|age| u64::try_from(age.as_millis()).ok());
+        let max_age_ms = self
+            .catalogue_max_age
+            .map(|limit| u64::try_from(limit.as_millis()).expect("bounded catalogue age"));
+        claw_protocol::native_models::CatalogueFreshness::new(age_ms, max_age_ms)
+            .expect("validated cache policy")
     }
 
     fn validate_model_aliases(
@@ -314,6 +351,11 @@ impl ProviderAdapter {
             .models
             .read()
             .map_err(|_| invalid_request("model catalogue is unavailable"))?;
+        if !self.catalogue_is_fresh_at(Instant::now()) {
+            return Err(invalid_request(
+                "model catalogue has expired or its age is unknown; explicitly refresh the catalogue before generating",
+            ));
+        }
         let aliases = self
             .validate_model_aliases(&models)
             .map_err(|error| map_provider_error(&error))?;
@@ -603,6 +645,11 @@ impl ProviderAdapter {
             .models
             .read()
             .map_err(|_| invalid("model catalogue is unavailable"))?;
+        if !self.catalogue_is_fresh_at(Instant::now()) {
+            return Err(invalid(
+                "model catalogue has expired or its age is unknown; explicitly refresh the catalogue before generating",
+            ));
+        }
         let model = models
             .iter()
             .find(|model| model.id == *model_id)
@@ -883,6 +930,7 @@ struct SwappableState {
     default_model: String,
     default_model_locked: bool,
     model_aliases: Vec<(ModelId, ModelId)>,
+    catalogue_max_age: Option<std::time::Duration>,
     role_prompt: String,
     generation: u64,
     retired: bool,
@@ -925,6 +973,7 @@ impl SwappableProvider {
                 default_model: default_model.into(),
                 default_model_locked: false,
                 model_aliases: Vec::new(),
+                catalogue_max_age: None,
                 role_prompt: role_prompt.into(),
                 generation: 0,
                 retired: false,
@@ -963,6 +1012,28 @@ impl SwappableProvider {
             );
         }
         state.unavailable_reason = reason;
+        state.generation = state.generation.saturating_add(1);
+        drop(state);
+        Ok(())
+    }
+
+    pub(crate) fn configure_catalogue_max_age(&self, max_age_ms: u64) -> Result<(), String> {
+        if !(1_000..=86_400_000).contains(&max_age_ms) {
+            return Err(
+                "model catalogue maximum age must be between 1000 and 86400000 milliseconds"
+                    .to_owned(),
+            );
+        }
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| "provider slot is unavailable".to_owned())?;
+        if state.current.is_some() || state.retired || state.catalogue_max_age.is_some() {
+            return Err(
+                "model catalogue age requires a new trusted startup configuration".to_owned(),
+            );
+        }
+        state.catalogue_max_age = Some(std::time::Duration::from_millis(max_age_ms));
         state.generation = state.generation.saturating_add(1);
         drop(state);
         Ok(())
@@ -1032,7 +1103,7 @@ impl SwappableProvider {
             provider,
             &activation,
             |candidate| async {
-                let (generation, model, aliases, role) = {
+                let (generation, model, aliases, max_age, role) = {
                     let state = self.state.read().map_err(|_| provider_slot_error())?;
                     if state.retired
                         || state.unavailable_reason
@@ -1049,6 +1120,7 @@ impl SwappableProvider {
                         state.generation,
                         state.default_model.clone(),
                         state.model_aliases.clone(),
+                        state.catalogue_max_age,
                         state.role_prompt.clone(),
                     )
                 };
@@ -1062,6 +1134,7 @@ impl SwappableProvider {
                     Arc::clone(&self.ready_gate),
                 );
                 adapter.model_aliases = aliases;
+                adapter.catalogue_max_age = max_age;
                 let adapter = Arc::new(adapter);
                 adapter.initialize(&activation).await?;
                 Ok((generation, adapter))
@@ -1301,10 +1374,18 @@ impl SwappableProvider {
             return Err(invalid());
         }
         let count = models.len();
-        *provider.models.write().map_err(|_| invalid())? = models;
+        let mut cached = provider.models.write().map_err(|_| invalid())?;
+        let mut refreshed = provider
+            .catalogue_refreshed_at
+            .write()
+            .map_err(|_| invalid())?;
+        *cached = models;
+        *refreshed = Some(Instant::now());
         provider
             .catalogue_observed_at_ms
             .store(ProviderAdapter::catalogue_time(), Ordering::Release);
+        drop(refreshed);
+        drop(cached);
         let result = json!({"schemaVersion":1,"refreshed":true,"provider":provider.provider_name(),"providerGeneration":self.slot.current_generation().get(),
             "requestedSha256":expected_sha256,"selectedModel":model,"totalModels":count,
             "selectionChanged":false,"networkContacted":true,"inferenceInvoked":false});
@@ -1325,6 +1406,8 @@ impl SwappableProvider {
             sha256: Option<String>,
             #[serde(default)]
             include_availability: bool,
+            #[serde(default)]
+            include_freshness: bool,
         }
         let invalid = || {
             PortError::new(
@@ -1350,7 +1433,7 @@ impl SwappableProvider {
                 return Err(invalid());
             }
             let mut page = json!({"schemaVersion":1,"available":false,"selectionChanged":false,"networkContacted":false});
-            if cursor.include_availability {
+            if cursor.include_availability || cursor.include_freshness {
                 page["unavailableReason"] = json!(if state.retired {
                     claw_protocol::native_models::CatalogueUnavailableReason::Retired
                 } else {
@@ -1360,6 +1443,13 @@ impl SwappableProvider {
             return Ok(page);
         }
         let snapshot = self.catalogue_snapshot(&state)?;
+        let freshness = cursor.include_freshness.then(|| {
+            state
+                .current
+                .as_ref()
+                .expect("published catalogue")
+                .catalogue_freshness_at(Instant::now())
+        });
         drop(state);
         let total = snapshot["models"]
             .as_array()
@@ -1378,12 +1468,15 @@ impl SwappableProvider {
         }
         let mut end = cursor.offset.saturating_add(8).min(total);
         loop {
-            let page = json!({"schemaVersion":1,"available":true,"offset":cursor.offset,"endOffset":end,"nextOffset":(end < total).then_some(end),
+            let mut page = json!({"schemaVersion":1,"available":true,"offset":cursor.offset,"endOffset":end,"nextOffset":(end < total).then_some(end),
             "totalModels":total,"sha256":digest,"provider":snapshot["provider"],"selectedModel":snapshot["selectedModel"],
             "providerGeneration":snapshot["providerGeneration"],
             "selectionPinned":snapshot["selectionPinned"],"observedAtMs":snapshot["observedAtMs"],"source":snapshot["source"],
             "liveCapabilitiesVerified":false,"selectionChanged":false,"networkContacted":false,
             "models":&snapshot["models"].as_array().expect("catalogue entries")[cursor.offset..end]});
+            if let Some(freshness) = freshness {
+                page["cacheFreshness"] = json!(freshness);
+            }
             if serde_json::to_vec(&page).map_err(|_| invalid())?.len() <= 16 * 1024 {
                 return Ok(page);
             }
@@ -3072,6 +3165,9 @@ mod tests {
                 (ModelId::new("other").expect("alias"), alternate),
             ])
             .expect("explicit aliases");
+        provider
+            .configure_catalogue_max_age(60_000)
+            .expect("explicit cache policy");
         provider.pin_default_model().expect("pin before activation");
         provider.activate(source.clone()).await.expect("activate");
         let request = claw_http_api::GenerationRequest {
@@ -3178,6 +3274,115 @@ mod tests {
             );
             assert_eq!(source.calls(), calls, "{name}: no provider operation");
         }
+        let adapter = provider
+            .state
+            .read()
+            .expect("published state")
+            .current
+            .clone()
+            .expect("adapter");
+        let history_seen = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(30))
+            .expect("history observation");
+        let history_before = {
+            let mut history = adapter.history.lock().expect("history fixture");
+            let entry = history
+                .messages
+                .get_mut("alias-session")
+                .expect("accepted history");
+            entry.seen = history_seen;
+            let messages = entry.messages.clone();
+            drop(history);
+            messages
+        };
+        *adapter
+            .catalogue_refreshed_at
+            .write()
+            .expect("expired observation") = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(60))
+                .expect("expired observation"),
+        );
+        for name in ["work", "gpt-4o", "openclaw/default"] {
+            let mut stale = request.clone();
+            stale.model = name.to_owned();
+            let rejected = provider
+                .generate(stale.clone(), tokio_util::sync::CancellationToken::new())
+                .await
+                .expect_err("stale alias completion");
+            assert!(rejected.message.contains("catalogue has expired"));
+            let (events, mut receiver) = tokio::sync::mpsc::channel(16);
+            let rejected = provider
+                .stream(
+                    stale.clone(),
+                    events,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .expect_err("stale alias stream");
+            assert!(rejected.message.contains("catalogue has expired"));
+            assert!(receiver.try_recv().is_err());
+            let rejected = provider
+                .embed(
+                    claw_http_api::EmbeddingRequest {
+                        model: name.to_owned(),
+                        input: vec!["text".to_owned()],
+                        dimensions: None,
+                    },
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .expect_err("stale alias embedding");
+            assert!(rejected.message.contains("catalogue has expired"));
+            assert!(
+                provider
+                    .generate_context(
+                        stale,
+                        vec![super::ChatMessage::user_text("owned context")],
+                        tokio_util::sync::CancellationToken::new()
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                source.calls(),
+                calls,
+                "expired {name}: no provider operation"
+            );
+            let history = adapter.history.lock().expect("unchanged history");
+            let entry = history
+                .messages
+                .get("alias-session")
+                .expect("retained history");
+            assert_eq!(
+                entry.seen, history_seen,
+                "expired {name}: no history access renewal"
+            );
+            assert_eq!(
+                entry.messages, history_before,
+                "expired {name}: no history mutation"
+            );
+            drop(history);
+        }
+        let snapshot = provider
+            .catalogue_page(&serde_json::json!({"offset":0}))
+            .expect("expired cache is readable");
+        provider
+            .refresh_catalogue(
+                snapshot["sha256"].as_str().expect("observed digest"),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("explicit recovery");
+        provider
+            .generate_context(
+                request,
+                vec![super::ChatMessage::user_text("owned context")],
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("fresh runtime request");
+        assert_eq!(source.calls(), calls + 1);
         assert_eq!(provider.default_model(), "gpt-4o");
         provider.shutdown().await;
     }
@@ -3445,6 +3650,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_catalogue_freshness_is_explicit_stable_and_keeps_expired_metadata_readable() {
+        let provider = SwappableProvider::new(
+            "gpt-4o",
+            "role",
+            ProviderHistoryConfig::default(),
+            Arc::new(EmptyModelTools),
+            Arc::new(DependencyReadiness::new(["provider"])),
+        );
+        let query = serde_json::json!({"offset":0,"includeFreshness":true});
+        let unavailable = provider.catalogue_page(&query).expect("no cache");
+        assert_eq!(unavailable["unavailableReason"], "not_initialized");
+        assert!(unavailable.get("cacheFreshness").is_none());
+        provider
+            .configure_catalogue_max_age(60_000)
+            .expect("age policy");
+        provider
+            .activate(Arc::new(SmokeProvider::new().expect("provider")))
+            .await
+            .expect("published provider");
+        let original = provider
+            .catalogue_page(&serde_json::json!({"offset":0}))
+            .expect("old page");
+        let current = provider.catalogue_page(&query).expect("fresh cache");
+        assert_eq!(current["cacheFreshness"]["state"], "fresh");
+        assert_eq!(current["cacheFreshness"]["maxAgeMs"], 60_000);
+        assert_eq!(current["sha256"], original["sha256"]);
+        assert!(original.get("cacheFreshness").is_none());
+        let adapter = provider
+            .state
+            .read()
+            .expect("state")
+            .current
+            .clone()
+            .expect("adapter");
+        for (time, expected) in [
+            (
+                Some(
+                    std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_secs(61))
+                        .expect("expired observation"),
+                ),
+                "expired",
+            ),
+            (None, "unknown"),
+            (
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(61)),
+                "unknown",
+            ),
+        ] {
+            *adapter.catalogue_refreshed_at.write().expect("observation") = time;
+            let observed = provider.catalogue_page(&query).expect("cache inspection");
+            assert_eq!(observed["cacheFreshness"]["state"], expected);
+            assert_eq!(observed["sha256"], original["sha256"]);
+            claw_protocol::native_models::validate_page(&observed.to_string(), 0, None)
+                .expect("validated dynamic metadata");
+            assert_eq!(
+                provider
+                    .catalogue_page(&serde_json::json!({"offset":0}))
+                    .expect("ordinary cache"),
+                original
+            );
+        }
+        assert!(
+            provider
+                .catalogue_page(&serde_json::json!({"offset":0,"includeFreshness":"true"}))
+                .is_err()
+        );
+        provider
+            .refresh_catalogue(
+                original["sha256"].as_str().expect("snapshot digest"),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("explicit recovery");
+        assert_eq!(
+            provider.catalogue_page(&query).expect("refreshed cache")["cacheFreshness"]["state"],
+            "fresh"
+        );
+        provider.shutdown().await;
+        assert_eq!(
+            provider.catalogue_page(&query).expect("retired cache")["unavailableReason"],
+            "retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_catalogue_expiry_refuses_generation_without_refresh_or_fallback() {
+        use super::{
+            Capability, CapabilitySet, ChatMessage, CompletionRequest, ModelId, ProviderAdapter,
+        };
+        let source = Arc::new(ModelCapabilityProvider::new(
+            CapabilitySet::from_slice(&[Capability::Completion]),
+            CapabilitySet::from_slice(&Capability::ALL),
+        ));
+        let readiness = Arc::new(DependencyReadiness::new(["provider"]));
+        readiness.set("provider", true);
+        let mut adapter = ProviderAdapter::new(
+            source.clone(),
+            "gpt-4o",
+            "",
+            ProviderHistoryConfig::default(),
+            Arc::new(EmptyModelTools),
+            readiness.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        let boundary = std::time::Instant::now();
+        let max_age = std::time::Duration::from_secs(60);
+        assert!(
+            adapter.catalogue_is_fresh_at(boundary),
+            "legacy policy is unbounded"
+        );
+        adapter.catalogue_max_age = Some(max_age);
+        assert!(
+            !adapter.catalogue_is_fresh_at(boundary),
+            "unknown observation cannot authorize generation"
+        );
+        adapter
+            .initialize(&super::RequestContext::new())
+            .await
+            .expect("initial catalogue");
+        let observed = *adapter.catalogue_refreshed_at.read().expect("observation");
+        let observed = observed.expect("initialized time");
+        assert!(
+            adapter.catalogue_is_fresh_at(
+                (observed + max_age)
+                    .checked_sub(std::time::Duration::from_millis(1))
+                    .expect("before deadline")
+            )
+        );
+        assert!(!adapter.catalogue_is_fresh_at(observed + max_age));
+        assert!(
+            !adapter.catalogue_is_fresh_at(
+                observed
+                    .checked_sub(std::time::Duration::from_millis(1))
+                    .expect("before observation")
+            )
+        );
+        let request = CompletionRequest::new(
+            ModelId::new("gpt-4o").expect("model"),
+            vec![ChatMessage::user_text("hello")],
+        );
+        *adapter.catalogue_refreshed_at.write().expect("age fixture") = Some(
+            std::time::Instant::now()
+                .checked_sub(max_age)
+                .expect("expired observation"),
+        );
+        let before = source
+            .lifecycle_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let error = adapter
+            .complete(request.clone(), tokio_util::sync::CancellationToken::new())
+            .await
+            .expect_err("expired catalogue");
+        assert_eq!(error.kind(), super::ErrorKind::InvalidRequest);
+        assert_eq!(source.calls(), 0);
+        assert_eq!(
+            source
+                .lifecycle_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before
+        );
+        assert_eq!(adapter.default_model(), "gpt-4o");
+        assert!(
+            readiness.is_ready(),
+            "catalogue policy is not a live readiness probe"
+        );
+        adapter
+            .initialize(&super::RequestContext::new())
+            .await
+            .expect("explicit new catalogue");
+        adapter
+            .complete(request, tokio_util::sync::CancellationToken::new())
+            .await
+            .expect("fresh catalogue");
+        assert_eq!(source.calls(), 1);
+    }
+
+    #[tokio::test]
     async fn model_admission_uses_known_bounds_without_inventing_unknown_limits_or_fallbacks() {
         use super::{
             Capability, CapabilitySet, ChatMessage, CompletionRequest, ModelId, ProviderAdapter,
@@ -3675,9 +4058,31 @@ mod tests {
                     .expect("explicit aliases");
             }
             provider
+                .configure_catalogue_max_age(60_000)
+                .expect("explicit cache age");
+            provider
                 .activate(fixture.clone())
                 .await
                 .expect("initial catalogue");
+            assert!(
+                provider.configure_catalogue_max_age(120_000).is_err(),
+                "no hot age-policy edit"
+            );
+            let adapter = provider
+                .state
+                .read()
+                .expect("provider state")
+                .current
+                .clone()
+                .expect("active adapter");
+            let expired_at = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(60))
+                .expect("expired observation");
+            *adapter
+                .catalogue_refreshed_at
+                .write()
+                .expect("expired fixture") = Some(expired_at);
+            assert!(!adapter.catalogue_is_fresh_at(std::time::Instant::now()));
             let initial = provider
                 .catalogue_page(&serde_json::json!({"offset":0}))
                 .expect("snapshot");
@@ -3733,6 +4138,21 @@ mod tests {
                     assert_eq!(pending.await.is_ok(), scenario == "success", "{scenario}");
                 }
             }
+            assert_eq!(
+                adapter.catalogue_is_fresh_at(std::time::Instant::now()),
+                scenario == "success",
+                "{scenario}"
+            );
+            if scenario != "success" {
+                assert_eq!(
+                    *adapter
+                        .catalogue_refreshed_at
+                        .read()
+                        .expect("original observation"),
+                    Some(expired_at),
+                    "failed refresh cannot extend validity: {scenario}"
+                );
+            }
             if !matches!(scenario, "shutdown" | "provider-changed") {
                 assert_eq!(provider.provider_generation(), generation);
                 assert_eq!(provider.default_model(), "gpt-4o");
@@ -3744,12 +4164,19 @@ mod tests {
                         initial
                     );
                     assert_eq!(
-                        provider
-                            .active_for_model("work")
+                        adapter
+                            .validate_model_aliases(
+                                &adapter.models.read().expect("retained models")
+                            )
+                            .expect("retained alias table")
+                            .resolve(&super::ModelId::new("work").expect("alias"))
                             .expect("original alias target")
-                            .1
                             .as_str(),
-                        "alternate-exact"
+                        "alternate-exact",
+                    );
+                    assert!(
+                        provider.active_for_model("work").is_err(),
+                        "retained expired metadata is not execution authorization"
                     );
                 }
                 assert_eq!(

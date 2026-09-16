@@ -15,6 +15,93 @@ impl std::fmt::Display for CatalogueError {
 
 impl std::error::Error for CatalogueError {}
 
+/// Local cache-age policy state, not a live account or model capability guarantee.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogueFreshnessState {
+    /// The observed age is below the configured maximum.
+    Fresh,
+    /// The observed age has reached the configured maximum.
+    Expired,
+    /// A configured maximum exists but the cache age is unavailable.
+    Unknown,
+    /// No cache-age admission policy is configured.
+    Unbounded,
+}
+
+/// One dynamic cache-age observation, excluded from the stable catalogue digest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogueFreshness {
+    state: CatalogueFreshnessState,
+    age_ms: Option<u64>,
+    max_age_ms: Option<u64>,
+}
+
+impl CatalogueFreshness {
+    /// Derives a consistent cache state from a local observation and explicit policy.
+    ///
+    /// # Errors
+    /// Rejects maximum ages outside 1000..=86400000 milliseconds.
+    pub fn new(age_ms: Option<u64>, max_age_ms: Option<u64>) -> Result<Self, CatalogueError> {
+        if max_age_ms.is_some_and(|limit| !(1_000..=86_400_000).contains(&limit)) {
+            return Err(CatalogueError);
+        }
+        let state = match (max_age_ms, age_ms) {
+            (None, _) => CatalogueFreshnessState::Unbounded,
+            (Some(_), None) => CatalogueFreshnessState::Unknown,
+            (Some(limit), Some(age)) if age < limit => CatalogueFreshnessState::Fresh,
+            (Some(_), Some(_)) => CatalogueFreshnessState::Expired,
+        };
+        Ok(Self {
+            state,
+            age_ms,
+            max_age_ms,
+        })
+    }
+
+    /// Returns the observed cache policy state.
+    #[must_use]
+    pub const fn state(self) -> CatalogueFreshnessState {
+        self.state
+    }
+
+    /// Returns the measured age without inferring it from a wall-clock timestamp.
+    #[must_use]
+    pub const fn age_ms(self) -> Option<u64> {
+        self.age_ms
+    }
+
+    /// Returns the explicitly configured maximum age, if any.
+    #[must_use]
+    pub const fn max_age_ms(self) -> Option<u64> {
+        self.max_age_ms
+    }
+}
+
+impl std::fmt::Display for CatalogueFreshness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match self.state {
+            CatalogueFreshnessState::Fresh => "fresh",
+            CatalogueFreshnessState::Expired => "expired",
+            CatalogueFreshnessState::Unknown => "unknown",
+            CatalogueFreshnessState::Unbounded => "unbounded",
+        };
+        write!(formatter, "Cache: {state}\nAge: ")?;
+        if let Some(age) = self.age_ms {
+            write!(formatter, "{age} ms")?;
+        } else {
+            formatter.write_str("not reported")?;
+        }
+        formatter.write_str("\nMaximum age: ")?;
+        if let Some(limit) = self.max_age_ms {
+            write!(formatter, "{limit} ms")
+        } else {
+            formatter.write_str("not configured")
+        }
+    }
+}
+
 /// A local lifecycle fact explaining why no model catalogue has been published.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +133,7 @@ struct Page {
     schema_version: u64,
     available: bool,
     unavailable_reason: Option<CatalogueUnavailableReason>,
+    cache_freshness: Option<CatalogueFreshness>,
     selection_changed: bool,
     network_contacted: bool,
     offset: Option<usize>,
@@ -149,6 +237,21 @@ pub fn validate_page(
     validate_document(encoded, offset, expected_sha256, false)
 }
 
+/// Validates an explicitly requested first-page cache-age observation.
+///
+/// # Errors
+/// Rejects malformed pages or a server that omits the requested cache or lifecycle state.
+pub fn validate_freshness_page(encoded: &str) -> Result<(), CatalogueError> {
+    validate_page(encoded, 0, None)?;
+    let page: Page = serde_json::from_str(encoded).map_err(|_| CatalogueError)?;
+    if page.available && page.cache_freshness.is_none()
+        || !page.available && page.unavailable_reason.is_none()
+    {
+        return Err(CatalogueError);
+    }
+    Ok(())
+}
+
 /// Validates a complete, bounded catalogue snapshot against its observed digest.
 ///
 /// # Errors
@@ -170,6 +273,13 @@ fn validate_document(
     }
     let page: Page = serde_json::from_str(encoded).map_err(|_| CatalogueError)?;
     if page.schema_version != 1 || page.selection_changed || page.network_contacted {
+        return Err(CatalogueError);
+    }
+    if let Some(freshness) = page.cache_freshness
+        && (complete
+            || !page.available
+            || CatalogueFreshness::new(freshness.age_ms, freshness.max_age_ms)? != freshness)
+    {
         return Err(CatalogueError);
     }
     if !page.available {
@@ -351,6 +461,47 @@ mod tests {
             page["unavailableReason"] = reason;
             assert!(validate_page(&page.to_string(), 0, None).is_err());
         }
+    }
+
+    #[test]
+    fn catalogue_freshness_is_consistent_opt_in_and_excluded_from_snapshot_digests() {
+        let mut page = json!({"schemaVersion":1,"available":true,"selectionChanged":false,"networkContacted":false,
+            "offset":0,"endOffset":1,"nextOffset":null,"totalModels":1,"provider":"fixture","providerGeneration":1,
+            "selectedModel":"exact","selectionPinned":true,"observedAtMs":123,"source":"provider_sdk_catalogue","liveCapabilitiesVerified":false,
+            "models":[{"id":"exact","displayName":null,"contextWindow":null,"maxOutputTokens":null,"advertisedCapabilities":[]}]});
+        seal(&mut page);
+        let digest = page["sha256"].as_str().expect("digest").to_owned();
+        for (age, limit, state) in [
+            (Some(999), Some(1000), CatalogueFreshnessState::Fresh),
+            (Some(1000), Some(1000), CatalogueFreshnessState::Expired),
+            (None, Some(1000), CatalogueFreshnessState::Unknown),
+            (Some(100_000), None, CatalogueFreshnessState::Unbounded),
+            (None, None, CatalogueFreshnessState::Unbounded),
+        ] {
+            let freshness = CatalogueFreshness::new(age, limit).expect("consistent age");
+            assert_eq!(freshness.state(), state);
+            page["cacheFreshness"] = json!(freshness);
+            validate_page(&page.to_string(), 0, None).expect("dynamic metadata outside digest");
+            assert!(validate_snapshot(&page.to_string(), &digest).is_err());
+        }
+        for invalid in [
+            json!({"state":"fresh","ageMs":1000,"maxAgeMs":1000}),
+            json!({"state":"expired","ageMs":999,"maxAgeMs":1000}),
+            json!({"state":"fresh","ageMs":null,"maxAgeMs":1000}),
+            json!({"state":"unbounded","ageMs":null,"maxAgeMs":1000}),
+            json!({"state":"fresh","ageMs":1,"maxAgeMs":0}),
+            json!({"state":"fresh","ageMs":1,"maxAgeMs":86_400_001}),
+            json!({"state":"private-remote-text","ageMs":1,"maxAgeMs":1000}),
+            json!({"state":"fresh","ageMs":1,"maxAgeMs":1000,"ready":true}),
+        ] {
+            page["cacheFreshness"] = invalid;
+            assert!(validate_page(&page.to_string(), 0, None).is_err());
+        }
+        page.as_object_mut().expect("page").remove("cacheFreshness");
+        validate_snapshot(&page.to_string(), &digest).expect("old snapshot unchanged");
+        let unavailable = json!({"schemaVersion":1,"available":false,"selectionChanged":false,"networkContacted":false,
+            "cacheFreshness":CatalogueFreshness::new(None,None).expect("unbounded")});
+        assert!(validate_page(&unavailable.to_string(), 0, None).is_err());
     }
 
     #[test]

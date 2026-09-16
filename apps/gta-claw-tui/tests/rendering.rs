@@ -113,6 +113,37 @@ fn model_catalogue_rows_wrap_and_keep_unknown_metadata_distinct() {
             assert!(visible.contains("Output: 1024"));
         }
     }
+    for (age, limit) in [
+        (Some(1), Some(1000)),
+        (Some(1000), Some(1000)),
+        (None, Some(1000)),
+        (Some(90_000), None),
+    ] {
+        let freshness =
+            claw_protocol::native_models::CatalogueFreshness::new(age, limit).expect("age policy");
+        model.model_catalogue.as_mut().expect("catalogue")["cacheFreshness"] =
+            serde_json::json!(freshness);
+        for width in [20, 40, 80, 120] {
+            for height in [10, 24] {
+                let mut logical = String::new();
+                for scroll in 0..60 {
+                    model.scroll = scroll;
+                    let grid = render(&model, width, height, true);
+                    logical.extend(
+                        grid.line(6)
+                            .chars()
+                            .filter(|character| !character.is_whitespace()),
+                    );
+                }
+                let expected: String = freshness
+                    .to_string()
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect();
+                assert!(logical.contains(&expected), "{width}x{height}: {freshness}");
+            }
+        }
+    }
     for reason in [
         claw_protocol::native_models::CatalogueUnavailableReason::Disabled,
         claw_protocol::native_models::CatalogueUnavailableReason::AuthenticationPending,

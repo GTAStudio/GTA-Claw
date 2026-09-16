@@ -320,6 +320,7 @@ fn native_model_catalogue_renders_cached_metadata_and_control_states_at_two_size
         "models":(0..8).map(|ordinal|json!({"id":if ordinal == 7 {format!("{}MODEL-ID-END","x".repeat(240))} else {format!("fixture-model-{ordinal}")},"displayName":format!("{} model {ordinal}","\u{754c}".repeat(30)),
             "contextWindow":null,"maxOutputTokens":1024,"advertisedCapabilities":["completion"]})).collect::<Vec<_>>()});
     page["models"][0]["aliases"] = json!(["work", format!("{}ALIAS-END", "a".repeat(240))]);
+    let cached_page = page.clone();
     view.state
         .borrow_mut()
         .apply_native(ProductUpdate::Response {
@@ -396,6 +397,54 @@ fn native_model_catalogue_renders_cached_metadata_and_control_states_at_two_size
             "hidden editor must discard a stale choice"
         );
         view.apply(&app);
+    }
+    for (age, limit) in [
+        (Some(1), Some(1000)),
+        (Some(1000), Some(1000)),
+        (None, Some(1000)),
+        (Some(90_000), None),
+    ] {
+        let freshness = claw_protocol::native_models::CatalogueFreshness::new(age, limit)
+            .expect("cache policy");
+        let mut payload = cached_page.clone();
+        payload["cacheFreshness"] = json!(freshness);
+        let params = view
+            .state
+            .borrow()
+            .native_model_catalogue(3)
+            .expect("cache status query");
+        view.state
+            .borrow_mut()
+            .native_model_catalogue_enqueued(&params);
+        view.state
+            .borrow_mut()
+            .apply_native(ProductUpdate::Response {
+                connection,
+                method: "models.list",
+                params,
+                payload,
+            });
+        for (width, height) in [(1080_u16, 720_u16), (720, 520)] {
+            app.set_layout_width(f32::from(width));
+            software_window.set_size(slint::PhysicalSize::new(
+                u32::from(width),
+                u32::from(height),
+            ));
+            app.set_model_catalogue("".into());
+            let empty = render(&software_window, usize::from(width), usize::from(height));
+            view.apply(&app);
+            assert!(
+                app.get_model_catalogue()
+                    .contains(freshness.to_string().as_str())
+            );
+            assert!(app.get_can_read_models() && app.get_can_refresh_models());
+            assert_eq!(app.get_model_choices().row_count(), 8);
+            let populated = render(&software_window, usize::from(width), usize::from(height));
+            assert!(
+                changed_pixel_count(&empty, &populated) > 1000,
+                "{width}x{height}: cache state is visible"
+            );
+        }
     }
     for reason in [
         claw_protocol::native_models::CatalogueUnavailableReason::Disabled,

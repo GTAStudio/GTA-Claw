@@ -36,6 +36,7 @@ use tokio::sync::watch;
 use url::{Host, Url};
 use zeroize::Zeroizing;
 
+mod accounting_cost;
 mod diagnostics;
 mod mcp_credential;
 mod mcp_oauth;
@@ -172,6 +173,7 @@ async fn dispatch(arguments: Vec<OsString>) -> RenderedResult {
         Ok(Invocation::McpCredential(command)) => mcp_credential::run(command).await,
         Ok(Invocation::McpLogin(command)) => mcp_oauth::run(*command).await,
         Ok(Invocation::ProviderConfig(command)) => provider_config::run(command).await,
+        Ok(Invocation::AccountingCost(command)) => accounting_cost::run(command).await,
         Err(failure) => render_parse_failure(failure),
     }
 }
@@ -262,11 +264,15 @@ commands:
     mcp oauth refresh           explicitly rotate the existing native OAuth record under the same reviewed endpoints
                                                             requires --confirm-refresh; no browser, callback, scope change or automatic retry
     send <session-id> <message> native Gateway send; requires --idempotency-key
-  gateway health              run one authenticated Gateway v4 health probe
+    accounting estimate         offline observed-token estimate from a complete accounting export and explicit rate card
+                                                            requires --source <local-file> --rates <local-file> --expected-sha256 <source-sha256> --rates-sha256 <rates-sha256>
+                                                            no provider call, file mutation, invoice settlement or automatic model pricing
+    gateway health              run one authenticated Gateway v4 health probe
     gateway sessions            list stored native sessions
     gateway models              read cached native model metadata; --offset <models> --sha256 <snapshot-digest>
                                                             no refresh, selection change, credential resolution or inference
                                                             --availability explicitly requests typed unavailable status on the first page
+                                                            --freshness reads monotonic cache age and its explicit limit; it never refreshes
     gateway refresh-models      explicitly fetch the current provider catalogue; requires --sha256 <observed-digest>
                                                             requests read/write scope; no model switch or inference; failure keeps the previous cache
     gateway export-models --destination <absolute-file>
@@ -378,6 +384,7 @@ enum Invocation {
     McpCredential(mcp_credential::CredentialCommand),
     McpLogin(Box<mcp_oauth::LoginCommand>),
     ProviderConfig(provider_config::ProviderConfigCommand),
+    AccountingCost(accounting_cost::EstimateCommand),
 }
 
 #[derive(Clone, Copy)]
@@ -424,6 +431,7 @@ fn parse_invocation(arguments: &[OsString]) -> Result<Invocation, ParseFailure> 
         "migrate" => migration_preview::parse(arguments).map(Invocation::Migration),
         "state" => state_snapshot::parse(arguments).map(Invocation::Snapshot),
         "config" => provider_config::parse(arguments).map(Invocation::ProviderConfig),
+        "accounting" => accounting_cost::parse(arguments).map(Invocation::AccountingCost),
         "mcp"
             if arguments.get(1).and_then(|value| value.to_str()) == Some("oauth")
                 && matches!(

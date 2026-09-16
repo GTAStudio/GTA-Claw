@@ -40,6 +40,11 @@ Aliases never switch provider, endpoint or account, initiate discovery or provid
 HTTP generation accepts configured aliases explicitly; the generic HTTP port does not start
 accepting arbitrary model names. Existing `openclaw` selectors retain their prior behavior.
 
+Optional `catalogue_max_age_ms` limits how long the active provider's cached model metadata may
+authorize new calls: 1000..86400000 ms, including for Copilot. Omission preserves unbounded caching;
+disabled mode rejects it. `inspect` reports `catalogueMaxAgeMs`; exact-model edits retain it.
+Changes require reviewed restart. This is not a request timeout, price limit or account validity period.
+
 The JSON5 candidate contains references, not resolved secrets, and uses the configuration library's
 deterministic serialization; source comments and layout are not copied. Its receipt includes
 `candidateSha256`, `fileCreated`, `restartRequired:true` and `applied:false`. Parent-directory
@@ -186,6 +191,26 @@ option; no automatic fallback or refresh occurs. Unknown reasons are rejected ra
 as remote text. TUI exposes `models-status`; desktop Models has a separate status control, retaining
 the previous valid page on refusal and rejecting responses from old connections. See the
 [status verification record](../../docs/ledger/native-model-status-20260916.json).
+
+`gateway models --freshness` explicitly reads `cacheFreshness`: `state`, `ageMs` and `maxAgeMs`.
+States are `fresh`, `expired`, `unknown` and `unbounded`. The first-page-only option cannot be
+combined with a continuation cursor. It never refreshes, selects a model or invokes generation.
+TUI `models-status` and the desktop status control request freshness alongside lifecycle details.
+Older servers may reject the request; omitted/inconsistent observations are not silently accepted.
+Use ordinary `models` for the prior cache-only contract.
+
+Age comes from a monotonic server clock, not wall-clock `observedAtMs`. With an explicit limit,
+age at or above that limit, unknown age or an invalid observation blocks new completion, stream,
+embedding and runtime provider calls. Existing streams are not retroactively cancelled. Failed or
+cancelled refreshes do not extend the old cache's lifetime. The expired directory remains readable;
+review it, explicitly run `refresh-models --sha256 <observed-digest>`, then read again. Successful
+publication restores cache freshness without changing the selected model or invoking inference.
+There is no automatic retry of a previously refused or uncertain generation.
+
+Displayed freshness is a snapshot, not a ticking clock or live per-account capability guarantee.
+Dynamic ages do not enter the catalogue digest or `export-models` archives, whose metadata may be
+stale and must not authorize execution by itself. See the
+[cache policy record](../../docs/ledger/native-model-cache-20260916.json).
 
 ### Complete Catalogue Export
 
@@ -606,6 +631,56 @@ directory and uses create-new plus file synchronization, not an atomic rename. A
 failure can leave a file and directory durability is not certified; preserve and inspect it
 before a new explicit export. No ACK, provider invocation or billing settlement is performed.
 See the [complete workflow record](../../docs/ledger/native-accounting-workflow-20260915.json).
+
+### Offline Cost Estimate
+
+`accounting estimate` reads that complete export and an independently reviewed rate card. It makes
+no Gateway/provider call and never updates either file. This illustrative rate card is **not a real
+service quote**; substitute the exact provider/model from your export and your reviewed rates:
+
+```json
+{
+  "schemaVersion": 1,
+  "kind": "gta-claw.token-rate-card",
+  "currency": "USD",
+  "revision": "reviewed-example-2026-09-16",
+  "tokenBasis": "all_reported_input_output",
+  "rates": [{
+    "provider": "openai",
+    "model": "exact-provider-model-id",
+    "inputMicrounitsPerMillion": 3000000,
+    "outputMicrounitsPerMillion": 15000000
+  }]
+}
+```
+
+The example values mean 3 and 15 currency units per million input/output tokens. Currency is a
+three-uppercase-letter label, not a verified exchange rate. All input and output tokens use these
+flat rates, including cached/reasoning subsets; those subsets are not added again. No cache discount,
+region, tier, account entitlement or legacy configured price is inferred.
+
+```powershell
+$sourceHash = (Get-FileHash D:\Exports\run.accounting.json -Algorithm SHA256).Hash.ToLowerInvariant()
+$ratesHash = (Get-FileHash D:\Exports\rates.json -Algorithm SHA256).Hash.ToLowerInvariant()
+gta-claw-cli accounting estimate --source D:\Exports\run.accounting.json --rates D:\Exports\rates.json --expected-sha256 $sourceHash --rates-sha256 $ratesHash --json
+```
+
+Review both files before using their hashes. The command validates both file digests and the whole
+accounting snapshot. Paths must be absolute local files without unsafe links. Limits are 4 MiB for
+the export, 64 KiB for the rate card, 128 exact unique provider/model rates and 1024 recorded rounds.
+Rates are integers from 0 through 1000000000000 microunits per million tokens; revision is a nonempty
+label of at most 128 bytes with no control characters. Duplicate/unknown fields and floating prices
+are refused. Aliases are not resolved by the offline calculator.
+
+Amounts are exact decimal strings with 12 places, computed using checked integers. Missing/partial
+reports or missing rates are counted separately, not filled with zero. `knownSubtotal` prices only
+complete covered rounds; `totalEstimate` is null unless every recorded round is priced. No recorded
+rounds yields null, while an explicit complete zero or free rate can yield zero. Even a complete
+**observed-usage estimate** leaves `actualCostKnown:false`, `billingReconciled:false` and `isInvoice:false`.
+It preserves `outcome_unknown` and cannot prove that an open journal includes every remote charge.
+Source metadata itself is untrusted; this is neither an invoice nor a runtime monetary hard limit.
+Filesystem reads have no portable hard I/O deadline. See the
+[estimate record](../../docs/ledger/native-accounting-estimate-20260916.json).
 
 Each reported response includes its actual provider/model/response identity, reporting coverage,
 observed token counters and finish reason. `response:null` is an unconfirmed attempt, not a zero-cost

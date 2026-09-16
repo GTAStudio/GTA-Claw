@@ -132,6 +132,7 @@
 | M3-08 / M5-01 / M5-02 | TUI和Slint接入已有providerAccounting，共用有界协议模型；区分缺失/未报/部分/明确零值/溢出、终态与日志来源和未结算费用；九种真实WebSocket、七种桌面状态及多尺寸软件像素，protocol/TUI138与桌面86通过、严格lint/根check | 非货币硬限额/已结算账单，桌面完整partial导出、模型配置生命周期、实号/交互平台与旧凭据异常仍开放；见[客户端用量记录](ledger/native-accounting-clients-20260915.json) |
 | M2-05 / M3-05 / M3-08 | CLI accounting-run按设备/run/终态revision只读16轮分页，完整记录摘要固定来源/日志代次；实际响应身份与计数、unknown不补零；九种CLI子进程及三方言daemon/重启/跨设备拒绝，CLI/daemon340通过/5忽略及严格lint | 单独续页非全文独立验证，完整归档/GUI逐轮查看/定价/发票与货币硬限额仍开放，旧凭据异常保留；见[逐轮用量页记录](ledger/native-accounting-pages-20260915.json) |
 | M3-05 / M3-08 / M5-01 / M5-02 | CLI export-accounting固定连接/终态、全页计数及全文SHA独立校验后独占创建JSON；TUI accounting/next与Slint只读逐轮查看、来源绑定/拒旧/无新增ACK；共享协议校验保留既有v1字段顺序；四包486通过/5忽略、桌面88通过、严格lint/根check | 非发票/价格/货币限额，GUI单独续页不独立证明全文；真实账号/平台交互、原生凭据跨进程偶发缺失未关闭；见[用量工作流记录](ledger/native-accounting-workflow-20260915.json) |
+| M3-05 / M3-08 / M5-01 | 离线完整用量导出和显式费率卡双SHA验证、精确provider/model定点整数估算；不重复缓存/推理子集、未知不补零；13种非空加1种空导出真实CLI场景，CLI117通过/2忽略、严格lint/根check | 只是已记录用量估算，不核对实号费率/账单，不做实时货币硬限额；GUI、缓存差价/阶梯/税费/汇率及原凭据异常仍开放；见[离线估算记录](ledger/native-accounting-estimate-20260916.json) |
 | M4-01 / M4-02 | 显式memory_notes接入模型/HTTP/MCP统一审批审计；身份分区、CAS保存/纠正/删除、分页/UTF-8游标、关键词跨会话召回；实际双设备模型夹具及两次重启验证 | 语义/自动召回、完整客户端/来源/备份遗忘、完整磁盘配额与真实模型账号；见[显式记忆记录](ledger/native-explicit-memory-20260914.json) |
 | M4-02 / M5-01 / M5-08 | CLI七种记忆动作使用持久设备与health能力预检；原生直接工具回合零模型请求、绑定审批/持久结果/幂等；固定revision摘要导出页、原子CAS导入、结构化stdin凭据分离；相关四包535测试通过 | 大归档分阶段导入/本地自动收集、TUI/Slint专用管理、语义与全历史/备份遗忘仍开放；见[记忆客户端记录](ledger/native-memory-client-20260914.json) |
 | M1-06 / M2-07 / M4-02 | 记忆全库256个持久笔记本配额在同一redb写事务检查；最后名额竞争、满额已有记录维护、重启和空笔记本保留；写锁等待后再次核权，相关三包301测试通过 | 完整磁盘/归档/产物配额、身份退役、全平台故障仍开放；见[记忆配额记录](ledger/native-memory-quota-20260914.json) |
@@ -589,7 +590,9 @@ M4-01、M4-03、M4-08、M5-01、M6-16 共同验证，不能用各 crate 的测�
 
 - [ ] M3-07 覆盖模型精确 ID、alias、endpoint、账号、显式默认/禁用/空 fallback、工具/图像/上下文能力和目录刷新。
 
-  归属/入口：providers/config、daemon model catalog、客户端模型选择。前置：M3-06、M0-05。当前：注册表和默认模型 pin 已有，完整能力目录及选择体验未完成。
+  归属/入口：providers/config、daemon model catalog、客户端模型选择。前置：M3-06、M0-05。当前：精确ID/显式别名、固定选择、缓存目录/刷新/导出、生命周期和可选单调年龄准入、CLI/TUI/Slint本地候选已接通；真实账号能力、完整在线退役及选择应用体验仍未完成。
+
+  2026-09-16 缓存年龄增量：显式1秒到24小时上限、到期/未知零调用、失败刷新不续期、成功显式恢复，查询时年龄不进入稳定摘要。三种真实daemon方言、五包641通过/7忽略、桌面98通过及严格lint/根check，见[缓存年龄记录](ledger/native-model-cache-20260916.json)；原凭据异常、实号及跨平台挂起边界不据此关闭。
 
   - [ ] M3-07.01 为每个模型区分 provider ID、精确模型 ID、alias、账号、endpoint、上下文/输出上限与各模态能力，标明来源和刷新时间。
   - [ ] M3-07.02 实现显式默认/禁用/空 fallback 和目录刷新，列表仅发现不发起生成，刷新不能替换用户选择。

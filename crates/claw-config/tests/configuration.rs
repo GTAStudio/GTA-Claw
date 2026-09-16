@@ -244,6 +244,80 @@ fn provider_model_edit_keeps_identity_credentials_limits_and_original_snapshot()
 }
 
 #[test]
+fn provider_catalogue_age_is_explicit_bounded_preserved_and_restart_required() {
+    let original = parse_json5(VALID, "catalogue-age").expect("base snapshot");
+    for kind in ["openai", "anthropic", "copilot"] {
+        let mut selection = serde_json::json!({"kind":kind,"model":"exact"});
+        if kind != "copilot" {
+            selection["api_key"] = serde_json::json!("env:CATALOGUE_KEY");
+        }
+        let unbounded = claw_config::with_provider_json(&original, &selection.to_string())
+            .expect("legacy age policy");
+        assert_eq!(
+            unbounded
+                .core()
+                .provider()
+                .expect("provider")
+                .catalogue_max_age_ms(),
+            None
+        );
+        for max_age in [1_000, 60_000, 86_400_000] {
+            selection["catalogue_max_age_ms"] = serde_json::json!(max_age);
+            let configured = claw_config::with_provider_json(&original, &selection.to_string())
+                .expect("bounded age policy");
+            assert_eq!(
+                configured
+                    .core()
+                    .provider()
+                    .expect("provider")
+                    .catalogue_max_age_ms(),
+                Some(max_age)
+            );
+            let encoded = to_json5(&configured).expect("serialization");
+            assert_eq!(
+                parse_json5(&encoded, "roundtrip").expect("config"),
+                configured
+            );
+            let candidate = claw_config::with_provider_model(&configured, "another-exact")
+                .expect("model candidate");
+            assert_eq!(
+                candidate
+                    .core()
+                    .provider()
+                    .expect("provider")
+                    .catalogue_max_age_ms(),
+                Some(max_age)
+            );
+            let mut reload = ReloadManager::new(unbounded.clone());
+            let change = reload
+                .reload_json5(&encoded, "age edit")
+                .expect("valid configuration");
+            assert_eq!(change.changed_domains, [ConfigDomain::Provider]);
+            assert_eq!(change.restart_required_domains, [ConfigDomain::Provider]);
+        }
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(999),
+            serde_json::json!(86_400_001),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("60000"),
+            serde_json::json!(true),
+        ] {
+            selection["catalogue_max_age_ms"] = invalid;
+            assert!(claw_config::with_provider_json(&original, &selection.to_string()).is_err());
+        }
+    }
+    assert!(
+        claw_config::with_provider_json(
+            &original,
+            r#"{"kind":"disabled","catalogue_max_age_ms":60000}"#
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn provider_model_aliases_are_explicit_bounded_and_preserved_without_changing_identity() {
     let original = parse_json5(VALID, "source").expect("base snapshot");
     let base = serde_json::json!({"kind":"openai","model":"exact", "api_key":"env:ALIAS_KEY"});

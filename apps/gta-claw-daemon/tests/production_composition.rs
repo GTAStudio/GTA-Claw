@@ -20,6 +20,7 @@ enum ProviderFixtureSource {
     Configuration,
     EditedModel,
     CliModel,
+    CatalogueAge,
 }
 
 fn apply_cli_model_fixture(config: &Path, model: &str) {
@@ -417,6 +418,9 @@ impl Running {
                         {"alias":"work-native","model":model},
                         {"alias":"work-other","model":"other-fixture"}
                     ]);
+                }
+                if provider_source == ProviderFixtureSource::CatalogueAge {
+                    document["core"]["provider"]["catalogue_max_age_ms"] = serde_json::json!(2000);
                 }
                 let contents = if matches!(
                     provider_source,
@@ -2245,6 +2249,136 @@ fn bound_cli_provider_model_prepare_apply_and_daemon_start_use_the_saved_selecti
     verify_native_provider_selection(&[ProviderFixtureSource::CliModel]);
 }
 
+#[test]
+fn bound_native_catalogue_age_requires_explicit_refresh_and_preserves_selection() {
+    verify_native_provider_selection(&[ProviderFixtureSource::CatalogueAge]);
+}
+
+fn verify_bound_catalogue_age(
+    daemon: &Running,
+    executor: &tokio::runtime::Runtime,
+    requests: &std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    invalid_catalogue: &std::sync::atomic::AtomicBool,
+) {
+    use serde_json::{Value, json};
+    let rpc = |params: Value| {
+        request(
+            daemon.http,
+            "POST",
+            "/api/v1/admin/rpc",
+            Some("operator-token"),
+            Some(&json!({"method":"models.list","params":params}).to_string()),
+        )
+    };
+    let inspect = || {
+        let response = rpc(json!({"nativeCatalogPage":{"offset":0,"includeFreshness":true}}));
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let document: Value =
+            serde_json::from_str(response_body(&response)).expect("cache observation");
+        let page = document["payload"].clone();
+        claw_protocol::native_models::validate_freshness_page(&page.to_string())
+            .expect("real cache state");
+        page
+    };
+    let initial = inspect();
+    assert_eq!(initial["cacheFreshness"]["maxAgeMs"], 2000);
+    assert_eq!(initial["cacheFreshness"]["state"], "fresh");
+    assert_eq!(initial["selectedModel"], "native-fixture");
+    let unauthenticated = request(
+        daemon.http,
+        "POST",
+        "/api/v1/admin/rpc",
+        None,
+        Some(
+            r#"{"method":"models.list","params":{"nativeCatalogPage":{"offset":0,"includeFreshness":true}}}"#,
+        ),
+    );
+    assert!(unauthenticated.starts_with("HTTP/1.1 401"));
+    let allowed = request(
+        daemon.http,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        Some(r#"{"model":"openclaw","messages":[{"role":"user","content":"fresh cache"}]}"#),
+    );
+    assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+    executor.block_on(async {
+        tokio::time::sleep(Duration::from_millis(2050)).await;
+    });
+    let expired = inspect();
+    assert_eq!(expired["cacheFreshness"]["state"], "expired");
+    assert_eq!(expired["sha256"], initial["sha256"]);
+    let calls_before = requests.lock().expect("request witness").len();
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            json!({"model":"openclaw","messages":[{"role":"user","content":"expired cache"}]}),
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"openclaw","input":"expired cache"}),
+        ),
+    ] {
+        let rejected = request(
+            daemon.http,
+            "POST",
+            path,
+            Some("operator-token"),
+            Some(&body.to_string()),
+        );
+        assert!(
+            rejected.starts_with("HTTP/1.1 400") && rejected.contains("catalogue has expired"),
+            "{rejected}"
+        );
+    }
+    assert_eq!(
+        requests.lock().expect("no stale generation").len(),
+        calls_before
+    );
+    invalid_catalogue.store(true, Ordering::SeqCst);
+    let invalid_refresh = rpc(json!({"nativeCatalogRefresh":{"sha256":expired["sha256"]}}));
+    assert!(
+        !invalid_refresh.starts_with("HTTP/1.1 200"),
+        "bad catalogue cannot extend validity"
+    );
+    invalid_catalogue.store(false, Ordering::SeqCst);
+    let still_expired = inspect();
+    assert_eq!(still_expired["cacheFreshness"]["state"], "expired");
+    assert_eq!(still_expired["sha256"], initial["sha256"]);
+    assert_eq!(
+        requests.lock().expect("one refused catalogue fetch").len(),
+        calls_before + 1
+    );
+    let refreshed = rpc(json!({"nativeCatalogRefresh":{"sha256":expired["sha256"]}}));
+    assert!(refreshed.starts_with("HTTP/1.1 200"), "{refreshed}");
+    let recovered = inspect();
+    assert_eq!(recovered["cacheFreshness"]["state"], "fresh");
+    assert_eq!(recovered["selectedModel"], "native-fixture");
+    assert_eq!(
+        recovered["providerGeneration"],
+        initial["providerGeneration"]
+    );
+    assert_eq!(recovered["selectionPinned"], true);
+    let old_digest = rpc(json!({"nativeCatalogRefresh":{"sha256":expired["sha256"]}}));
+    assert!(!old_digest.starts_with("HTTP/1.1 200"));
+    assert_eq!(
+        requests.lock().expect("no stale refresh request").len(),
+        calls_before + 2
+    );
+    let allowed = request(
+        daemon.http,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        Some(r#"{"model":"openclaw","messages":[{"role":"user","content":"refreshed cache"}]}"#),
+    );
+    assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+    assert_eq!(
+        requests.lock().expect("one recovered generation").len(),
+        calls_before + 3
+    );
+}
+
 fn verify_native_provider_selection(sources: &[ProviderFixtureSource]) {
     use axum::extract::Json;
     use axum::http::HeaderMap;
@@ -2267,6 +2401,8 @@ fn verify_native_provider_selection(sources: &[ProviderFixtureSource]) {
         let typed_provider = provider_source != ProviderFixtureSource::Environment;
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let models = Arc::clone(&requests);
+        let invalid_catalogue = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invalid_models = Arc::clone(&invalid_catalogue);
         let completions = Arc::clone(&requests);
         let role = Arc::clone(&requests);
         let router = axum::Router::new()
@@ -2278,6 +2414,9 @@ fn verify_native_provider_selection(sources: &[ProviderFixtureSource]) {
                 let credential = if provider == "openai" { headers.get("authorization").expect("bearer credential").to_str().expect("header") } else { headers.get("x-api-key").expect("Anthropic key").to_str().expect("header") };
                 assert_eq!(credential, if provider == "openai" { "Bearer native-provider-fixture" } else { "native-provider-fixture" });
                 models.lock().expect("models request").push(("models".to_owned(), Value::Null));
+                if invalid_models.load(Ordering::SeqCst) {
+                    return Json(json!({"data": []}));
+                }
                 Json(json!({"data": [{"id": "native-fixture", "type": "model", "display_name": "Native fixture", "created_at": "2026-09-14T00:00:00Z"}, {"id": "other-fixture", "type": "model", "display_name": "Other fixture", "created_at": "2026-09-14T00:00:00Z"}]}))
             }))
             .route(if completion_api == Some("responses") { "/v1/responses" } else if provider == "openai" { "/v1/chat/completions" } else { "/v1/messages" }, post(move |headers: HeaderMap, Json(body): Json<Value>| async move {
@@ -2348,6 +2487,13 @@ fn verify_native_provider_selection(sources: &[ProviderFixtureSource]) {
             None,
             provider_source,
         );
+        if provider_source == ProviderFixtureSource::CatalogueAge {
+            verify_bound_catalogue_age(&daemon, &executor, &requests, &invalid_catalogue);
+            daemon.stop();
+            stop.cancel();
+            executor.block_on(server).expect("owned API fixture joined");
+            continue;
+        }
         let status = request(
             daemon.http,
             "POST",
@@ -2377,6 +2523,7 @@ fn verify_native_provider_selection(sources: &[ProviderFixtureSource]) {
                 ("model", json!("other-fixture")),
                 ("api_key", json!("env:MUST_NOT_RESOLVE_DURING_RELOAD")),
                 ("request_timeout_ms", json!(1000)),
+                ("catalogue_max_age_ms", json!(3000)),
                 ("max_observed_turn_tokens", json!(0)),
                 (
                     "model_aliases",

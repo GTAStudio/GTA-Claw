@@ -1,0 +1,140 @@
+{
+  "schemaVersion": 1,
+  "stage": "explicit-monotonic-model-catalogue-age-and-client-observation",
+  "capturedOn": "2026-09-16",
+  "baseCommit": "7e256b51ce7bac92ddd9de65cb3ba5396ebcce95",
+  "taskIds": ["M3-06.01", "M3-07.02", "M3-07.03", "M3-07.04", "M5-01", "M5-02.02"],
+  "platform": "windows-x86_64",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "cargoLockSha256": "03ae0a54ee93bb13ccaf84f53747742ef5fd48103ef6032b07e4793baeae7834",
+  "desktopCargoLockSha256": "b675cb2b8305584f95bf1d60dcce178e4f3cb93921722e30ca6a3ba3487d5c63",
+  "sourceFiles": [
+    { "path": "apps/gta-claw-cli/src/lib.rs", "sha256": "c0f490674e1aa0ffc7661701f72d27f545439310e3b98dd983cebdd38d6f0673" },
+    { "path": "apps/gta-claw-cli/src/native_gateway.rs", "sha256": "52389b7c744ae3a8653ac49efca4af3592986f4efa3771adfcbcbf85c95062e8" },
+    { "path": "apps/gta-claw-cli/src/provider_config.rs", "sha256": "6133d0ff0da6f4232f155f959dd7563683bae2b86e3ebd87bc50bc97f844d610" },
+    { "path": "apps/gta-claw-cli/tests/foundation.rs", "sha256": "73e9c810725a6df0fd46d64687d3e7a9d3a0d2a5e5b2386a679cade61961e684" },
+    { "path": "apps/gta-claw-cli/tests/gateway_health.rs", "sha256": "345248e7f5e3473b6b49b3bc9e4f5eb091d03d6c6d734fcbe57f606cd4ee46de" },
+    { "path": "apps/gta-claw-daemon/src/adapters/http_api.rs", "sha256": "de58fc8e5c7c14ec91d3de70e990aef625a45cbae40384739c24b180846a1df0" },
+    { "path": "apps/gta-claw-daemon/src/production.rs", "sha256": "1e1e2de0e88c04346b7561a9fcb7639af0b9e1a9582723c2d45afeae5591a87e" },
+    { "path": "apps/gta-claw-daemon/tests/production_composition.rs", "sha256": "dafc31814aba61f346042eea3519ab6ce2df76703469a75ac53de5daceff5964" },
+    { "path": "apps/gta-claw-tui/src/gateway.rs", "sha256": "543b02aa5345b1f1bd63bf39f9f701a6a3e8c8b0aa97e01ee0ef8de82dd371b3" },
+    { "path": "apps/gta-claw-tui/src/render.rs", "sha256": "5c2a45eb80a9731b0b6b311ab5c11e6d6e8aa5b5e1ab22e849f78349557c5f5c" },
+    { "path": "apps/gta-claw-tui/tests/gateway_double.rs", "sha256": "6795cfc636c3bba45dc3e22c6e8de78b4dfaa7239c8d939fce7417d6d529c644" },
+    { "path": "apps/gta-claw-tui/tests/rendering.rs", "sha256": "767a008364df2021232ceaa45d0bfb8487ea2b91904f6864e0d2e029a996d32a" },
+    { "path": "crates/claw-config/src/model.rs", "sha256": "a2e8b0a451f08c6768aa71fcc01fc091e02aba6db5638ce1afed5e3c20b4c775" },
+    { "path": "crates/claw-config/src/wire.rs", "sha256": "3b6a315bca189fb486fab2299f6c6192b54d6e6b3ff852a2438a4acf87cf14ed" },
+    { "path": "crates/claw-config/tests/configuration.rs", "sha256": "7199b318d827d35d0e0330909cb25d383985fa87251d127e176b58938cf50265" },
+    { "path": "crates/claw-protocol/src/native_models.rs", "sha256": "07b4a45ea936727f63e37da84bcc9a3343b69ed8e37d14059df21afea3ef4834" },
+    { "path": "desktop/apps/gta-claw-desktop/src/controller.rs", "sha256": "02cbfec9cbbef867cb0caa480625acbae3fb4492b2cc72212fc90d0506618dfc" },
+    { "path": "desktop/apps/gta-claw-desktop/src/product_state.rs", "sha256": "5c5fe2604a3a5ef13b66bf1b894f1cfe7156a6e30de40ebe1d3bfb6ae8a48c88" },
+    { "path": "desktop/apps/gta-claw-desktop/src/software_renderer_smoke.rs", "sha256": "4c903dc27d44ffe02b5d72e9c1a69eb7c966143ef25ee9f8507bce0a4f9a750f" }
+  ],
+  "checks": [
+    {
+      "command": "cargo +stable test -p claw-config -p claw-protocol -p gta-claw-daemon -p gta-claw-cli -p gta-claw-tui --all-targets --no-fail-fast --locked --offline -j 1",
+      "result": "passed", "exitCode": 0, "passed": 641, "failed": 0, "ignored": 7, "testBinaries": 38,
+      "log": "target/native-model-cache-final-tests-20260916.log",
+      "sha256": "d7a4dd7f44eaec0a2b94f69a7c6a72845da9f4b260b99a04f3fe39dab1c5fbed"
+    },
+    {
+      "command": "cargo +stable clippy -p claw-config -p claw-protocol -p gta-claw-daemon -p gta-claw-cli -p gta-claw-tui --all-targets --locked --offline -j 1 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-model-cache-final-clippy-20260916.log",
+      "sha256": "93226fadebd0bb75a08036fc3ef8827bf015734146f8f0843a21a98404a5b8a7"
+    },
+    {
+      "command": "cargo +stable check --workspace --all-targets --locked --offline -j 1",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-model-cache-final-check-20260916.log",
+      "sha256": "7e0ab62bf0c646130e2da3301f6c52f42893b90a377c11362287468d164367bd"
+    },
+    {
+      "command": "cargo +stable test --manifest-path desktop/Cargo.toml --workspace --all-targets --no-fail-fast --locked --offline -j 1 --config profile.test.package.gta-claw-desktop.debug=0 --config profile.test.package.gta-claw-desktop.codegen-units=16",
+      "result": "passed", "exitCode": 0, "passed": 98, "failed": 0, "ignored": 0, "testBinaries": 1,
+      "log": "target/native-model-cache-desktop-final-tests-20260916.log",
+      "sha256": "c2c5891a5f446fbba674453050da8c05fd1111f2c2263d1ff86590da83843627"
+    },
+    {
+      "command": "cargo +stable clippy --manifest-path desktop/Cargo.toml --workspace --all-targets --locked --offline -j 1 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-model-cache-desktop-first-clippy-20260916.log",
+      "sha256": "89461615efe9bb62f7639fce289e11e44fa33dce8631352e2f08712db741524a"
+    }
+  ],
+  "behaviorEvidence": [
+    "provider_catalogue_age_is_explicit_bounded_preserved_and_restart_required",
+    "catalogue_freshness_is_consistent_opt_in_and_excluded_from_snapshot_digests",
+    "model_catalogue_expiry_refuses_generation_without_refresh_or_fallback",
+    "model_catalogue_freshness_is_explicit_stable_and_keeps_expired_metadata_readable",
+    "model_catalogue_refresh_is_bounded_cancel_safe_and_preserves_selected_provider",
+    "model_alias_requests_preserve_exact_ids_and_pinned_selection_before_provider_calls",
+    "bound_native_catalogue_age_requires_explicit_refresh_and_preserves_selection",
+    "model_catalogue_cli_validates_metadata_without_selection_refresh_or_replay",
+    "native_tui_model_catalogue_reads_and_refreshes_without_chat_ack_or_selection",
+    "native_model_catalogue_renders_cached_metadata_and_control_states_at_two_sizes"
+  ],
+  "notes": [
+    "core.provider.catalogue_max_age_ms is optional, supports active OpenAI/Anthropic/Copilot selections and is bounded to 1000..86400000 milliseconds. Omission preserves the previous unbounded-age policy. Disabled selection rejects the setting, exact-model editing retains it and provider reload classifies it as restart-required",
+    "The adapter measures elapsed time with Instant, never by subtracting wall-clock observedAtMs. Initial successful catalogue publication and successful explicit refresh record monotonic time with the model cache locked. Expiry is age >= limit; absent or backwards observation rejects admission when a limit is configured",
+    "Completion, streaming, embeddings and runtime-context generation validate age before calling the provider. Expired requests cause zero provider calls and no stream events. Explicit aliases are resolved before the same checks and cannot select a different model or bypass expiry",
+    "Only a validated, still-current successful refresh updates freshness. Cancellation, dropped futures, timeout, missing selected model, alias collisions, removed targets, concurrent selection/provider changes and shutdown retain the old adapter's expiry. No automatic list request, generation retry, paid-model fallback or wall-clock change is added",
+    "includeFreshness:true adds cacheFreshness only to available live inspection pages and returns a typed lifecycle reason when no cache exists. fresh/expired/unknown/unbounded are closed states cross-checked against ageMs/maxAgeMs. Dynamic observations are outside the stable ordered catalogue digest; complete archived snapshots reject them",
+    "CLI models --freshness is a first-page-only read option and requires the requested observation, rejecting unsupported or incomplete responses. Ordinary models, availability-only queries and export-models retain their wire shape. CLI local provider inspection exposes catalogueMaxAgeMs without resolving credentials",
+    "TUI models-status and the desktop status button request lifecycle plus freshness. An old server may refuse these fields; clients preserve the previous valid page and never silently fall back or auto-refresh. Ordinary catalogue reads remain available. Rendering uses only validated types; model selectors still carry exact IDs",
+    "Displayed age is the observation received, not a ticking clock or a continuing authorization. Server admission rechecks local age for each new provider call. Cache presence and fresh metadata are not proof of live account capabilities or inference readiness",
+    "One actual daemon test runs three HTTP dialects with a two-second age policy: fresh request succeeds, real expiry rejects, invalid refresh does not extend validity, successful refresh restores generation, and stale refresh digest is refused. Authenticated inspection and exact request counters are checked. Other source/dialect reload fixtures reject age-policy edits without generation changes",
+    "CLI real-process cases cover all four states, unknown text, omitted metadata and inconsistent numeric states. TUI transport and eight terminal sizes plus desktop controller and two software-rendered window sizes passed. No mobile or macOS runtime qualification is inferred from Windows tests",
+    "Seven ignored native helpers/integration entries are not counted as executed. The CLI async-runtime initialization failure line belongs to existing passing fault injection. Strict lint precedes final formatting of two files; final regressions and root check follow that formatting",
+    "The first boundary fixture used a one-nanosecond offset unrepresentable by Windows Instant and failed. It was corrected to one millisecond without relaxing the age boundary. An incomplete patch initially led to a zero-test filtered run; that is not counted. The actual test was then added and ran successfully. Initial strict lint found nested conditions and unchecked test-time subtraction, repaired without allowances",
+    "No locks, dependencies, CI definitions, sealed fixtures or published release policy changed. No Git write, real account, paid request, production proxy operation or user configuration migration was performed. Historical model-status/alias/export records remain unchanged"
+  ],
+  "followups": [
+    {
+      "stage": "reject-already-expired-model-resolution-before-history-access",
+      "sourceFiles": [
+        { "path": "apps/gta-claw-daemon/src/adapters/http_api.rs", "sha256": "6f07f1f2a453cb802f9dcf7523dc84711269d6bb357f178a849320a3183cde3d" }
+      ],
+      "checks": [
+        {
+          "command": "cargo +stable test -p gta-claw-daemon --all-targets --no-fail-fast --locked --offline -j 1",
+          "result": "passed", "exitCode": 0, "passed": 259, "failed": 0, "ignored": 5, "testBinaries": 9,
+          "log": "target/native-model-cache-history-final-tests-20260916.log",
+          "sha256": "ac4fbe90210ff585f491edfb2695770cf14ba1a2cfe26a80a44037cedbcbddc4"
+        },
+        {
+          "command": "cargo +stable clippy -p gta-claw-daemon --all-targets --locked --offline -j 1 -- -D warnings",
+          "result": "passed", "exitCode": 0,
+          "log": "target/native-model-cache-history-verified-clippy-20260916.log",
+          "sha256": "2c19a14bb8443fd2a2e6f174f88ac793163710e018b43600d876c04f4fa62f97"
+        },
+        {
+          "command": "cargo +stable test -p gta-claw-daemon --lib model_alias_requests_preserve_exact_ids_and_pinned_selection_before_provider_calls --locked --offline -j 1",
+          "result": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0, "testBinaries": 1,
+          "log": "target/native-model-cache-history-post-lint-tests-20260916.log",
+          "sha256": "3ce63141d4265962bf3334dcdeecbb01a4578371e6e96378da2ef06ad0e21a92"
+        }
+      ],
+      "retainedFailure": {
+        "log": "target/native-model-cache-history-baseline-20260916.log",
+        "sha256": "a2e18b070ada895095c82acc648aa0429a23e50f0b2a70c67be939dd8c0a4a9e",
+        "passed": 0, "failed": 1,
+        "reason": "An already expired alias completion correctly avoided provider generation but renewed the local history access timestamp during request preparation. The added fixed-history-time assertion failed before the early resolver guard was introduced"
+      },
+      "notes": [
+        "Model resolution now checks configured cache age before alias admission and HTTP request history access. Exact IDs, explicit aliases and default selectors all reject already expired caches without renewing the retained history timestamp or changing stored messages",
+        "The provider-call guard remains in place for expiry during request preparation. This does not promise rollback of all preparation work when expiry occurs after the first guard, nor cancel an already admitted call",
+        "The existing refresh-failure test previously used execution admission to inspect retained alias metadata. It now separately verifies the unchanged alias map and that its expired execution is refused; original snapshot, generation and timestamp assertions remain",
+        "After the 259-test daemon regression, strict lint required explicit early release of two test-only history guards. The verified lint and single post-lint history regression above cover those final changes. No claim is made that all five packages or desktop ran again for this daemon-only follow-up",
+        "The initial five-package and desktop results remain historical at the original hashes. This follow-up replaces only the current daemon source identity; old logs and all unrelated code remain unchanged"
+      ]
+    }
+  ],
+  "unverified": [
+    "Real account revocation or model capability changes within an otherwise fresh interval",
+    "Retroactive cancellation of already admitted in-flight provider calls",
+    "Monotonic-clock behavior across OS suspension on every supported platform",
+    "Original OAuth/MCP credential intermittency, full online retirement and whole-project acceptance"
+  ]
+}

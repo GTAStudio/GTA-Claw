@@ -247,6 +247,8 @@ pub(crate) struct ProviderWire {
     #[serde(skip_serializing_if = "Option::is_none")]
     request_timeout_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    catalogue_max_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     completion_api: Option<ProviderCompletionApi>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_observed_turn_tokens: Option<u64>,
@@ -268,6 +270,7 @@ impl ProviderWire {
                 || self.base_url.is_some()
                 || self.credential_origin.is_some()
                 || self.request_timeout_ms.is_some()
+                || self.catalogue_max_age_ms.is_some()
                 || self.completion_api.is_some()
                 || self.max_observed_turn_tokens.is_some()
             {
@@ -284,6 +287,7 @@ impl ProviderWire {
                 base_url: None,
                 credential_origin: None,
                 request_timeout_ms: None,
+                catalogue_max_age_ms: None,
                 completion_api: None,
                 max_observed_turn_tokens: None,
             });
@@ -345,6 +349,14 @@ impl ProviderWire {
             .collect();
         let timeout = self.request_timeout_ms.unwrap_or(120_000);
         validate_range(timeout, 1_000, 120_000, "core.provider.request_timeout_ms")?;
+        if let Some(max_age) = self.catalogue_max_age_ms {
+            validate_range(
+                max_age,
+                1_000,
+                86_400_000,
+                "core.provider.catalogue_max_age_ms",
+            )?;
+        }
         if self.kind == ProviderKind::Copilot {
             if self.api_key.is_some()
                 || self.base_url.is_some()
@@ -364,6 +376,7 @@ impl ProviderWire {
                 base_url: None,
                 credential_origin: None,
                 request_timeout_ms: Some(timeout),
+                catalogue_max_age_ms: self.catalogue_max_age_ms,
                 completion_api: None,
                 max_observed_turn_tokens: self.max_observed_turn_tokens,
             });
@@ -417,6 +430,7 @@ impl ProviderWire {
             base_url: Some(endpoint.to_string()),
             credential_origin: Some(origin),
             request_timeout_ms: Some(timeout),
+            catalogue_max_age_ms: self.catalogue_max_age_ms,
             completion_api: if self.kind == ProviderKind::Openai {
                 Some(
                     self.completion_api
@@ -487,6 +501,7 @@ impl From<&ProviderConfig> for ProviderWire {
             base_url: config.base_url.clone(),
             credential_origin: config.credential_origin.clone(),
             request_timeout_ms: config.request_timeout_ms,
+            catalogue_max_age_ms: config.catalogue_max_age_ms,
             completion_api: config.completion_api,
             max_observed_turn_tokens: config.max_observed_turn_tokens,
         }

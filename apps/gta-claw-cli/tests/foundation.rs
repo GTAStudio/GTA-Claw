@@ -58,7 +58,7 @@ fn provider_config_cli_prepares_verified_new_files_without_network_secrets_or_so
     let origin = format!("http://{}", listener.local_addr().expect("address"));
     let initial = claw_config::ConfigLayers::new().with_workspace_json5(json!({"core":{
         "role":{"source_url":format!("{origin}/role")},"channels":{"teams":{"enabled":false}},
-        "provider":{"kind":"openai","model":"initial-model","api_key":"env:UNRESOLVED_CONFIG_TEST_KEY","base_url":format!("{origin}/v1/")}
+        "provider":{"kind":"openai","model":"initial-model","api_key":"env:UNRESOLVED_CONFIG_TEST_KEY","base_url":format!("{origin}/v1/"),"catalogue_max_age_ms":60000}
     }}).to_string()).resolve().expect("initial typed config").config;
     let source = root.0.join("source.json5");
     let original = claw_config::to_json5(&initial).expect("initial encoding");
@@ -118,6 +118,7 @@ fn provider_config_cli_prepares_verified_new_files_without_network_secrets_or_so
     let (success, inspection) = run("inspect", None, None, None, &[]);
     assert!(success, "{inspection}");
     assert_eq!(inspection["selection"]["model"], "initial-model");
+    assert_eq!(inspection["selection"]["catalogueMaxAgeMs"], 60000);
     assert_eq!(inspection["environmentApplied"], false);
     assert_eq!(inspection["credentialsResolved"], false);
     let digest = inspection["sourceSha256"].as_str().expect("source SHA");
@@ -172,6 +173,14 @@ fn provider_config_cli_prepares_verified_new_files_without_network_secrets_or_so
             original
         );
         if success {
+            assert_eq!(
+                receipt["selection"]["catalogueMaxAgeMs"],
+                if scenario == "exact-model" {
+                    json!(60000)
+                } else {
+                    Value::Null
+                }
+            );
             let candidate = std::fs::read_to_string(&destination).expect("new candidate");
             let parsed = claw_config::parse_json5(&candidate, "candidate.json5")
                 .expect("full candidate validates");

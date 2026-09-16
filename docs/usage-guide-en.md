@@ -435,6 +435,13 @@ digest, while a later page only pins the snapshot. Use
 [CLI export-accounting](../apps/gta-claw-cli/README.md) for a complete, independently verified
 plaintext JSON export. Cost remains uncalculated and billing unreconciled.
 
+For a separate offline observed-usage estimate, use CLI `accounting estimate` with the complete
+export, an explicit flat-rate card and both reviewed file hashes. Amounts use checked integers,
+not legacy floating prices; missing/partial reports or absent exact rates never become zero.
+This does not alter the TUI/server accounting, invoke a model or reconcile a bill. See the
+[rate card and command](../apps/gta-claw-cli/README.md#offline-cost-estimate) and
+[estimate record](ledger/native-accounting-estimate-20260916.json).
+
 Anything else reports `Unknown command: …` in the notice line. `Esc` closes the palette.
 
 ### 4.5 Non-interactive mode
@@ -579,6 +586,12 @@ provider settings, starts no model or Device Flow, and stays explicitly non-read
 requests while administrative inspection remains available. The optional `max_observed_turn_tokens`
 is an observed per-turn stop threshold, not a monetary or single-request hard cap.
 
+Optional `core.provider.catalogue_max_age_ms` sets a cache-age admission limit of 1000..86400000 ms.
+It is supported by all active provider kinds, omitted by default, retained by exact-model candidate
+editing and restart-required. Disabled mode refuses it; local inspection reports `catalogueMaxAgeMs`.
+Elapsed age is monotonic. At expiry or unknown age, new provider calls are refused without discovery,
+fallback or retry. A successful explicit catalogue refresh restores validity; failures do not renew it.
+
 Optional `model_aliases` also applies to Copilot and Anthropic. It is a case-sensitive, single-hop
 alias-to-exact-ID table, limited to 128 entries and 4096 total UTF-8 bytes of names and targets;
 each name uses the same 256-byte model-ID grammar. Duplicate names, chains, exact-ID collisions,
@@ -629,6 +642,15 @@ capabilities are not live per-account capability proof. See the
 These are read-only local facts, not live inference readiness. Ordinary directory queries retain
 their previous format; old-server refusal preserves the previous page, and unknown reasons are
 rejected. See the [status record](ledger/native-model-status-20260916.json).
+
+`gateway models --freshness` reads a first-page cache observation with `fresh`, `expired`, `unknown`
+or `unbounded` state, age and configured maximum. TUI `models-status` and the desktop status button
+request both lifecycle and freshness; old-server refusal or missing/invalid metadata preserves the
+previous view. Ordinary `models` still uses the old format. Expired metadata remains readable and
+can be explicitly refreshed using its digest. Displayed age is not continuously updated; each new
+server call rechecks age. It is not live-account readiness, and already admitted streams are not
+cancelled retroactively. Dynamic freshness is excluded from stable directory digests and exports;
+see the [cache policy record](ledger/native-model-cache-20260916.json).
 
 `gateway export-models --destination <new-absolute-file>` reads the entire cached directory through
 the same authenticated read-only connection. It pins all page metadata and independently verifies

@@ -228,6 +228,7 @@ fn provider_summary(config: &claw_config::ConfigSnapshot) -> Value {
         "kind":provider.kind(),"model":provider.model(),"baseUrl":provider.base_url(),
         "credentialOrigin":provider.credential_origin(),"apiKeyConfigured":provider.api_key().is_some(),
         "requestTimeoutMs":provider.request_timeout_ms(),"completionApi":provider.completion_api(),
+        "catalogueMaxAgeMs":provider.catalogue_max_age_ms(),
         "maxObservedTurnTokens":provider.max_observed_turn_tokens(),
     }))
 }

@@ -403,6 +403,12 @@ session、run、turn、revision 和终态，续页同时固定原长度和摘要
 摘要，后续单页只固定快照；完整独立校验的明文 JSON 文件使用
 [CLI export-accounting](../apps/gta-claw-cli/README.md)。费用仍未计算，账单仍未核对。
 
+另有纯离线 `accounting estimate`：显式提供完整导出、定点整数费率卡及两个已审阅文件摘要，
+按精确 provider/model 估算已记录用量。缺失/部分报告或未匹配费率不补零，缓存/推理子集不重复
+收费，不读取旧浮点价格、不调用模型或改写输入。估算保留 `outcome_unknown`，不是实际账单或
+运行时货币硬限额，详情见[费率卡与命令](../apps/gta-claw-cli/README.md#offline-cost-estimate)及
+[估算记录](ledger/native-accounting-estimate-20260916.json)。
+
 其他输入会在提示行显示 `Unknown command: …`。`Esc` 关闭命令面板。
 
 ### 4.5 非交互模式
@@ -528,6 +534,11 @@ Copilot 使用 `kind:"copilot"`、精确 `model` 和可选超时，认证继续�
 模型就绪状态明确为 false。可选 `max_observed_turn_tokens` 是每回合已观察用量阈值，
 不代表货币预算或单次请求硬限额。
 
+可选 `core.provider.catalogue_max_age_ms` 将目录缓存准入年龄限制为 1000..86400000 毫秒，
+支持所有活动提供方，默认省略且不限制年龄；精确模型候选保留该值，修改需重启，disabled
+拒绝该设置。CLI 本地检查回执显示 `catalogueMaxAgeMs`。年龄使用单调时钟，不依赖墙钟；
+到期或年龄未知时拒绝新提供方调用，不自动发现、重试或换模型。只有成功显式刷新能恢复有效期。
+
 可选 `model_aliases` 同样支持 Copilot 和 Anthropic，是区分大小写、只解析一跳的显式
 别名到精确 ID 表；最多 128 项，名称与目标总计最多 4096 UTF-8 字节，每个名称遵循
 256 字节模型 ID 规则。拒绝重复、别名链、与任何精确 ID 碰撞，以及保留的 `openclaw`
@@ -570,6 +581,13 @@ SDK 声明能力不等于已验证真实账号的每模型能力。完整说明�
 或 `retired` 生命周期状态。TUI 对应 `models-status`，桌面 Models 提供独立状态按钮。它们只读
 本地事实，不证明真实账号或推理就绪；普通目录请求保留旧格式，旧服务拒绝时保留上一有效页，
 未知原因不作为任意远端文字显示，见[状态记录](ledger/native-model-status-20260916.json)。
+
+`gateway models --freshness` 显式读取第一页的 `fresh`、`expired`、`unknown` 或 `unbounded`
+状态、已观察年龄和配置上限。TUI `models-status` 与桌面状态按钮同时请求生命周期和新鲜度，
+旧服务拒绝或缺失/矛盾响应时保留上一有效页；普通 `models` 保持旧报文。过期目录仍可读取，
+审阅摘要后显式 `refresh-models`，失败或取消不会延长旧有效期。显示年龄是查询时快照，不是
+持续计时或实号就绪证明；服务端每次新调用复查，已经接受的流不因到期追溯取消。动态年龄不进入
+稳定目录摘要或导出文件，归档本身不授权推理，见[缓存策略记录](ledger/native-model-cache-20260916.json)。
 
 `gateway export-models --destination <全新绝对路径>` 通过同一已认证只读连接读取完整缓存目录，
 固定每页身份、代次、选择、观察时间和摘要，独立核验全量摘要及跨页 ID/别名唯一性后才新建

@@ -934,6 +934,13 @@ impl ProductionService {
             Arc::clone(&readiness),
         ));
         if let Some(configuration) = configured_provider {
+            if let Some(max_age_ms) = configuration.catalogue_max_age_ms() {
+                provider
+                    .configure_catalogue_max_age(max_age_ms)
+                    .map_err(|error| {
+                        ProductionError::message("native-model-catalogue-age", error)
+                    })?;
+            }
             let aliases = configuration
                 .model_aliases()
                 .iter()

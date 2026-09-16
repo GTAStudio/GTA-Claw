@@ -1840,7 +1840,7 @@ impl ProductState {
         }
         if action == 3 {
             return Some(
-                serde_json::json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true}}),
+                serde_json::json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true,"includeFreshness":true}}),
             );
         }
         let page = native
@@ -1941,7 +1941,10 @@ impl ProductState {
                 })
             },
         );
-        if !accepted {
+        if !accepted
+            || params["nativeCatalogPage"]["includeFreshness"] == true
+                && claw_protocol::native_models::validate_freshness_page(&encoded).is_err()
+        {
             self.fail_native_model_catalogue(params);
             return;
         }
@@ -1986,6 +1989,12 @@ impl ProductState {
                 lines.push(format!("Observed: {} (Unix ms)", page["observedAtMs"]));
                 lines.push("Source: provider SDK catalogue".to_owned());
                 lines.push("Live capabilities: unverified".to_owned());
+                if let Ok(freshness) = serde_json::from_value::<
+                    claw_protocol::native_models::CatalogueFreshness,
+                >(page["cacheFreshness"].clone())
+                {
+                    lines.extend(freshness.to_string().lines().map(str::to_owned));
+                }
                 if let Some(models) = page["models"].as_array() {
                     for model in models {
                         lines.push(String::new());
@@ -4509,7 +4518,7 @@ mod tests {
                 .expect("explicit status read");
             assert_eq!(
                 params,
-                json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true}})
+                json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true,"includeFreshness":true}})
             );
             state.native_model_catalogue_enqueued(&params);
             assert!(state.native_model_catalogue(0).is_none());

@@ -784,6 +784,12 @@ fn model_catalogue_rows(model: &AppModel, columns: usize) -> Vec<String> {
             lines.push(format!("Observed: {} (Unix ms)", page["observedAtMs"]));
             lines.push("Source: provider SDK catalogue".to_owned());
             lines.push("Live capabilities: unverified".to_owned());
+            if let Ok(freshness) = serde_json::from_value::<
+                claw_protocol::native_models::CatalogueFreshness,
+            >(page["cacheFreshness"].clone())
+            {
+                lines.extend(freshness.to_string().lines().map(str::to_owned));
+            }
             if let Some(models) = page["models"].as_array() {
                 for descriptor in models {
                     lines.push(String::new());

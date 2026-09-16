@@ -723,6 +723,24 @@ mod explicit_tool_tests {
         );
         status.push("--availability".into());
         assert!(parse(&status, 0).is_err());
+        let mut freshness = base.clone();
+        freshness.push("--freshness".into());
+        let parsed = parse(&freshness, 0)
+            .ok()
+            .expect("explicit freshness request");
+        assert_eq!(parsed.scope, Scope::OperatorRead);
+        assert_eq!(
+            parsed.params,
+            json!({"nativeCatalogPage":{"offset":0,"includeFreshness":true}})
+        );
+        for extra in [
+            vec!["--freshness"],
+            vec!["--offset", "8", "--sha256", &"a".repeat(64)],
+        ] {
+            let mut invalid = freshness.clone();
+            invalid.extend(extra.into_iter().map(OsString::from));
+            assert!(parse(&invalid, 0).is_err());
+        }
         let mut continued = base.clone();
         continued.extend(["--offset", "8"].into_iter().map(OsString::from));
         assert!(
@@ -1597,6 +1615,15 @@ pub(super) fn parse(
                 return Err(invalid());
             }
             params["nativeCatalogPage"]["includeAvailability"] = json!(true);
+        } else if arguments[index] == "--freshness" {
+            if command != "models"
+                || params["nativeCatalogPage"]
+                    .get("includeFreshness")
+                    .is_some()
+            {
+                return Err(invalid());
+            }
+            params["nativeCatalogPage"]["includeFreshness"] = json!(true);
         } else if arguments[index] == "--destination" {
             if !matches!(
                 command,
@@ -1780,9 +1807,12 @@ pub(super) fn parse(
         "models" => "nativeCatalogPage",
         _ => "partialPage",
     };
-    if params["nativeCatalogPage"]
+    if (params["nativeCatalogPage"]
         .get("includeAvailability")
         .is_some()
+        || params["nativeCatalogPage"]
+            .get("includeFreshness")
+            .is_some())
         && (params["nativeCatalogPage"]["offset"] != 0
             || params["nativeCatalogPage"].get("sha256").is_some())
     {
@@ -3010,6 +3040,10 @@ pub(super) async fn run(command: NativeCommand) -> RenderedResult {
                     )
                 };
                 let encoded = response.payload().value().ok_or_else(invalid)?;
+                if page["includeFreshness"] == true {
+                    claw_protocol::native_models::validate_freshness_page(encoded.as_json())
+                        .map_err(|_| invalid())?;
+                }
                 claw_protocol::native_models::validate_page(
                     encoded.as_json(),
                     page["offset"]
