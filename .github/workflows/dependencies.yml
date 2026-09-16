@@ -1,0 +1,158 @@
+name: Dependency checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "**/deny*.toml"
+      - "**/.deny*.toml"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "**/deny*.toml"
+      - "**/.deny*.toml"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/**"
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-checks-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-advisories:
+    name: Rust dependency vulnerabilities
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install hash-verified auditor in an isolated environment
+        shell: /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          readonly version="0.22.2"
+          readonly archive_sha256="700c2b240f7fd330c24b675fe429f73a5b676531fcc6300400b2b67f155ba12a"
+          readonly tool_root="${{ runner.temp }}/dependency-audit-tools"
+          original_home="$(/usr/bin/getent passwd "$(/usr/bin/id -u)" | /usr/bin/cut -d: -f6)"
+          readonly rustup_bin="$original_home/.cargo/bin/rustup"
+          readonly rustup_home="$original_home/.rustup"
+          cargo_bin="$(/usr/bin/env -i HOME="$original_home" RUSTUP_HOME="$rustup_home" PATH=/usr/bin:/bin "$rustup_bin" which --toolchain stable cargo)"
+          rustc_bin="$(/usr/bin/env -i HOME="$original_home" RUSTUP_HOME="$rustup_home" PATH=/usr/bin:/bin "$rustup_bin" which --toolchain stable rustc)"
+          /usr/bin/mkdir -p "$tool_root/home" "$tool_root/cargo-home" "$tool_root/src"
+          archive="$tool_root/cargo-audit.crate"
+          /usr/bin/curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://static.crates.io/crates/cargo-audit/cargo-audit-${version}.crate" --output "$archive"
+          /usr/bin/printf '%s  %s\n' "$archive_sha256" "$archive" | /usr/bin/sha256sum --check -
+          /usr/bin/tar --extract --gzip --file "$archive" --directory "$tool_root/src"
+          cd "$tool_root"
+          /usr/bin/env -i HOME="$tool_root/home" CARGO_HOME="$tool_root/cargo-home" \
+            RUSTUP_HOME="$rustup_home" PATH=/usr/bin:/bin RUSTC="$rustc_bin" \
+            "$cargo_bin" install --path "$tool_root/src/cargo-audit-${version}" \
+            --locked --root "$tool_root"
+          test "$("$tool_root/bin/cargo-audit" audit --version)" = "cargo-audit-audit ${version}"
+      - name: Audit all application workspace lockfiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed=0
+          for lockfile in Cargo.lock desktop/Cargo.lock android/Cargo.lock ios/Cargo.lock; do
+            if ! "$RUNNER_TEMP/dependency-audit-tools/bin/cargo-audit" audit --file "$lockfile"; then
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+  rust-dependency-policy:
+    name: Rust dependency licenses, bans and sources
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install hash-verified dependency checker
+        shell: /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          readonly version="0.19.8"
+          readonly archive_sha256="70e769ae3872e34d45132b17040859175e11401dc12dddb0303e0b8c7d088f3f"
+          readonly tool_root="${{ runner.temp }}/dependency-policy-tools"
+          /usr/bin/mkdir -p "$tool_root/bin"
+          archive="$tool_root/cargo-deny.tar.gz"
+          /usr/bin/curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${version}/cargo-deny-${version}-x86_64-unknown-linux-musl.tar.gz" \
+            --output "$archive"
+          /usr/bin/printf '%s  %s\n' "$archive_sha256" "$archive" | /usr/bin/sha256sum --check -
+          /usr/bin/tar --extract --gzip --file "$archive" --directory "$tool_root/bin" --strip-components=1
+          test "$("$tool_root/bin/cargo-deny" --version)" = "cargo-deny ${version}"
+      - name: Check dependency issues without building applications
+        shell: /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          readonly tool_root="${{ runner.temp }}/dependency-policy-tools"
+          readonly workspace="${{ github.workspace }}"
+          original_home="$(/usr/bin/getent passwd "$(/usr/bin/id -u)" | /usr/bin/cut -d: -f6)"
+          readonly rustup_bin="$original_home/.cargo/bin/rustup"
+          readonly rustup_home="$original_home/.rustup"
+          cargo_bin="$(/usr/bin/env -i HOME="$original_home" RUSTUP_HOME="$rustup_home" PATH=/usr/bin:/bin "$rustup_bin" which --toolchain stable cargo)"
+          rustc_bin="$(/usr/bin/env -i HOME="$original_home" RUSTUP_HOME="$rustup_home" PATH=/usr/bin:/bin "$rustup_bin" which --toolchain stable rustc)"
+          /usr/bin/mkdir -p "$tool_root/home" "$tool_root/cargo-home" "$tool_root/work"
+          cd "$tool_root/work"
+          failed=0
+          check_policy() {
+            local manifest="$1" policy="$2"
+            shift 2
+            if ! /usr/bin/env -i HOME="$tool_root/home" CARGO_HOME="$tool_root/cargo-home" \
+              RUSTUP_HOME="$rustup_home" PATH=/usr/bin:/bin CARGO="$cargo_bin" RUSTC="$rustc_bin" \
+              "$tool_root/bin/cargo-deny" \
+              --manifest-path "$workspace/$manifest" --locked --all-features "$@" \
+              check --config "$workspace/$policy" bans licenses sources; then
+              failed=1
+            fi
+          }
+          check_policy Cargo.toml deny.toml
+          check_policy desktop/Cargo.toml desktop/deny.toml --target x86_64-pc-windows-msvc
+          check_policy desktop/Cargo.toml desktop/deny.toml --target aarch64-pc-windows-msvc
+          check_policy desktop/Cargo.toml desktop/deny.toml --target x86_64-apple-darwin
+          check_policy desktop/Cargo.toml desktop/deny.toml --target aarch64-apple-darwin
+          check_policy android/Cargo.toml android/deny.toml --target aarch64-linux-android
+          check_policy android/Cargo.toml android/deny.toml --target armv7-linux-androideabi
+          check_policy android/Cargo.toml android/deny.toml --target i686-linux-android
+          check_policy android/Cargo.toml android/deny.toml --target x86_64-linux-android
+          check_policy ios/Cargo.toml ios/deny.toml --target aarch64-apple-ios
+          check_policy ios/Cargo.toml ios/deny.toml --target aarch64-apple-ios-sim
+          check_policy ios/Cargo.toml ios/deny.toml --target x86_64-apple-ios
+          exit "$failed"
+
+  npm-advisories:
+    name: Legacy npm dependency vulnerabilities
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up audit runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "26"
+      - name: Audit lockfile without installing packages or executing scripts
+        run: npm audit --package-lock-only --ignore-scripts --audit-level=low
