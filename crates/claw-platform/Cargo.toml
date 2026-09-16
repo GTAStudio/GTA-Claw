@@ -9,10 +9,13 @@ repository.workspace = true
 
 [features]
 native-identity = ["dep:claw-provider-sdk", "dep:claw-security", "dep:ring", "dep:sha2", "dep:zeroize", "dep:rustix"]
+native-config = ["dep:claw-config", "dep:claw-tools", "dep:ring", "dep:zeroize"]
 
 [dependencies]
 claw-application.workspace = true
 claw-protocol.workspace = true
+claw-config = { workspace = true, optional = true }
+claw-tools = { workspace = true, optional = true }
 claw-provider-sdk = { workspace = true, optional = true }
 claw-security = { workspace = true, optional = true }
 ring = { version = "=0.17.14", optional = true }

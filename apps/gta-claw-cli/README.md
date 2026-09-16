@@ -1,5 +1,219 @@
 # GTA Claw Native CLI
 
+## Provider Configuration
+
+`config provider inspect` reads the saved native configuration only. It reports the source SHA-256
+and bounded provider/model/endpoint/timeout metadata without resolving or printing credential
+references. `selection:null` means the file has no explicit provider selection; the legacy runtime
+or environment selection is not resolved by this command. No environment overrides, daemon calls,
+model discovery or authentication occur.
+
+`config provider prepare` reads one complete strict JSON provider object from stdin and creates a
+new validated configuration file. It requires the source digest from inspect, never edits the
+source, never overwrites an existing destination and does not apply anything to a running daemon.
+
+```powershell
+$inspection = gta-claw-cli config provider inspect --source D:\Configs\claw.json5 --json | ConvertFrom-Json
+@'
+{"kind":"openai","model":"exact-provider-model-id","model_aliases":[{"alias":"work","model":"exact-provider-model-id"}],"api_key":"env:PROVIDER_API_KEY","completion_api":"responses","request_timeout_ms":30000}
+'@ | gta-claw-cli config provider prepare --source D:\Configs\claw.json5 --destination D:\Configs\claw.candidate.json5 --expected-sha256 $inspection.sourceSha256 --selection-stdin --json
+```
+
+Replace the example model with an exact ID available to your account. These commands do not prove
+that it exists or that the referenced credential is valid. The source must already be a complete
+valid native configuration; this is a provider editor, not first-run setup. Selecting Copilot
+requires suitable `core.auth.github` settings in that source. Input is at most 16 KiB with EOF
+within 30 seconds; source and candidate are at most 4 MiB. Duplicate/unknown fields, literal
+credentials, changed source digests and invalid full configurations are refused before creation.
+
+Optional `model_aliases` contains explicit `{ "alias": "work", "model": "exact-id" }` pairs for
+this provider only. Names are case-sensitive, at most 256 bytes each, with at most 128 pairs and
+4096 total UTF-8 bytes of names and targets. Targets must be exact IDs in the startup catalogue.
+Duplicates, alias chains, collisions with any exact catalogue ID, `openclaw` and the entire
+`openclaw/` namespace are refused. File preparation validates syntax; startup and catalogue refresh
+additionally validate all targets and collisions against the complete directory. A rejected refresh
+preserves the old cache. Alias changes require a separately reviewed restart, not hot reload.
+
+The primary `model` remains an exact ID. A configured alias resolves before capability and fixed-model
+admission, so an alias pointing to another listed model still cannot override the selected model.
+Aliases never switch provider, endpoint or account, initiate discovery or provide fallback. Native
+HTTP generation accepts configured aliases explicitly; the generic HTTP port does not start
+accepting arbitrary model names. Existing `openclaw` selectors retain their prior behavior.
+
+The JSON5 candidate contains references, not resolved secrets, and uses the configuration library's
+deterministic serialization; source comments and layout are not copied. Its receipt includes
+`candidateSha256`, `fileCreated`, `restartRequired:true` and `applied:false`. Parent-directory
+pinning and exclusive create-new prevent overwriting; this is not an atomic rename or directory
+durability guarantee. A local I/O error or interruption can leave a candidate file. Preserve it and
+use a new destination for an explicit subsequent attempt. The stdin limit is not a hard filesystem
+I/O deadline. Windows holds the source exclusively during the operation; on other platforms the
+source SHA identifies the bytes read and does not lock out concurrent external editors.
+
+To change only the precise model ID, replace `--selection-stdin` with `--model <exact-id>`:
+
+```powershell
+gta-claw-cli config provider prepare --source D:\Configs\claw.json5 --destination D:\Configs\claw.model.json5 --expected-sha256 $inspection.sourceSha256 --model exact-provider-model-id --json
+```
+
+This preserves the explicit provider, aliases, credential reference, endpoint, protocol, timeout and
+observed token threshold. It refuses disabled or implicit providers and does not check a live catalogue.
+`modelOnly:true` does not mean that the model exists or is authenticated. Windows inspection and
+preparation hold the source without read/write/delete sharing until the operation ends. New
+candidates are read back before success; source configuration is never modified by `prepare`.
+
+### Offline Application And Recovery
+
+On Windows, `apply` saves a provider-only candidate into the reviewed source during explicitly
+confirmed offline maintenance. Stop all users and editors of that configuration first, review the
+source/candidate hashes and choose a new backup file. The CLI does not stop processes, attest that
+all consumers are stopped, contact a provider or restart the daemon.
+
+```powershell
+gta-claw-cli config provider apply --source D:\Configs\claw.json5 --candidate D:\Configs\claw.model.json5 --backup D:\Configs\claw.before-model.json5 --expected-sha256 $inspection.sourceSha256 --candidate-sha256 $candidateSha256 --confirm-apply --confirm-offline --json
+```
+
+Both digests and confirmations are mandatory. Only the provider domain may change; unrelated
+configuration changes, unchanged selections, invalid inputs, changed hashes, linked files,
+read-only sources, occupied files and existing backup paths are refused. Candidate input may be
+read-only. Input and backup handles exclude competing data access and rename for their lifetime;
+all paths use the existing pinned-directory sandbox. The exact original bytes are written to a
+new backup, synchronized and read back before the first source write. Source bytes are then written,
+length-adjusted, synchronized and read back using the original held file handle. File identity and
+access permissions are retained, but this is **not an atomic replacement** or a power-loss guarantee.
+An interruption or I/O failure can leave an incomplete source; the verified backup is not deleted.
+
+Success means `configurationSaved:true`, not live application: `applied:false`,
+`restartRequired:true`, `restartPerformed:false` and `liveReadinessVerified:false` remain explicit.
+After a source-write failure, `sourceModified:null` and `sourceMayHaveChanged:true` prevent a false
+claim that the source was untouched. Preserve source, candidate and backup; there is no automatic
+rollback or retry. A lost receipt does not permit blindly repeating the original command.
+
+For recovery, `restore` accepts a fully valid reviewed snapshot even if the current source is no
+longer valid JSON5. It first preserves the exact current residual bytes in another **new** backup.
+Use the current residual SHA-256, not the pre-application source hash:
+
+```powershell
+$residualSha256 = (Get-FileHash D:\Configs\claw.json5 -Algorithm SHA256).Hash.ToLowerInvariant()
+gta-claw-cli config provider restore --source D:\Configs\claw.json5 --candidate D:\Configs\claw.before-model.json5 --backup D:\Configs\claw.interrupted.json5 --expected-sha256 $residualSha256 --candidate-sha256 $inspection.sourceSha256 --confirm-restore --confirm-offline --json
+```
+
+Restoration is an explicit **full configuration** restore, not a provider-only merge. It preserves
+both the input backup and the interrupted bytes, performs no environment/credential/network work,
+and requires subsequent static validation and a separately controlled restart. Local source and
+candidate limits remain 4 MiB. `apply` and `restore` fail before mutation on other platforms until
+their equivalent exclusive-maintenance guarantee is implemented and verified.
+
+Use the daemon's separate `--check-config --config <candidate>` for static composition and secret
+resolution. It does not contact model endpoints or prove readiness. A reviewed restart with that
+candidate is needed to activate a changed provider. Custom credential origins still require the
+independent `GTA_CLAW_PROVIDER_ORIGINS` policy; declaring `credential_origin` in a file does not
+enroll it. A file with `core.provider` cannot be combined with `GTA_CLAW_PROVIDER_POLICY` or smoke.
+See the [provider configuration guide](../../docs/usage-guide-en.md#52-configuration-check) and
+[verification record](../../docs/ledger/native-provider-config-20260916.json).
+
+The TUI and Slint reuse the same local source/candidate service. TUI accepts the structured
+`config-provider` palette command; Slint exposes the local model form under Settings > Models.
+Both require the saved provider/current model to match the observed directory and preserve the
+rest of the configuration. `copilot` maps to the SDK catalogue ID `github-copilot`; neither client
+mistakes that spelling difference for an account change. These are candidate editors, not remote
+configuration management, and application remains the separately confirmed maintenance command.
+
+## Model Catalogue
+
+Generation admission checks the exact selected model in the current cached catalogue before any
+completion, stream or embedding provider call. Provider-level support is mandatory. When a model
+has explicit capability declarations they further restrict completion/streaming, tools, vision,
+JSON mode and embeddings. An empty capability list means the directory did not supply per-model
+information, not an affirmative denial or live support guarantee; existing provider-level checks
+still apply and `liveCapabilitiesVerified` remains false. A missing model is never replaced by a
+fallback. An explicit output cap must be nonzero and cannot exceed a published output/context
+limit; absent limits remain unknown, and no token-accurate input/context budget is inferred.
+
+Tools supplied explicitly by an HTTP client, required tool choices, image input and typed tool or
+image history cannot be silently removed. Requests unsupported by the model are refused before
+provider invocation. Optional runtime/host tool declarations are not offered to a known text-only
+model, so ordinary text conversations can still run; this does not execute the omitted tools or
+convert their history into trusted prose. Invalid requests do not mark a healthy provider down or
+change the selected model. Streaming failures use the existing SSE error contract. See the
+[model admission record](../../docs/ledger/native-model-admission-20260916.json).
+
+`gateway models` reads a native daemon's cached provider model descriptors without discovery,
+credential resolution, generation or selection changes. It requires only `operator.read`:
+
+```powershell
+gta-claw-cli gateway models --endpoint ws://127.0.0.1:18789 --device-profile work
+gta-claw-cli gateway models --offset $nextOffset --sha256 $sha256 --endpoint ws://127.0.0.1:18789 --device-profile work
+gta-claw-cli gateway refresh-models --sha256 $sha256 --endpoint ws://127.0.0.1:18789 --device-profile work --timeout-ms 15000
+```
+
+These are separate operations. `models` returns at most eight of 1024 cached models per page,
+including exact IDs, optional display/context/output metadata and `advertisedCapabilities` from
+the provider SDK. Optional per-model `aliases` are local configuration metadata, not provider or
+live-account claims. They are covered by the catalogue digest, and pages may contain fewer than
+eight entries to stay within the 16 KiB encoded limit. New clients still accept old pages without
+aliases; old strict clients can reject alias-bearing pages and must be upgraded before using them.
+No-alias pages retain their existing representation. TUI and Slint label aliases separately and
+continue to offer exact IDs in configuration candidate editors.
+`source:"provider_sdk_catalogue"` and `liveCapabilitiesVerified:false` are
+intentional: adapters may use provider-level defaults rather than actual per-model capability
+proof. Missing limits remain null; absence from the advertised set is not proof of unsupported
+functionality. An unavailable provider returns `available:false`, not an empty ready catalogue.
+
+Pages pin provider and its instance generation, selected model, pin state, observation timestamp, source and all descriptors
+with the original-order JSON SHA-256. Full single pages independently verify the whole digest;
+continuations only bind it. A changed selection/catalogue requires a fresh first-page read. This
+is a native extension of `models.list`, not a full upstream payload compatibility claim.
+
+`refresh-models` explicitly requests read/write scopes and requires a previously observed snapshot
+SHA. It performs only model listing against the current provider, with one in-flight refresh and
+a ten-second overall wait budget. It never selects a different model or invokes inference. A
+missing current model, duplicate/invalid descriptor, timeout, cancellation, provider switch or
+configuration change rejects publication and preserves the prior cache. The server rechecks the
+actual provider instance and configuration before publishing; no partial catalogue is published.
+The result is a separate refresh receipt bound to `requestedSha256` and `providerGeneration`, so
+read the first page again after success. Generation is process-local; reread after a reconnect,
+not reuse a cursor as a cross-restart identity. No automatic
+refresh, reconnect, retry or credential enrollment is added. See the
+[catalogue record](../../docs/ledger/native-model-catalogue-20260916.json).
+
+### Catalogue Availability
+
+`gateway models --availability` explicitly requests lifecycle details without provider discovery
+or inference. Unavailable replies distinguish `disabled`, `authentication_pending`, `not_initialized`
+and `retired`. These are local lifecycle facts, not live account or model capability checks.
+Ordinary `gateway models` keeps its previous wire format. An older server can reject the explicit
+option; no automatic fallback or refresh occurs. Unknown reasons are rejected rather than displayed
+as remote text. TUI exposes `models-status`; desktop Models has a separate status control, retaining
+the previous valid page on refusal and rejecting responses from old connections. See the
+[status verification record](../../docs/ledger/native-model-status-20260916.json).
+
+### Complete Catalogue Export
+
+```powershell
+gta-claw-cli gateway export-models --destination D:\Exports\models.json --endpoint ws://127.0.0.1:18789 --device-profile work
+```
+
+The destination must be an absolute, new local file in an existing directory. This command uses
+only `operator.read` and always starts with the first cached page; `--offset`, `--sha256`,
+`--overwrite`, wait and idempotency options are refused. It keeps one connection epoch, uses the
+existing `--timeout-ms` overall read budget, and never reconnects, refreshes the provider catalogue,
+generates output, selects a model or acknowledges a result. `networkContacted:false` in the receipt
+means no provider discovery request, not that the Gateway connection was network-free.
+
+Every page must retain the provider, generation, selected model, observation time, total and digest.
+The assembled catalogue is independently checked for exact-ID/alias collisions, complete coverage
+and its original ordered JSON SHA-256. Limits are 1024 models, 1024 nonempty pages, 16 KiB per page
+and 2 MiB for the complete snapshot. A missing catalogue, changed page, disconnect, timeout or invalid
+full digest produces no file. Known metadata is preserved and missing capabilities remain unknown.
+
+The `gta-claw.provider-model-catalogue` archive is **plaintext, untrusted metadata**, not a credential
+backup, authenticated account proof or an importable configuration. Its receipt includes the
+catalogue digest, `fileSha256`, byte/page counts and `snapshotVerified:true`. The existing local
+writer creates without overwrite and synchronizes the file, but directory crash durability remains
+unverified. Once writing starts, an I/O failure or lost receipt can leave a file: preserve and inspect
+it instead of overwriting or assuming the operation did not happen. No running configuration changes.
+See the [complete export record](../../docs/ledger/native-model-export-20260916.json).
+
 ## Local MCP Credentials
 
 `mcp credential reference|status|set|delete` manages only the dedicated native credential for an
@@ -366,9 +580,32 @@ Each invocation requests only `operator.read` and returns at most 16 of the reta
 The offset is a round index, not a byte offset. Use the returned `accounting.nextOffset` and
 `accounting.sha256` for the next explicit read. A changed run revision, source, journal revision,
 closure state or recorded response refuses continuation. The SHA-256 covers the UTF-8 JSON of
-`{"summary":<summary>,"rounds":<all rounds>}` with the server's original field order. A complete
+`{"summary":<summary>,"rounds":<all rounds>}` with the server's original field order. The shared
+validator retains the workspace's existing preserve-order JSON contract. A complete
 single page verifies this entire digest locally; an individual continuation only binds that digest
-and cannot independently prove the entire snapshot. There is no automatic multi-page export yet.
+and cannot independently prove the entire snapshot.
+
+To collect and independently verify every retained round, export to a new local file:
+
+```powershell
+gta-claw-cli gateway export-accounting $runId $revision --destination D:\Exports\run.accounting.json --endpoint ws://127.0.0.1:18789 --device-profile work
+```
+
+The command uses one device connection and terminal revision, pins the session/turn/status,
+summary/provenance, count and digest across every page, then verifies all aggregate counts and
+the whole snapshot SHA-256 before creating any file. It refuses an existing target, missing
+record, changed snapshot, interrupted connection or incomplete export. An available empty record
+can be exported; an unavailable record cannot. There is no reconnect or automatic retry.
+
+The UTF-8 JSON file has `schemaVersion:1`, `kind:"gta-claw.provider-accounting"` and the validated
+complete `snapshot`. It is plaintext untrusted metadata, not a state backup or import format.
+Only a bounded receipt is printed, including `sha256` for the snapshot and `fileSha256` for the
+actual file bytes; provider/model/response identifiers remain in the file. Collection is bounded
+by 1024 rounds/pages, a 4 MiB output limit and the normal CLI timeout. Creation pins the parent
+directory and uses create-new plus file synchronization, not an atomic rename. A local I/O
+failure can leave a file and directory durability is not certified; preserve and inspect it
+before a new explicit export. No ACK, provider invocation or billing settlement is performed.
+See the [complete workflow record](../../docs/ledger/native-accounting-workflow-20260915.json).
 
 Each reported response includes its actual provider/model/response identity, reporting coverage,
 observed token counters and finish reason. `response:null` is an unconfirmed attempt, not a zero-cost

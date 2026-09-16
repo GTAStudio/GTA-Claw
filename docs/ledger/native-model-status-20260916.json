@@ -1,0 +1,95 @@
+{
+  "schemaVersion": 1,
+  "stage": "opt-in-native-model-catalogue-lifecycle-status",
+  "capturedOn": "2026-09-16",
+  "baseCommit": "8c3abffc3299db1fa5add5c7d705fe39b1236a6d",
+  "taskIds": ["M3-07.02", "M3-07.04", "M5-01", "M5-02.02"],
+  "platform": "windows-x86_64",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "cargoLockSha256": "03ae0a54ee93bb13ccaf84f53747742ef5fd48103ef6032b07e4793baeae7834",
+  "desktopCargoLockSha256": "b675cb2b8305584f95bf1d60dcce178e4f3cb93921722e30ca6a3ba3487d5c63",
+  "sourceFiles": [
+    { "path": "crates/claw-protocol/src/native_models.rs", "sha256": "d51dfbc8b6f8688ec0b7017decc299e7dfa1a844d79676df3327a59992395ade" },
+    { "path": "apps/gta-claw-daemon/src/adapters/http_api.rs", "sha256": "cb3d4ecfd6cb527e54db3a8afcc677c2ffed95c90d84f7bd010d19f6faedb14d" },
+    { "path": "apps/gta-claw-daemon/src/production.rs", "sha256": "6e87af70774277e5d36be3521e0b7ddfbd2ab9cc2d1791635a21cd260c4a5d28" },
+    { "path": "apps/gta-claw-daemon/tests/production_composition.rs", "sha256": "a5e9beb51cba244bf5b1c7471f6ee653054b06462311f4ec2419f344679853fb" },
+    { "path": "apps/gta-claw-cli/src/native_gateway.rs", "sha256": "ec2db045116ebadcc6a4a4e6e92769c9507abe223f11a12f2189e41735cd6138" },
+    { "path": "apps/gta-claw-cli/src/lib.rs", "sha256": "d03e0762b68abc3fa12d6658b734e621d7e3219333a762ef5d5afe1f32ed0566" },
+    { "path": "apps/gta-claw-cli/tests/gateway_health.rs", "sha256": "9142d47284d1d919c02ded568935ec90a19750aebcc1fe10afff85d25d3be501" },
+    { "path": "apps/gta-claw-tui/src/gateway.rs", "sha256": "aece06c229cc75f7be0bad4cb1be9545f59c0b57684e550755755295ec9e4939" },
+    { "path": "apps/gta-claw-tui/src/lib.rs", "sha256": "7faf3bcb8b62539d2b5e66a4679e3bc78fdfaa9b8a703e8bc7270a691c1c5193" },
+    { "path": "apps/gta-claw-tui/src/render.rs", "sha256": "1e08f9a12c389b2f7f48a96569748b019dfc51f54802551869609d4832fd39f4" },
+    { "path": "apps/gta-claw-tui/tests/gateway_double.rs", "sha256": "475c262b394c1c8eeee308ec3ccef7f27fc9c13f4c010c1d5f3fdfb18555a556" },
+    { "path": "apps/gta-claw-tui/tests/rendering.rs", "sha256": "7c585ffd3635d453e632d8455ffc25bb1c2b12fa3c19bd063153f8fb0338d304" },
+    { "path": "desktop/apps/gta-claw-desktop/src/product_state.rs", "sha256": "355aa469543916357c15ba602fd62760ab57a45ba96efabebeea90c90f8ae23a" },
+    { "path": "desktop/apps/gta-claw-desktop/src/controller.rs", "sha256": "1e02e413fbe2061610e791360ab1fe9f13d1a950b8d2ed4526c0da284a0bb2e6" },
+    { "path": "desktop/apps/gta-claw-desktop/src/software_renderer_smoke.rs", "sha256": "6863a1d288f3cf5db402a0aa039d87c8627370dc5a025fd233faf0d1fffe7c4e" },
+    { "path": "desktop/apps/gta-claw-desktop/ui/modules/product-shell.slint", "sha256": "61b229f45bd1f90ae8d1e3c8289d596b15377b340841f346aebefbaf5cf3c880" }
+  ],
+  "checks": [
+    {
+      "scope": "claw-protocol, gta-claw-cli, gta-claw-daemon and gta-claw-tui all-target regression",
+      "result": "passed", "passed": 525, "failed": 0, "ignored": 7, "testBinaries": 27,
+      "log": "target/native-model-status-final-tests-20260916.log",
+      "sha256": "f60216e269cbfe75b1240711ef96549a7d872dad45f268d6fb294eb9f82316cd"
+    },
+    {
+      "scope": "Same four native packages, strict Clippy with warnings denied",
+      "result": "passed",
+      "log": "target/native-model-status-verified-clippy-20260916.log",
+      "sha256": "a1004558ab85a0b7a7875d13dabb3c649ae44112d38c1f1f1da3f5d30b9d435f"
+    },
+    {
+      "scope": "Root workspace all-target check",
+      "result": "passed",
+      "log": "target/native-model-status-final-check-20260916.log",
+      "sha256": "1d614f8773a847df7c431756cfd90312042791641b2af3ddbedf7387dfc29b13"
+    },
+    {
+      "scope": "Post-lint provider catalogue lifecycle regression",
+      "result": "passed", "passed": 1, "failed": 0, "ignored": 0, "testBinaries": 1,
+      "log": "target/native-model-status-post-lint-test-20260916.log",
+      "sha256": "3a68f5eca8f6eeb00d3127a6aa84dd20092ca14908a173518dc27e56e7750cc1"
+    },
+    {
+      "scope": "Desktop workspace all-target tests, including software rendering at 1080x720 and 720x520",
+      "result": "passed", "passed": 98, "failed": 0, "ignored": 0, "testBinaries": 1,
+      "log": "target/native-model-status-desktop-final-tests-20260916.log",
+      "sha256": "083f1ce649369ec9e51433d8141cb010888ac0ef836126962d1141be1388dfb8"
+    },
+    {
+      "scope": "Desktop workspace strict Clippy with warnings denied",
+      "result": "passed",
+      "log": "target/native-model-status-desktop-completed-clippy-20260916.log",
+      "sha256": "50201a45f0f6eac98482332af8f84806072bc69d21940757454cd2dccebc669c"
+    }
+  ],
+  "behaviorEvidence": [
+    "native_model_catalogue_unavailability_is_opt_in_and_tracks_actual_lifecycle",
+    "model_catalogue_commands_separate_read_and_explicit_snapshot_refresh",
+    "model_catalogue_cli_validates_metadata_without_selection_refresh_or_replay",
+    "model_catalogue_requests_keep_read_refresh_and_unavailable_responses_separate",
+    "native_tui_model_catalogue_reads_and_refreshes_without_chat_ack_or_selection",
+    "native_model_catalogue_availability_is_explicit_typed_and_connection_bound",
+    "product_model_catalogue_uses_real_transport_and_preserves_read_refresh_boundaries",
+    "native_model_catalogue_renders_cached_metadata_and_control_states_at_two_sizes"
+  ],
+  "notes": [
+    "Explicit nativeCatalogPage.includeAvailability:true requests one bounded lifecycle reason: disabled, authentication_pending, not_initialized or retired. Ordinary queries retain their previous payload. Available cache pages do not gain a readiness claim",
+    "Trusted startup records disabled or pending-authentication state before activation. Disabled and retired slots reject activation before provider startup/ping; counted lifecycle tests establish zero provider operations on these refusals",
+    "CLI gateway models --availability, TUI models-status and the desktop Models status control remain read-only. Unknown reasons are rejected and never rendered as arbitrary remote text. Existing epoch/request binding, single in-flight work and previous-page preservation remain intact",
+    "An old server can reject the explicit request field. Clients retain the previous valid page; no silent fallback, provider refresh, model switch, inference or result ACK is added. A new client still accepts the old generic unavailable reply",
+    "Isolated actual daemon tests check authenticated disabled and pending-authentication responses while unauthenticated requests remain refused. TUI transport/eight-size rendering and desktop real-controller/two-size software rendering cover the status path",
+    "The complete regressions preceded final local lint-only edits. The six logs separately record strict native/desktop lint, a post-edit lifecycle test and root check. This is not a claim that every full test suite ran after every formatting edit",
+    "Earlier model configuration, accounting, alias and export ledgers remain historical snapshots. This record owns only the newly extended status slice and does not rewrite old source hashes or claim prior whole-workspace credential failures were repaired",
+    "No real cloud account, paid model, deployment, production proxy change or external user configuration migration was involved. Product source is being published at the user's explicit request, not declared release-ready"
+  ],
+  "unverified": [
+    "Cached catalogue age/deprecation and real per-account inference readiness",
+    "Complete online provider switching and retirement",
+    "Original OAuth/MCP native-credential intermittency",
+    "Cross-platform product qualification, dependency-policy debt and whole-project acceptance"
+  ]
+}

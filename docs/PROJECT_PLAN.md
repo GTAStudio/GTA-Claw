@@ -71,7 +71,81 @@ GitHub 官方 release API 经本轮独立查询返回该版本，发布时间为
 [legacy-node-port-obligations.md](legacy-node-port-obligations.md) 管理。本方案替换旧开发
 路线；实际实现状态随证据更新，但不改变封存合同或仓库政策。
 
+2026-09-15 用量工作流增量：M3-05/M3-08/M5-01/M5-02 已增加完整 CLI 用量快照导出、
+TUI/Slint 逐轮查看及共享严格协议校验，保留既有服务端 v1 字段顺序与结果 ACK 语义。
+本地四包 486 项通过/5 项既有忽略，桌面 88 项通过、严格 lint 和根全目标 check 通过，
+见[用量工作流记录](ledger/native-accounting-workflow-20260915.json)。这不是货币预算、
+定价或发票核销，也不关闭统一模型配置、真实账号、迁移、移动产品及发布门槛。
+联合测试中原生凭据写后跨进程 status 曾返回缺失；仅增加脱敏诊断，复验通过不算根因修复。
+
 ## 1. 产品目标与兼容范围
+
+2026-09-16 配置增量：M3-06.01 已完成原生主配置 provider/model/SecretRef/base URL/origin/
+timeout 及来源诊断，保留旧显式环境策略且拒绝混用；CLI 可按源 SHA 查看并生成新候选，
+不会覆盖或热应用。新增配置分层重复字段拒绝、跨 provider 凭据不继承及显式 disabled，
+六种真实进程来源/方言、十种静态检查和实际 reload 代次保护通过；三包 457 项通过/5 项
+既有忽略、严格 lint 和根全目标 check 通过，见[统一配置记录](ledger/native-provider-config-20260916.json)。
+完整在线切换/退役、真实账号及图形配置编辑仍未关闭，旧凭据异常无根因修复声明。
+
+同日模型目录增量：新增有界缓存详情页和显式刷新，保留 SDK 声明能力、来源/观察时间及
+默认选择；目录唯一性/上限/描述校验在发布前执行，失败刷新和并发切换不覆盖旧目录。
+Gateway/CLI 读取与刷新权限分开，后者只重新列模型、不推理或切换。四包最终 533 项通过/
+5 项既有忽略、严格 lint/根 check 通过，见[目录记录](ledger/native-model-catalogue-20260916.json)。
+初轮 OAuth 独立原生状态查询失败仍保持未定位，不能以目录工作完成关闭凭据可靠性问题。
+后续同毫秒/同目录实例替换回归又证明摘要须绑定 provider 代次；已加入代次、同锁核验/捕获
+和刷新回执原SHA验证，最终四包534项通过/5项既有忽略、严格lint/根check通过，追加证据
+仍在同一目录记录内。代次非跨进程持久身份，不扩大真实账号或完整M3-07完成声明。
+
+随后完成 TUI 独立 Models 视图与 Slint Models 设置页的缓存展示/续页/显式刷新，连接和
+请求归属、失败保留、刷新后失效、无聊天 ACK 均有真实 WS 和多尺寸渲染回归。最终原生
+六包869项通过/7项忽略，桌面91项通过，严格lint与根编译通过；新增测试专用原生凭据
+父子进程探针五阶段通过，但并未复现/修复旧 OAuth 间歇失败。模型选择、配置应用及真实
+账号/平台验收仍开放，所有追加证据归同一[目录记录](ledger/native-model-catalogue-20260916.json)。
+
+本次继续补齐精确模型候选、Windows 显式离线配置应用及损坏源恢复，复用共用平台文件服务。
+Slint 可按已检查本地源和当前目录页选择精确模型生成新候选；保存/应用/重启明确分开，
+图形候选不证明本地文件属于远端 Gateway。应用先同步并验读备份，再在独占句柄写源，
+是非原子维护流程而非热切换；3 个真实进程退出点及保留残留的恢复、20 种文件场景验证通过。
+九种 daemon 来源/方言和三种 CLI 到 daemon 新进程启动链路通过；最终原生八包1087项通过/
+11项忽略、桌面96项通过、双workspace严格lint及根编译通过，见[配置应用记录](ledger/native-provider-application-20260916.json)。
+原 OAuth 损坏记录状态测试在初轮再次异常，最终通过不算根因修复；全部实号、完整在线退役、
+其他平台维护与项目级交付门槛仍开放，不新增主项完成声明。
+
+随后在真实 provider 调用前增加模型级能力准入：已声明能力与提供方能力共同限制完成、
+流式、工具、图像、JSON 和嵌入请求，精确模型不存在或显式输出上限越界时拒绝，不自动
+回落。空逐模型声明保持未知；文本模型不接收可选宿主工具，但明确客户端工具和已有类型化
+历史不能丢弃。计数型零调用/零事件、真实 HTTP/SSE 拒绝及九种方言/来源回归通过；
+三包617项通过/5项忽略、严格lint/根check通过，见[能力准入记录](ledger/native-model-admission-20260916.json)。
+这不是实时每账号能力探测或完整token上下文计费，也不关闭M3-07整体或旧凭据异常。
+
+本地模型客户端后续：TUI新增封闭JSON的 `config-provider` 检查/候选命令，固定已检查源SHA、
+当前目录provider/model与精确目标ID；路径不发给Gateway，单个本地任务跨断线保留，取消等待
+不丢句柄，正常退出等任务结束。共用映射修正配置 `copilot` 与SDK `github-copilot` 的区别。
+TUI/配置库192项、桌面97项通过，双workspace严格lint和根编译通过；十包联合1460项通过、
+1项原有MCP凭据撤销测试失败、11项忽略。单项复验通过不是根因修复或联合全绿，失败日志保留。
+证据追加到[配置应用记录](ledger/native-provider-application-20260916.json)，此前TUI候选缺口已覆盖；
+图形直接应用、在线退役、真实账号/平台和项目交付仍开放。
+
+显式模型别名后续：增加同provider的大小写敏感、单跳精确ID表，拒绝碰撞、链式、保留命名空间
+和缺失目标；启动/刷新发布前校验，HTTP按显式别名解析后仍执行固定模型及能力准入。目录摘要
+覆盖配置别名，编码页限16KiB，TUI/Slint分开展示而候选仍保存精确ID。十二种来源/方言、
+十三种CLI页场景及刷新冲突通过；原生七包1015项通过/9项既有忽略、桌面97项通过，双workspace
+严格lint和根check通过，见[别名记录](ledger/native-model-aliases-20260916.json)。旧严格客户端
+不保证接受别名页；真实账号、完整在线退役及原凭据异常仍开放，不新增任务完成声明。
+
+完整目录导出后续：CLI新增 `gateway export-models`，单连接只读收齐固定目录摘要、provider
+代次及选择，完整校验跨页ID/别名、总量和原有顺序摘要后才独占新建明文快照；无刷新/推理/ACK。
+十三种真实CLI/WebSocket场景及三种真实daemon方言通过；相关三包441项通过/7项既有忽略，
+另行执行一项三方言生产链路通过，严格lint和根check通过，见
+[目录导出记录](ledger/native-model-export-20260916.json)。写入未知需保留输出，目录断电耐久、
+GUI导出、实号和完整M3/M5仍开放；既有别名记录作为历史快照保留。
+
+模型生命周期状态后续：显式目录状态区分禁用、等待认证、未初始化及已关闭；普通目录报文
+不变，CLI `models --availability`、TUI `models-status` 与桌面独立按钮只读查询。禁用/关闭
+在启动提供方前拒绝，计数测试确认零调用；未知原因/旧服务器拒绝不伪造状态。原生四包525项
+通过/7项既有忽略、桌面98项通过，双workspace严格lint、后续生命周期测试和根check通过，见
+[状态记录](ledger/native-model-status-20260916.json)。缓存过期、真实账号、完整在线退役及原凭据
+异常仍开放，不新增任务完成声明。
 
 **推荐方向: 保留 Rust 核心和原生客户端，按可运行的用户工作流重组开发顺序。**
 不是重新抄一遍 OpenClaw，也不是给旧 Node 服务换名字。兼容的是可观察行为、协议与
@@ -370,7 +444,7 @@ Cron、heartbeat 与可恢复任务使用成熟调度库，不自写 cron 解析
 | Windows/macOS | 独立 Slint 已接聊天/历史/审批与 OS profile | 完整设置/工作区信任、身份/结果恢复、签名安装及真实平台工作流 |
 | Android | 独立 NativeActivity Slint 壳 | Keystore、网络回调、配对、聊天/附件/审批、生命周期及进程死亡恢复；当前主要目标 arm64 |
 | iOS/iPadOS | 独立 Slint 壳、进程内凭据 | Keychain、UIKit/NWPathMonitor 桥接、配对、聊天/审批、回前台恢复与签名分发 |
-| Linux | server/CLI/TUI；desktop 被现有 CI 明确拒绝 | 先验证原生服务和软件包；新增 Linux GUI 需 D05 决策，不默默取消现有门槛 |
+| Linux | server/CLI/TUI；desktop 仍由平台代码明确拒绝 | 先验证原生服务和软件包；新增 Linux GUI 需 D05 决策，清理 CI 不改变支持范围 |
 | Web/浏览器扩展 | API/协议及 relay 基础，不是已交付 UI | 作为明确差异/扩展项；不在本轮擅自增加 Node 前端或 JS 例外 |
 
 首屏进入可用工作流；状态必须区分 Gateway connected、provider authenticated、chat ready、
@@ -468,8 +542,15 @@ detect -> preview -> consistent-backup -> stage -> validate
 
 ### 8.1 复用现有验证入口
 
-现有 CI 在 [.github/workflows/rust.yml](../.github/workflows/rust.yml)，参考网关流程在
-[.github/workflows/upstream-gateway-reference.yml](../.github/workflows/upstream-gateway-reference.yml)。
+2026-09-16 按用户明确要求，GitHub 仅保留
+[依赖检查](../.github/workflows/dependencies.yml)与自动 Dependency Graph/Dependabot 告警。
+构建、普通测试、打包、发布、参考网关及政策自测工作流已移除；CodeQL 默认扫描已关闭，
+单独的旧必需桌面工作流规则已解除，禁止删分支和强推的保护不变。仅 CI 清理提交
+`30f97d0` 已发布，不包含进行中的应用开发。四个 Rust workspace 的漏洞、许可证/依赖策略
+和历史 npm 锁审计仍执行，失败不降级为成功。源码测试、手动脚本、封存政策和历史证据保留。
+首轮实际发现三个客户端锁中的 `webbrowser 1.2.1` 参数注入漏洞；安全补丁提交 `8c3abff`
+只发布三处 `1.2.2` 锁条目，原生应用开发未夹带。修复后GitHub四个Rust锁及npm漏洞审计均通过，
+许可证/重复版本/通配依赖政策债务仍失败，未加豁免，见[依赖CI记录](ledger/dependency-only-ci-20260916.json)。
 以下是未来代码变更的验证入口，不表示本轮已执行这些构建或测试:
 
 ```powershell
@@ -489,7 +570,7 @@ cargo test -p gta-claw-daemon --test production_composition --locked
 helpers；新 crate/新职责确有需要才加测试目录。拒绝借文档检查通过宣称 Rust 编译成功。
 
 desktop 命令必须带 `--manifest-path desktop/Cargo.toml`，在 Windows/macOS 验证；保留
-Linux 明确拒绝测试。移动端分别运行现有 android/ios scripts 与工作流；iOS 构建/分发
+Linux 明确拒绝测试。移动端分别运行现有 android/ios scripts；iOS 构建/分发
 需要 macOS、完整 Xcode 和适当签名身份，Windows 本机检查不能替代。
 
 保留根图无 Slint、受保护 base SHA 的供给链验证、各 workspace lock/deny/audit、SBOM、
@@ -508,8 +589,9 @@ provenance 和精确依赖校验；不要在规划变更中顺便升级依赖或
 | 生命周期 | 资源撤权和清理分开验证，迟到回调不复活；shutdown 有未结算任务时不能报 clean |
 | 打包 | 安装后的真实二进制验收，不只测源码；签名/篡改拒绝、升级中断、配置保留和卸载不删用户数据 |
 
-参考上游测试若需要 Node，只能使用经批准的隔离参考环境；不能在本仓库添加 Node CI、
-打包其运行时或把外部测试用工具混入 Rust 产品。真实账号、付费模型、推送和设备测试
+参考上游测试若需要 Node，只能使用经批准的隔离参考环境；依赖 CI 中的历史 npm 锁审计
+不安装包或执行安装脚本，不构建 Node 产品。不得打包 Node 运行时或把外部测试工具混入 Rust 产品。
+真实账号、付费模型、推送和设备测试
 要单独明确授权、预算和数据范围；本轮没有进行这些操作。
 
 ### 8.3 建议的首轮发布门槛

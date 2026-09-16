@@ -25,7 +25,12 @@ Four Cargo workspaces and one legacy service that is being retired:
 | `src/`, `Dockerfile`, `package.json`, `tsconfig.json` | The legacy Node/TypeScript service. It remains during migration while the Rust daemon's named gaps and compatibility-evidence obligations are closed. |
 
 The root workspace excludes all three UI workspaces (`exclude = ["android", "desktop", "ios"]`),
-so a root `cargo build` never resolves Slint. CI asserts this with `cargo metadata`.
+so a root `cargo build` never resolves Slint. Metadata isolation remains a local validation requirement.
+GitHub Actions intentionally keeps only [dependency checks](.github/workflows/dependencies.yml):
+Rust/npm vulnerability audits and Rust dependency license, version and source policy. Dependency
+Graph and Dependabot alerts remain enabled; build, product-test, packaging and publishing workflows
+were removed on 2026-09-16. Removing those workflows does not replace local product verification or
+change supported platforms.
 
 **Status caveat, stated up front:** `gta-claw-daemon` is a real but partial production composition.
 Its `main` path binds the 17-route main HTTP API, legacy HTTP facade, Gateway and a separate loopback

@@ -955,6 +955,620 @@ async fn partial_export_cli_collects_verified_pages_without_ack_or_overwriting_f
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_catalogue_refresh_cli_requests_write_scope_and_validates_only_a_refresh_receipt() {
+    for scenario in [
+        "valid",
+        "refused",
+        "inference",
+        "selection",
+        "extra",
+        "wrong-request",
+        "zero-generation",
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&calls);
+        let gateway=TestGateway::spawn(handler(move |mut socket,_| {
+            let calls=Arc::clone(&captured);
+            async move {
+                send_challenge(&mut socket).await;
+                let (connect,params)=receive_connect(&mut socket).await;
+                support::verify_connect_proof(&params);
+                let scopes=params.scopes.as_ref().expect("scopes").iter().map(claw_protocol::gateway::Name::as_str).collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(scopes,std::collections::BTreeSet::from(["operator.read","operator.write"]));
+                send_hello(&mut socket,connect.id(),"model-refresh-fixture",4,AUTHENTICATED_MAX_FRAME_BYTES,"operator",&["operator.read","operator.write"]).await;
+                let request=receive_request(&mut socket).await;
+                calls.fetch_add(1,Ordering::SeqCst);
+                assert_eq!(request.method().as_str(),"models.list");
+                let actual:Value=serde_json::from_str(request.params().value().expect("params").as_json()).expect("JSON");
+                assert_eq!(actual,json!({"nativeCatalogRefresh":{"sha256":"a".repeat(64)}}));
+                let mut receipt=json!({"schemaVersion":1,"refreshed":true,"provider":"fixture","selectedModel":"private-model","totalModels":2,
+                    "providerGeneration":1,"requestedSha256":"a".repeat(64),
+                    "selectionChanged":false,"networkContacted":true,"inferenceInvoked":false});
+                if scenario=="inference" {receipt["inferenceInvoked"]=json!(true);}
+                if scenario=="selection" {receipt["selectionChanged"]=json!(true);}
+                if scenario=="extra" {receipt["token"]=json!("private-secret");}
+                if scenario=="wrong-request" {receipt["requestedSha256"]=json!("b".repeat(64));}
+                if scenario=="zero-generation" {receipt["providerGeneration"]=json!(0);}
+                if scenario=="refused" {
+                    send_json(&mut socket,json!({"type":"res","id":request.id().as_str(),"ok":false,"error":{"code":"INVALID_REQUEST","message":"private-secret"}})).await;
+                } else {send_json(&mut socket,json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":receipt})).await;}
+                loop {match socket.read_frame().await {
+                    Ok(frame) if frame.opcode==fastwebsockets::OpCode::Text => {calls.fetch_add(1,Ordering::SeqCst);}
+                    Ok(frame) if frame.opcode==fastwebsockets::OpCode::Close => break,
+                    Ok(_)=>{},Err(_)=>break,
+                }}
+            }
+        })).await;
+        let mut arguments: Vec<OsString> =
+            ["gateway", "refresh-models", "--sha256", &"a".repeat(64)]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+        arguments.extend(gateway_arguments(gateway.url.as_str()).into_iter().skip(2));
+        let output = run_cli(arguments, Some(TOKEN)).await;
+        let stdout = String::from_utf8(output.stdout).expect("receipt");
+        assert_eq!(
+            output.status.success(),
+            scenario == "valid",
+            "{scenario}: {stdout}"
+        );
+        if scenario != "valid" {
+            assert!(!stdout.contains("private-model"));
+        }
+        assert!(!stdout.contains("private-secret") && !stdout.contains(TOKEN));
+        assert!(output.stderr.is_empty());
+        gateway.shutdown().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry or inference");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_catalogue_cli_validates_metadata_without_selection_refresh_or_replay() {
+    use std::fmt::Write as _;
+    for scenario in [
+        "valid",
+        "continuation",
+        "unavailable",
+        "bad-digest",
+        "duplicate",
+        "capability",
+        "bad-limit",
+        "extra",
+        "selected",
+        "generation",
+        "aliases",
+        "alias-collision",
+        "alias-tampered",
+        "availability-disabled",
+        "availability-authentication_pending",
+        "availability-not_initialized",
+        "availability-retired",
+        "availability-private-secret",
+    ] {
+        let availability_reason = scenario.strip_prefix("availability-");
+        let count = if scenario == "continuation" { 9 } else { 1 };
+        let mut snapshot = json!({"provider":"fixture","providerGeneration":1,"selectedModel":"private-model-0","selectionPinned":true,"observedAtMs":12345,
+            "source":"provider_sdk_catalogue","liveCapabilitiesVerified":false,
+            "models":(0..count).map(|ordinal|json!({"id":format!("private-model-{ordinal}"),"displayName":format!("Model {ordinal}"),
+                "contextWindow":null,"maxOutputTokens":null,"advertisedCapabilities":["completion","streaming"]})).collect::<Vec<_>>()});
+        if matches!(scenario, "aliases" | "alias-tampered") {
+            snapshot["models"][0]["aliases"] = json!(["work", "Work"]);
+        }
+        let mut digest = String::with_capacity(64);
+        for byte in ring::digest::digest(
+            &ring::digest::SHA256,
+            &serde_json::to_vec(&snapshot).expect("snapshot"),
+        )
+        .as_ref()
+        {
+            write!(digest, "{byte:02x}").expect("digest");
+        }
+        let offset = if scenario == "continuation" { 8 } else { 0 };
+        let mut page = json!({"schemaVersion":1,"available":true,"offset":offset,"endOffset":count,"nextOffset":null,"totalModels":count,"sha256":digest,
+            "provider":snapshot["provider"],"providerGeneration":1,"selectedModel":snapshot["selectedModel"],"selectionPinned":true,"observedAtMs":12345,
+            "source":"provider_sdk_catalogue","liveCapabilitiesVerified":false,"selectionChanged":false,"networkContacted":false,
+            "models":if offset == 0 {snapshot["models"].clone()} else {json!([snapshot["models"][8]])}});
+        match scenario {
+            "unavailable" => {
+                page = json!({"schemaVersion":1,"available":false,"selectionChanged":false,"networkContacted":false});
+            }
+            "bad-digest" => page["sha256"] = json!("0".repeat(64)),
+            "duplicate" => {
+                page["models"] = json!([page["models"][0], page["models"][0]]);
+                page["endOffset"] = json!(2);
+                page["totalModels"] = json!(2);
+            }
+            "capability" => {
+                page["models"][0]["advertisedCapabilities"] = json!(["unknown-capability"]);
+            }
+            "bad-limit" => page["models"][0]["contextWindow"] = json!(0),
+            "extra" => page["models"][0]["apiKey"] = json!("private-secret-must-not-render"),
+            "selected" => page["selectedModel"] = json!("missing-model"),
+            "generation" => page["providerGeneration"] = json!(0),
+            "alias-collision" => page["models"][0]["aliases"] = json!(["private-model-0"]),
+            "alias-tampered" => page["models"][0]["aliases"] = json!(["changed"]),
+            _ => {}
+        }
+        if let Some(reason) = availability_reason {
+            page = json!({"schemaVersion":1,"available":false,"unavailableReason":reason,"selectionChanged":false,"networkContacted":false});
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&calls);
+        let expected_digest = digest.clone();
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let page = page.clone();
+            let calls = Arc::clone(&captured);
+            let digest = expected_digest.clone();
+            async move {
+                send_challenge(&mut socket).await;
+                let (connect, params) = receive_connect(&mut socket).await;
+                support::verify_connect_proof(&params);
+                assert_eq!(
+                    params
+                        .scopes
+                        .as_ref()
+                        .expect("scopes")
+                        .iter()
+                        .map(claw_protocol::gateway::Name::as_str)
+                        .collect::<Vec<_>>(),
+                    ["operator.read"]
+                );
+                send_hello(
+                    &mut socket,
+                    connect.id(),
+                    "model-catalogue-fixture",
+                    4,
+                    AUTHENTICATED_MAX_FRAME_BYTES,
+                    "operator",
+                    &["operator.read"],
+                )
+                .await;
+                let request = receive_request(&mut socket).await;
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(request.method().as_str(), "models.list");
+                let actual: Value =
+                    serde_json::from_str(request.params().value().expect("params").as_json())
+                        .expect("JSON");
+                let mut expected = json!({"nativeCatalogPage":{"offset":offset}});
+                if availability_reason.is_some() {
+                    expected["nativeCatalogPage"]["includeAvailability"] = json!(true);
+                }
+                if offset > 0 {
+                    expected["nativeCatalogPage"]["sha256"] = json!(digest);
+                }
+                assert_eq!(actual, expected);
+                send_json(
+                    &mut socket,
+                    json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":page}),
+                )
+                .await;
+                loop {
+                    match socket.read_frame().await {
+                        Ok(frame) if frame.opcode == fastwebsockets::OpCode::Text => {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(frame) if frame.opcode == fastwebsockets::OpCode::Close => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        }))
+        .await;
+        let mut arguments: Vec<OsString> = vec!["gateway".into(), "models".into()];
+        if availability_reason.is_some() {
+            arguments.push("--availability".into());
+        }
+        if offset > 0 {
+            arguments.extend(
+                ["--offset", "8", "--sha256", &digest]
+                    .into_iter()
+                    .map(OsString::from),
+            );
+        }
+        arguments.extend(gateway_arguments(gateway.url.as_str()).into_iter().skip(2));
+        let output = run_cli(arguments, Some(TOKEN)).await;
+        let success = matches!(
+            scenario,
+            "valid"
+                | "continuation"
+                | "unavailable"
+                | "aliases"
+                | "availability-disabled"
+                | "availability-authentication_pending"
+                | "availability-not_initialized"
+                | "availability-retired"
+        );
+        let stdout = String::from_utf8(output.stdout).expect("JSON output");
+        assert_eq!(output.status.success(), success, "{scenario}: {stdout}");
+        let document: Value = serde_json::from_str(&stdout).expect("receipt");
+        if success {
+            assert_eq!(document["method"], "models.list");
+            assert_eq!(document["result"]["networkContacted"], false);
+            if let Some(reason) = availability_reason {
+                assert_eq!(document["result"]["unavailableReason"], reason);
+                assert_eq!(document["result"]["available"], false);
+            }
+            if scenario == "aliases" {
+                assert_eq!(document["result"]["models"][0]["id"], "private-model-0");
+                assert_eq!(
+                    document["result"]["models"][0]["aliases"],
+                    json!(["work", "Work"])
+                );
+            }
+        } else {
+            assert!(stdout.contains("invalid_model_catalogue"));
+            assert!(!stdout.contains("private-model") && !stdout.contains("private-secret"));
+        }
+        assert!(!stdout.contains(TOKEN));
+        assert!(output.stderr.is_empty());
+        gateway.shutdown().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{scenario}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_catalogue_export_cli_verifies_complete_pages_before_creating_a_file() {
+    use std::fmt::Write as _;
+
+    for scenario in [
+        "valid",
+        "short-pages",
+        "duplicate-id",
+        "duplicate-alias",
+        "tampered",
+        "provider-generation",
+        "selected-model",
+        "observation",
+        "total-changed",
+        "disconnect",
+        "existing-target",
+        "missing",
+        "refused",
+    ] {
+        let mut snapshot = json!({"provider":"fixture","providerGeneration":7,"selectedModel":"exact-model-0","selectionPinned":true,
+            "observedAtMs":123,"source":"provider_sdk_catalogue","liveCapabilitiesVerified":false,
+            "models":(0..17).map(|ordinal|json!({"id":format!("exact-model-{ordinal}"),"displayName":format!("Model {ordinal}"),
+                "contextWindow":null,"maxOutputTokens":null,"advertisedCapabilities":["completion"]})).collect::<Vec<_>>()});
+        snapshot["models"][0]["aliases"] = json!(["work"]);
+        if scenario == "duplicate-id" {
+            snapshot["models"][16]["id"] = json!("exact-model-1");
+        } else if scenario == "duplicate-alias" {
+            snapshot["models"][16]["aliases"] = json!(["work"]);
+        }
+        let mut digest = String::with_capacity(64);
+        for byte in ring::digest::digest(
+            &ring::digest::SHA256,
+            &serde_json::to_vec(&snapshot).expect("snapshot"),
+        )
+        .as_ref()
+        {
+            write!(digest, "{byte:02x}").expect("digest");
+        }
+        let page_size = if scenario == "short-pages" { 5 } else { 8 };
+        let mut pages = Vec::new();
+        for offset in (0..17).step_by(page_size) {
+            let end = (offset + page_size).min(17);
+            let mut page = snapshot.clone();
+            page["schemaVersion"] = json!(1);
+            page["available"] = json!(true);
+            page["selectionChanged"] = json!(false);
+            page["networkContacted"] = json!(false);
+            page["offset"] = json!(offset);
+            page["endOffset"] = json!(end);
+            page["nextOffset"] = json!((end < 17).then_some(end));
+            page["totalModels"] = json!(17);
+            page["sha256"] = json!(digest);
+            page["models"] = json!(&snapshot["models"].as_array().expect("models")[offset..end]);
+            if end == 17 {
+                match scenario {
+                    "tampered" => {
+                        page["models"][0]["displayName"] = json!("private-untrusted-replacement");
+                    }
+                    "provider-generation" => page["providerGeneration"] = json!(8),
+                    "selected-model" => page["selectedModel"] = json!("exact-model-1"),
+                    "observation" => page["observedAtMs"] = json!(124),
+                    "total-changed" => {
+                        page["totalModels"] = json!(18);
+                        page["nextOffset"] = json!(17);
+                    }
+                    _ => {}
+                }
+            }
+            if scenario == "missing" {
+                page = json!({"schemaVersion":1,"available":false,"selectionChanged":false,"networkContacted":false});
+            }
+            pages.push(page);
+            if matches!(scenario, "missing" | "refused") {
+                break;
+            }
+        }
+        let expected_calls = pages.len();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let expected_digest = digest.clone();
+        let gateway = TestGateway::spawn(handler(move |mut socket, connection| {
+            let pages = pages.clone();
+            let calls = Arc::clone(&observed);
+            let digest = expected_digest.clone();
+            async move {
+                assert_eq!(connection, 0, "catalogue export cannot reconnect");
+                send_challenge(&mut socket).await;
+                let (connect, params) = receive_connect(&mut socket).await;
+                support::verify_connect_proof(&params);
+                assert_eq!(params.scopes.as_ref().expect("scopes").iter().map(claw_protocol::gateway::Name::as_str).collect::<Vec<_>>(), ["operator.read"]);
+                send_hello(&mut socket, connect.id(), "catalogue-export-fixture", 4, AUTHENTICATED_MAX_FRAME_BYTES, "operator", &["operator.read"]).await;
+                for (ordinal, page) in pages.into_iter().enumerate() {
+                    let request = receive_request(&mut socket).await;
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(request.method().as_str(), "models.list");
+                    let actual: Value = serde_json::from_str(request.params().value().expect("parameters").as_json()).expect("JSON");
+                    let mut expected = json!({"nativeCatalogPage":{"offset":ordinal * page_size}});
+                    if ordinal > 0 {
+                        expected["nativeCatalogPage"]["sha256"] = json!(digest);
+                    }
+                    assert_eq!(actual, expected, "only cached reads; no refresh, inference or ACK");
+                    if scenario == "disconnect" && ordinal == 2 {
+                        return;
+                    }
+                    if scenario == "refused" {
+                        send_json(&mut socket, json!({"type":"res","id":request.id().as_str(),"ok":false,"error":{"code":"UNAVAILABLE","message":"fixture refusal"}})).await;
+                    } else {
+                        send_json(&mut socket, json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":page})).await;
+                    }
+                }
+                wait_for_close(&mut socket).await;
+            }
+        })).await;
+        let destination = log_path(&format!(
+            "model-export-{scenario}-{}.json",
+            std::process::id()
+        ));
+        if scenario == "existing-target" {
+            fs::write(&destination, b"keep-existing-models").expect("owned existing file");
+        }
+        let mut arguments = vec![
+            "gateway".into(),
+            "export-models".into(),
+            "--destination".into(),
+            destination.as_os_str().to_owned(),
+        ];
+        arguments.extend(gateway_arguments(gateway.url.as_str()).into_iter().skip(2));
+        let output = run_cli(arguments, Some(TOKEN)).await;
+        let success = matches!(scenario, "valid" | "short-pages");
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let document = parse_json(&output);
+        assert_eq!(document["operation"], "models.export_catalogue");
+        assert_eq!(document["sourceModified"], false);
+        assert_eq!(document["acknowledged"], false);
+        assert_eq!(document["automaticReplay"], false);
+        assert!(
+            !document
+                .to_string()
+                .contains("private-untrusted-replacement")
+        );
+        if success {
+            let bytes = fs::read(&destination).expect("complete archive");
+            let archive: Value = serde_json::from_slice(&bytes).expect("archive JSON");
+            assert_eq!(archive["kind"], "gta-claw.provider-model-catalogue");
+            assert_eq!(archive["snapshot"]["models"], snapshot["models"]);
+            claw_protocol::native_models::validate_snapshot(
+                &archive["snapshot"].to_string(),
+                &digest,
+            )
+            .expect("independent snapshot check");
+            let mut file_digest = String::with_capacity(64);
+            for byte in ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref() {
+                write!(file_digest, "{byte:02x}").expect("file digest");
+            }
+            assert_eq!(document["result"]["fileSha256"], file_digest);
+            assert_eq!(document["result"]["pages"], expected_calls);
+            assert_eq!(document["result"]["fileCreated"], true);
+            assert_eq!(document["result"]["snapshotVerified"], true);
+            assert_eq!(document["result"]["networkContacted"], false);
+            assert_eq!(document["result"]["selectionChanged"], false);
+            assert_eq!(document["result"]["inferenceInvoked"], false);
+            assert_eq!(document["result"]["liveCapabilitiesVerified"], false);
+            fs::remove_file(&destination).expect("owned export cleanup");
+        } else if scenario == "existing-target" {
+            assert_eq!(
+                fs::read(&destination).expect("preserved target"),
+                b"keep-existing-models"
+            );
+            fs::remove_file(&destination).expect("owned fixture cleanup");
+        } else {
+            assert!(!destination.exists(), "{scenario} cannot create an output");
+            assert_eq!(document["fileMayExist"], false);
+        }
+        gateway.shutdown().await;
+        assert_eq!(calls.load(Ordering::SeqCst), expected_calls, "{scenario}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accounting_export_cli_pins_all_pages_and_writes_only_verified_new_files() {
+    use std::fmt::Write as _;
+
+    for scenario in [
+        "valid",
+        "empty",
+        "corrupt",
+        "identity",
+        "provenance",
+        "inflated-total",
+        "disconnect",
+        "existing-target",
+        "missing",
+        "refused",
+    ] {
+        let count = if scenario == "empty" { 0 } else { 17 };
+        let total = if scenario == "inflated-total" {
+            18
+        } else {
+            count
+        };
+        let tokens = json!({"inputTokens":1,"outputTokens":0,"totalTokens":1,"cachedInputTokens":0,"reasoningTokens":0});
+        let mut snapshot = json!({
+            "summary":{"available":count > 0,"recordedRounds":count,"completeCounterRounds":count,
+                "partialCounterRounds":0,"unreportedRounds":0,"allPrimaryCountersReported":count > 0,
+                "observedTokens":{"inputTokens":total,"outputTokens":0,"totalTokens":total,"cachedInputTokens":0,"reasoningTokens":0},
+                "aggregationOverflow":false,"costCalculated":false,"billingReconciled":false,
+                "recordSource":"provider_journal","journalRevision":7,"journalClosed":false,"attemptsMayBeUnsent":true},
+            "rounds":(0..count).map(|round| json!({"round":round,"response":{"provider":"fixture","model":"private-model-must-not-render",
+                "responseId":format!("private-response-{round}"),"usageReporting":"complete","finishReason":"stop","observedTokens":tokens}})).collect::<Vec<_>>()
+        });
+        if count == 0 {
+            snapshot["summary"]["observedTokens"] = Value::Null;
+        }
+        let mut digest = String::with_capacity(64);
+        for byte in ring::digest::digest(
+            &ring::digest::SHA256,
+            &serde_json::to_vec(&snapshot).expect("snapshot"),
+        )
+        .as_ref()
+        {
+            write!(digest, "{byte:02x}").expect("digest");
+        }
+        let mut first = json!({"runId":"a".repeat(64),"sessionId":"owned-session","revision":4,"turn":0,"status":"outcome_unknown",
+            "durable":true,"acknowledged":false,"automaticReplay":false,
+            "accounting":{"available":true,"offset":0,"endOffset":count.min(16),"nextOffset":(count > 16).then_some(16),
+                "totalRounds":count,"sha256":digest,"summary":snapshot["summary"],"rounds":&snapshot["rounds"].as_array().expect("rounds")[..count.min(16)]}});
+        if scenario == "missing" {
+            first["accounting"] = json!({"available":false});
+        }
+        let mut pages = vec![first.clone()];
+        if count > 16 && !matches!(scenario, "missing" | "refused") {
+            first["accounting"]["offset"] = json!(16);
+            first["accounting"]["endOffset"] = json!(count);
+            first["accounting"]["nextOffset"] = Value::Null;
+            first["accounting"]["rounds"] = json!([snapshot["rounds"][16]]);
+            if scenario == "corrupt" {
+                first["accounting"]["rounds"][0]["response"]["model"] = json!("substituted-model");
+            } else if scenario == "identity" {
+                first["sessionId"] = json!("another-session");
+            } else if scenario == "provenance" {
+                first["accounting"]["summary"]["journalRevision"] = json!(8);
+            }
+            pages.push(first);
+        }
+        let expected_calls = pages.len();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let expected_digest = digest.clone();
+        let gateway = TestGateway::spawn(handler(move |mut socket, connection| {
+            let pages = pages.clone();
+            let calls = Arc::clone(&observed);
+            let digest = expected_digest.clone();
+            async move {
+                assert_eq!(connection, 0, "export cannot reconnect");
+                send_challenge(&mut socket).await;
+                let (connect, params) = receive_connect(&mut socket).await;
+                support::verify_connect_proof(&params);
+                assert_eq!(params.scopes.as_ref().expect("scopes").iter().map(claw_protocol::gateway::Name::as_str).collect::<Vec<_>>(), ["operator.read"]);
+                send_hello(&mut socket, connect.id(), "accounting-export-fixture", 4, AUTHENTICATED_MAX_FRAME_BYTES, "operator", &["operator.read"]).await;
+                for (index, page) in pages.into_iter().enumerate() {
+                    let request = receive_request(&mut socket).await;
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(request.method().as_str(), "agent.wait");
+                    let actual: Value = serde_json::from_str(request.params().value().expect("parameters").as_json()).expect("JSON");
+                    let mut expected = json!({"runId":"a".repeat(64),"accountingPage":{"revision":4,"offset":index * 16}});
+                    if index > 0 { expected["accountingPage"]["sha256"] = json!(digest); }
+                    assert_eq!(actual, expected, "no ACK, inference, wait or unrelated operation");
+                    if scenario == "disconnect" && index == 1 { return; }
+                    if scenario == "refused" {
+                        send_json(&mut socket, json!({"type":"res","id":request.id().as_str(),"ok":false,"error":{"code":"UNAVAILABLE","message":"fixture refusal"}})).await;
+                    } else {
+                        send_json(&mut socket, json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":page})).await;
+                    }
+                }
+                wait_for_close(&mut socket).await;
+            }
+        })).await;
+        let destination = log_path(&format!(
+            "accounting-export-{scenario}-{}.json",
+            std::process::id()
+        ));
+        if scenario == "existing-target" {
+            fs::write(&destination, b"keep-original-output").expect("owned existing file");
+        }
+        let mut arguments = vec![
+            "gateway".into(),
+            "export-accounting".into(),
+            "a".repeat(64).into(),
+            "4".into(),
+            "--destination".into(),
+            destination.as_os_str().to_owned(),
+        ];
+        arguments.extend(gateway_arguments(gateway.url.as_str()).into_iter().skip(2));
+        let output = run_cli(arguments, Some(TOKEN)).await;
+        let success = matches!(scenario, "valid" | "empty");
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let document = parse_json(&output);
+        assert_eq!(document["operation"], "run.export_accounting");
+        assert_eq!(document["sourceModified"], false);
+        assert_eq!(document["acknowledged"], false);
+        assert_eq!(document["automaticReplay"], false);
+        if success {
+            let bytes = fs::read(&destination).expect("verified file");
+            let exported: Value = serde_json::from_slice(&bytes).expect("complete archive");
+            assert_eq!(exported["schemaVersion"], 1);
+            assert_eq!(exported["kind"], "gta-claw.provider-accounting");
+            assert_eq!(
+                exported["snapshot"]["accounting"]["summary"],
+                snapshot["summary"]
+            );
+            assert_eq!(
+                exported["snapshot"]["accounting"]["rounds"],
+                snapshot["rounds"]
+            );
+            assert_eq!(
+                exported["snapshot"]["accounting"]["nextOffset"],
+                Value::Null
+            );
+            assert_eq!(document["result"]["sha256"], digest);
+            let mut file_digest = String::with_capacity(64);
+            for byte in ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref() {
+                write!(file_digest, "{byte:02x}").expect("file digest");
+            }
+            assert_eq!(document["result"]["fileSha256"], file_digest);
+            assert_eq!(document["result"]["fileCreated"], true);
+            assert_eq!(document["result"]["snapshotVerified"], true);
+            assert_eq!(document["result"]["costCalculated"], false);
+            assert_eq!(document["result"]["billingReconciled"], false);
+        } else if scenario == "existing-target" {
+            assert_eq!(
+                fs::read(&destination).expect("original"),
+                b"keep-original-output"
+            );
+        } else {
+            assert!(
+                !destination.exists(),
+                "unverified export must create no target"
+            );
+            assert_eq!(document["fileMayExist"], false);
+        }
+        let stdout = String::from_utf8(output.stdout).expect("JSON output");
+        assert!(!stdout.contains("private-model-must-not-render"));
+        assert!(!stdout.contains("private-response"));
+        assert!(!stdout.contains(TOKEN));
+        assert!(output.stderr.is_empty());
+        let _ = fs::remove_file(destination);
+        gateway.shutdown().await;
+        assert_eq!(calls.load(Ordering::SeqCst), expected_calls, "{scenario}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accounting_run_cli_verifies_pages_with_one_read_and_no_ack_or_replay() {
     use std::fmt::Write as _;
     for scenario in [

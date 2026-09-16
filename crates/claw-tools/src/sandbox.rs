@@ -43,6 +43,14 @@ const FILE_SHARE_READ: u32 = 0x0000_0001;
 #[cfg(windows)]
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 
+#[derive(Clone, Copy)]
+enum HandleSharing {
+    Normal,
+    StablePath,
+    #[cfg(windows)]
+    Exclusive,
+}
+
 /// Reserved Windows device names, compared case-insensitively against the
 /// portion of a component before its first dot.
 const RESERVED_DEVICE_NAMES: [&str; 26] = [
@@ -523,6 +531,26 @@ impl Sandbox {
     /// Refuses existing targets, links, unsafe ancestors or changed file identities before content
     /// is written. New Unix files are owner-only; Windows files inherit the trusted parent ACL.
     pub fn create_new_file(&self, path: &RelativePath) -> Result<File, SandboxError> {
+        self.create_new_handle(path, HandleSharing::Normal)
+    }
+
+    /// Creates an output whose contents and name cannot be accessed by another process.
+    ///
+    /// This Windows maintenance primitive is not an atomic publication API. Retain
+    /// the pinned sandbox and the returned handle until verification is complete.
+    ///
+    /// # Errors
+    /// Applies all of [`Self::create_new_file`]'s path, identity and hard-link checks.
+    #[cfg(windows)]
+    pub fn create_new_exclusive_file(&self, path: &RelativePath) -> Result<File, SandboxError> {
+        self.create_new_handle(path, HandleSharing::Exclusive)
+    }
+
+    fn create_new_handle(
+        &self,
+        path: &RelativePath,
+        sharing: HandleSharing,
+    ) -> Result<File, SandboxError> {
         let prepared = self.prepare_write(path, WriteMode::CreateNew)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
@@ -532,6 +560,7 @@ impl Sandbox {
             options.mode(0o600);
         }
         apply_no_follow(&mut options);
+        apply_handle_sharing(&mut options, sharing);
         let file = options
             .open(&prepared.absolute)
             .map_err(|error| map_io(&error))?;
@@ -717,7 +746,7 @@ impl Sandbox {
     /// [`SandboxError::RaceDetected`] when an ancestor or the opened handle
     /// stopped matching the validated path between check and use.
     pub fn open_no_follow(&self, resolved: &ResolvedPath) -> Result<File, SandboxError> {
-        self.open_existing_handle(resolved, false, false)
+        self.open_existing_handle(resolved, false, HandleSharing::Normal)
     }
 
     /// Opens an existing read/write host file without creation, truncation or path redirection.
@@ -727,7 +756,31 @@ impl Sandbox {
     /// # Errors
     /// Applies the same file identity, hard-link and ancestor checks as [`Self::open_no_follow`].
     pub fn open_existing_for_update(&self, resolved: &ResolvedPath) -> Result<File, SandboxError> {
-        self.open_existing_handle(resolved, true, false)
+        self.open_existing_handle(resolved, true, HandleSharing::Normal)
+    }
+
+    /// Opens an existing Windows file for exclusive maintenance without truncating it.
+    ///
+    /// Data reads, writes, deletion and rename by other handles are refused until
+    /// this handle closes. Existing incompatible handles make the open fail.
+    /// Retain the pinned sandbox while using the handle; hard links remain forbidden.
+    ///
+    /// # Errors
+    /// Applies all of [`Self::open_no_follow`]'s checks and refuses sharing conflicts.
+    #[cfg(windows)]
+    pub fn open_existing_exclusive(&self, resolved: &ResolvedPath) -> Result<File, SandboxError> {
+        self.open_existing_handle(resolved, true, HandleSharing::Exclusive)
+    }
+
+    /// Holds an existing Windows input without permitting concurrent data access or rename.
+    ///
+    /// Unlike [`Self::open_existing_exclusive`], this requires no write access.
+    ///
+    /// # Errors
+    /// Applies all of [`Self::open_no_follow`]'s checks and refuses sharing conflicts.
+    #[cfg(windows)]
+    pub fn open_read_exclusive(&self, resolved: &ResolvedPath) -> Result<File, SandboxError> {
+        self.open_existing_handle(resolved, false, HandleSharing::Exclusive)
     }
 
     /// Opens a verified host coordination file for read/write and later advisory locking.
@@ -742,14 +795,14 @@ impl Sandbox {
         &self,
         resolved: &ResolvedPath,
     ) -> Result<File, SandboxError> {
-        self.open_existing_handle(resolved, true, true)
+        self.open_existing_handle(resolved, true, HandleSharing::StablePath)
     }
 
     fn open_existing_handle(
         &self,
         resolved: &ResolvedPath,
         writable: bool,
-        stable_path: bool,
+        sharing: HandleSharing,
     ) -> Result<File, SandboxError> {
         let components = &resolved.relative.components;
         let Some(leaf) = components.last() else {
@@ -760,12 +813,7 @@ impl Sandbox {
         let mut options = OpenOptions::new();
         options.read(true).write(writable);
         apply_no_follow(&mut options);
-        #[cfg(windows)]
-        if stable_path {
-            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-        }
-        #[cfg(not(windows))]
-        let _ = stable_path;
+        apply_handle_sharing(&mut options, sharing);
         let file = options.open(&absolute).map_err(|error| map_io(&error))?;
         verify_handle_is_not_reparse_point(&file)?;
         verify_single_link(&file)?;
@@ -1094,6 +1142,21 @@ fn remove_own_empty_file(path: &Path) {
 #[cfg(not(windows))]
 fn is_link_like(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
+}
+
+fn apply_handle_sharing(options: &mut OpenOptions, sharing: HandleSharing) {
+    #[cfg(windows)]
+    match sharing {
+        HandleSharing::Normal => {}
+        HandleSharing::StablePath => {
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
+        HandleSharing::Exclusive => {
+            options.share_mode(0);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (options, sharing);
 }
 
 #[cfg(windows)]
@@ -1558,6 +1621,63 @@ impl Error for SandboxError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn exclusive_maintenance_handles_refuse_read_write_rename_and_existing_owners() {
+        struct OwnedRoot(PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = OwnedRoot(std::env::temp_dir().join(format!(
+                "claw-maintenance-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            )));
+        std::fs::create_dir(&root.0).expect("owned root");
+        let source = root.0.join("source.json5");
+        std::fs::write(&source, b"original").expect("source");
+        let sandbox = Sandbox::new_pinned(&root.0, SandboxLimits::default()).expect("pinned root");
+        let relative = sandbox.relative("source.json5").expect("relative");
+        let resolved = sandbox.resolve_file(&relative).expect("resolved");
+        let reader = File::open(&source).expect("existing reader");
+        assert!(sandbox.open_existing_exclusive(&resolved).is_err());
+        drop(reader);
+        let mut exclusive = sandbox
+            .open_existing_exclusive(&resolved)
+            .expect("maintenance handle");
+        assert!(File::open(&source).is_err());
+        assert!(OpenOptions::new().write(true).open(&source).is_err());
+        assert!(std::fs::rename(&source, root.0.join("renamed.json5")).is_err());
+        assert!(std::fs::remove_file(&source).is_err());
+        assert!(sandbox.open_existing_exclusive(&resolved).is_err());
+        exclusive
+            .write_all(b"updated!")
+            .expect("write on verified handle");
+        exclusive.sync_all().expect("sync source");
+        let new_path = sandbox.relative("backup.json5").expect("backup path");
+        let mut output = sandbox
+            .create_new_exclusive_file(&new_path)
+            .expect("new exclusive output");
+        output.write_all(b"original").expect("output");
+        output.sync_all().expect("sync output");
+        assert!(std::fs::write(root.0.join("backup.json5"), b"replacement").is_err());
+        assert!(std::fs::remove_file(root.0.join("backup.json5")).is_err());
+        sandbox.validate_root().expect("root held");
+        drop(output);
+        drop(exclusive);
+        assert_eq!(std::fs::read(&source).expect("read updated"), b"updated!");
+        std::fs::hard_link(&source, root.0.join("alias.json5")).expect("owned hardlink");
+        assert!(matches!(
+            sandbox.open_existing_exclusive(&resolved),
+            Err(SandboxError::HardLinksForbidden)
+        ));
+    }
 
     fn limits() -> SandboxLimits {
         SandboxLimits::default()

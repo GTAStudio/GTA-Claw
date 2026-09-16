@@ -8,6 +8,9 @@ pub mod suspend;
 #[cfg(feature = "native-identity")]
 pub mod identity;
 
+#[cfg(feature = "native-config")]
+pub mod configuration;
+
 /// Reads platform identity from the Rust target.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeSystemProbe;

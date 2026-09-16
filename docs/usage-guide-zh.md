@@ -320,6 +320,7 @@ GTA_CLAW_GATEWAY_TOKEN='…' gta-claw-tui --gateway wss://gateway.example.test
 | Diff | 工作区差异查看器。 |
 | Artifacts | 会话产物查看器。 |
 | Help | 键盘操作参考。 |
+| Models | 原生 provider 缓存目录与显式目录刷新。 |
 
 ### 4.3 按键
 
@@ -333,7 +334,7 @@ x                 取消精确观察到的原生 run
 y / n             批准 / 拒绝
 r                 从 Gateway 刷新
 Ctrl-P 或 :       命令面板
-1..6              跳转到指定界面
+1..7              跳转到指定界面
 Esc               关闭命令面板
 ?                 键盘帮助
 q / Ctrl-C        安全退出
@@ -344,10 +345,38 @@ q / Ctrl-C        安全退出
 按 `:` 或 `Ctrl-P` 打开，输入命令后回车。可识别的命令（不区分大小写）：
 
 `sessions`、`workspace`、`runs`、`diff`、`artifacts`、`help`、`refresh`、`quit`（或 `q`），
-以及 `new`、`message`、`send`、`run`、`partial`、`partial-next`、`cancel`、`retry-send`。
+以及 `new`、`message`、`send`、`run`、`partial`、`partial-next`、`accounting`、`accounting-next`、
+`cancel`、`retry-send`、`models`、`models-next`、`refresh-models`、`config-provider <JSON>`。
 
 `discard-draft` 明确丢弃未提交草稿。`discard-send` 只允许丢弃所有尝试都确定未发送的输入；
 已排队或曾可能送达的输入不能这样丢弃。下面的记忆动作在重试时仍保留类型，不转为普通聊天。
+
+独立的 Models 视图显示当前连接的缓存目录、已选模型与实例代次、观察时间、可选上限和 SDK
+声明能力。`models`（或该视图中的 `r`）只读缓存，`models-next` 固定原摘要续读下一组八项。
+`refresh-models` 明确读取 provider 目录，不选模型、不推理。最多一个目录请求在途，失败保留
+上一页；刷新成功后旧页失效，需再用 `models` 读取。连接或请求序号变化会拒绝旧响应。
+目录不进入聊天历史、不取得 ACK 资格；实号能力与完整在线配置应用仍未验证。
+证据见[终端目录追加记录](ledger/native-model-catalogue-20260916.json)。
+
+本地模型候选使用 `config-provider` 后跟一个封闭 JSON 对象：
+
+```text
+config-provider {"action":"inspect","source":"D:/Configs/claw.json5"}
+config-provider {"action":"prepare","source":"D:/Configs/claw.json5","destination":"D:/Configs/claw.model.json5","model":"exact-model-id"}
+```
+
+检查源文件不需要 Gateway 就绪；生成候选要求当前已验证的 Models 页、没有目录请求在途、
+同一已检查源路径，以及该页内的精确模型 ID。源 provider 和当前模型必须对应目录；配置
+`copilot` 映射到实际 SDK 标识 `github-copilot`。匹配不证明本地文件就是远端 Gateway 配置。
+服务会复核源 SHA，独占新建候选、同步并读回；不改源文件、凭据或在线模型，应用需另走
+[离线 CLI 流程](../apps/gta-claw-cli/README.md#offline-application-and-recovery)，不推导实号就绪。
+
+JSON 最多16KiB，路径最多4096字节，模型ID最多256字节；路径空格作为数据，使用JSON转义
+或正斜杠。重复/未知字段、未支持动作、相对路径、缺失或已选模型、provider不符均拒绝。
+命令面板支持有界粘贴，普通命令仍保持较小长度限制；最多一个本地文件任务在途。Gateway
+断线不会丢弃该任务或回执，正常退出会等已开始的文件任务结束。结果只显示在Models视图，
+不进入聊天历史或ACK队列。I/O故障或进程中断可能留下候选，禁止自动覆盖/删除重试；
+这不是客户端崩溃日志或文件系统I/O硬超时。
 
 原生消息在收到持久回执前保留随机幂等键。投递未知时不接受另一个新发送；`retry-send` 是显式
 使用原会话、原文本和原键重试，不自动重放。重连会拒绝旧连接的发送、取消、审批、ACK 和回答。
@@ -365,6 +394,14 @@ session、run、turn、revision 和终态，续页同时固定原长度和摘要
 且 transcript 仍是有界视图而非完整归档。完整收集与摘要校验使用
 [CLI export-partial](../apps/gta-claw-cli/README.md#retained-partial-text)，验证边界见
 [TUI 记录](ledger/native-tui-partial-20260915.json)。
+
+`accounting` 读取选中且已观察终态的 run 的第一组模型轮次，`accounting-next` 显式续页。
+每页最多 16 轮、总量最多 1024 轮，显示 provider/model/response 标识、主计数完整程度、
+缓存/推理子集和 finish reason。缺失报告保持 unknown，明确完整的零值仍显示零。
+请求固定连接、会话、run、turn、revision、终态、数量、摘要与汇总来源；连接或 run 改变
+会清除游标，旧响应不能覆盖当前视图。查看用量不新增 ACK 或重放权限。完整单页核对全文
+摘要，后续单页只固定快照；完整独立校验的明文 JSON 文件使用
+[CLI export-accounting](../apps/gta-claw-cli/README.md)。费用仍未计算，账单仍未核对。
 
 其他输入会在提示行显示 `Unknown command: …`。`Esc` 关闭命令面板。
 
@@ -452,9 +489,101 @@ gta-claw-daemon --check-config --config /etc/gta-claw/config.json5
 加载分层配置，并执行当前的非网络检查子集：针对检查模式所允许选项的暴露策略、状态目录路径解析、代理策略
 构造、管理令牌解析、更新及遗留/通道设置、通道覆盖，以及提供方认证配置和密钥解析。它不会打开监听器。
 它只计算状态目录路径，不会创建该目录、测试其可用性或权限，也不会打开配对、审计或目标存储；同样不会
-初始化遥测或测试其输出、获取角色、发现或激活插件，也不会初始化提供方。
+初始化遥测或测试其输出、获取角色、发现或激活插件，也不会认证/激活提供方。
+原生 API 客户端及传输会被构造以验证静态设置，但不会连接其端点。
 `--check-config` 可与 `--config`、`--state-dir` 一起使用；不能与 `--probe` 或任何监听、日志、TLS 断言及
 smoke 选项组合。因此，尽管检查过程会调用暴露策略，它无法预检拟议的监听覆盖值或可路由部署。
+
+可选的 `core.provider` 显式选择 `openai`、`anthropic`、`copilot` 或 `disabled`，不再依赖
+旧 `core.copilot` 默认值来选择原生后端。例如下面是需要与其余角色、渠道等配置合并的文件片段：
+
+```json5
+{
+  core: {
+    provider: {
+      kind: "openai",
+      model: "exact-provider-model-id",
+      model_aliases: [{ alias: "work", model: "exact-provider-model-id" }],
+      api_key: "env:PROVIDER_API_KEY",
+      base_url: "https://api.openai.com/v1/",
+      credential_origin: "https://api.openai.com",
+      completion_api: "responses",
+      request_timeout_ms: 30000,
+    },
+  },
+}
+```
+
+模型 ID 必须替换为账号真实可用的精确值，非空且不含空白，最多 256 字节。OpenAI/Anthropic
+要求 SecretRef，不能填写明文密钥；引用最多 1024 字节，URL 最多 2048 字节，超时为
+1000..120000 毫秒、默认 120000。URL 允许 HTTPS 或字面量 loopback HTTP，拒绝 userinfo、
+查询、片段、空白及歧义点路径。origin 必须与端点一致且无路径；省略时从已验证端点计算。
+默认使用相应官方端点，自定义 origin 仍须通过独立 `GTA_CLAW_PROVIDER_ORIGINS` 登记，
+配置里声明 origin 不等于获准发送凭据。`completion_api` 仅 OpenAI 可用，默认
+`chat_completions`；`responses` 必须显式选择且保持 stateless。
+
+Copilot 使用 `kind:"copilot"`、精确 `model` 和可选超时，认证继续取自 `core.auth.github`，
+不接受原生 API key 或 endpoint 字段。OpenAI/Anthropic 与 disabled 不要求无用的 GitHub 凭据。
+`kind:"disabled"` 不接受活动 provider 字段，不启动模型或 Device Flow；管理查询仍可用，
+模型就绪状态明确为 false。可选 `max_observed_turn_tokens` 是每回合已观察用量阈值，
+不代表货币预算或单次请求硬限额。
+
+可选 `model_aliases` 同样支持 Copilot 和 Anthropic，是区分大小写、只解析一跳的显式
+别名到精确 ID 表；最多 128 项，名称与目标总计最多 4096 UTF-8 字节，每个名称遵循
+256 字节模型 ID 规则。拒绝重复、别名链、与任何精确 ID 碰撞，以及保留的 `openclaw`
+和整个 `openclaw/` 命名空间。文件编辑先验证语法，启动和刷新再对完整目录验证全部目标
+与碰撞；无效刷新保留旧目录。主 `model` 始终保存精确 ID，别名先解析再经过固定模型和
+能力准入，因此指向另一模型的别名仍不能覆盖已选模型。它不切换账号、端点或提供方，
+不推断凭据或 fallback。原生 HTTP 只额外接受明确配置的别名，通用 HTTP 端口不会开始
+接受任意名称；别名修改仍需独立审阅后重启。
+
+省略 `core.provider` 时保留旧路径。显式选择不能与 `GTA_CLAW_PROVIDER_POLICY` 并存，
+即使旧变量为空也拒绝混用；同样不能被 smoke 覆盖。角色模型或 reload 不能暗中替换固定模型。
+provider 修改需重启，拒绝的 reload 保留正在运行的配置和 provider 代次。跨层改变 kind 时
+整体替换 provider 对象，避免继承另一家的密钥；同 kind 的局部覆盖保留其他字段。
+JSON5 层里的重复对象字段在合并前拒绝。管理状态会报告配置来源和声明的 origin，不输出凭据引用。
+
+[CLI provider inspect/prepare](../apps/gta-claw-cli/README.md#provider-configuration) 可查看保存的选择，
+按源文件 SHA 验证后将 stdin 严格 JSON 选择写成新配置文件；不会覆盖源/目标或应用到运行中服务，
+也不会合并环境覆盖、解析秘密或联网。候选文件生成后仍需独立检查与受控重启。
+验证范围和未完成项见[配置记录](ledger/native-provider-config-20260916.json)。
+
+`config provider prepare --model <精确ID>` 只改模型，保留 provider、凭据引用、端点、方言、
+超时和预算。Windows `apply` 还要求源/候选两个摘要、全新备份和
+`--confirm-apply --confirm-offline`；先同步并验读原始备份，再用原源文件句柄写入。
+这是非原子的离线保存，不是在线应用；失败可能留下未知源内容。独立确认的 `restore`
+会先保留这些残留，再恢复完整已审阅配置，且不自动重启。操作步骤与恢复限制见
+[离线应用和恢复](../apps/gta-claw-cli/README.md#offline-application-and-recovery)。
+
+原生 `gateway models` 每页最多只读八个缓存模型，保留精确 ID、声明能力、可选上下文/输出
+上限、显式别名、当前选择和观察时间，不联网刷新。别名来自本地配置并纳入目录摘要，不是
+实号能力声明；编码页最多 16 KiB，因此可少于八项。新客户端仍接受无别名的旧页，旧严格
+客户端可能拒绝含别名的页，使用前需升级。TUI/Slint 分开展示别名，候选编辑仍保存精确 ID。
+`gateway refresh-models --sha256 <已观察摘要>` 是单独的
+读写权限动作，只发起目录读取，最多一个在途刷新、十秒等待预算，不执行推理或切换模型。
+无效目录、当前模型缺失、取消、超时或并发 provider 变化都会保留旧缓存。
+SDK 声明能力不等于已验证真实账号的每模型能力。完整说明见
+[CLI 模型目录](../apps/gta-claw-cli/README.md#model-catalogue)及
+[目录验收记录](ledger/native-model-catalogue-20260916.json)。
+
+`gateway models --availability` 显式读取 `disabled`、`authentication_pending`、`not_initialized`
+或 `retired` 生命周期状态。TUI 对应 `models-status`，桌面 Models 提供独立状态按钮。它们只读
+本地事实，不证明真实账号或推理就绪；普通目录请求保留旧格式，旧服务拒绝时保留上一有效页，
+未知原因不作为任意远端文字显示，见[状态记录](ledger/native-model-status-20260916.json)。
+
+`gateway export-models --destination <全新绝对路径>` 通过同一已认证只读连接读取完整缓存目录，
+固定每页身份、代次、选择、观察时间和摘要，独立核验全量摘要及跨页 ID/别名唯一性后才新建
+文件。不刷新、不推理、不切换模型或发送 ACK。输出为有界明文元数据，不是账号证明或可导入
+配置；读取中断不产生文件，文件写入不确定时须保留检查，禁止覆盖已有目标。完整步骤与限制见
+[目录导出](../apps/gta-claw-cli/README.md#complete-catalogue-export)和
+[验收记录](ledger/native-model-export-20260916.json)。
+
+daemon 在完成、流式和嵌入请求调用 provider 前检查精确模型仍在当前目录，提供方能力与
+明确逐模型声明均满足要求，显式输出上限不为零且不超过已知输出/上下文上限。目录未声明
+逐模型能力时保留未知，只使用原有提供方级支持检查，不伪造实号能力。用户明确提交的工具、
+强制工具选择、图像及类型化工具历史不会被偷偷丢弃；仅对已知文本模型省略可选宿主/运行时
+工具声明，使普通文本仍可用。不回落别的模型、不推断未知上下文大小或额外联网，见
+[能力准入记录](ledger/native-model-admission-20260916.json)。
 
 ### 5.3 提供服务
 
@@ -464,7 +593,7 @@ gta-claw-daemon
 
 服务模式先在 `main` 中解析配置并初始化遥测，然后调用 `serve_production`。`ProductionService` 启动过程
 会打开持久化的 Gateway 配对、安全审计和目标存储，激活已签名插件，按条件激活 smoke 提供方或
-GitHub Copilot，启动已配置的通道传输，并绑定四个监听器：
+GitHub Copilot 或显式原生 OpenAI/Anthropic 选择，启动已配置的通道传输，并绑定四个监听器：
 
 - 主 17 路由 HTTP API；
 - 与遗留 Node 服务兼容的 HTTP 门面；
@@ -613,6 +742,31 @@ flow."*（连接会执行真实的 challenge、connect、hello 与安全的 heal
 产品模式精确申请 `operator.read`、`operator.write` 和 `operator.approvals`，不会申请 admin。
 原生聊天/历史/审批已有真实传输，生产模型初始为空；重连后查询待审批，完整有界预览到达前不能批准。
 请求和事件绑定连接 epoch；流式输出、历史/事件合并、工作区信任和完整凭据生命周期仍未完成。
+
+原生终态 run 的 Session Usage 区显示已保存用量；刷新图标从第一轮读取，右箭头在有下一页
+时续读。读取期间或当前连接/run 无法对应时按钮禁用。可滚动只读区区分缺失报告、明确零值、
+部分计数、持久来源和未计算费用。读取失败保留上一张有效页，不改变 run 终态、不确认结果；
+会话、epoch 或 revision 变化会拒绝旧响应。这是有界查看，不是完整导出或发票结算，见
+[用量工作流记录](ledger/native-accounting-workflow-20260915.json)。
+
+Settings > Models 现在显示原生缓存目录，不再使用自动路由占位内容。向下箭头读取第一张
+缓存页，右箭头固定摘要续页，刷新图标明确从 provider 读取目录。控件使用现有认证连接，
+请求在途时禁用，不选择或配置模型。失败/坏响应保留上一张有效页，刷新成功后旧页失效，
+需再读取缓存；断线或 epoch 改变会清空视图并拒绝旧响应。缺失上限保持未知，SDK 能力声明
+明确标为未验证。可滚动只读区不产生聊天结果或 ACK，这些按钮不代表已经实现模型选择/
+应用配置流程，见[桌面目录追加记录](ledger/native-model-catalogue-20260916.json)。
+
+铅笔图标打开独立的**本地**模型候选表单：填写绝对源路径，点击向下箭头检查源文件，
+从当前目录页选择精确模型，再填写全新绝对候选路径并点击加号生成。本地 provider 类型和
+已保存模型必须对应当前目录，但这不能证明该文件就是所连接 Gateway 的配置；端点与凭据
+绑定仍需独立审阅。目录页、连接或实例变化会使旧选择失效，不自动推断别名、fallback 或凭据。
+
+共用平台服务会复核源 SHA，独占新建候选并读回校验；只改变模型字段，不改源文件或在线服务。
+回执显示源/候选摘要，不显示凭据引用；断线后仍保留已生成文件的回执，避免误认为没有执行。
+本地 I/O 失败可能留下候选文件，必须保留检查。任务在 UI 线程外执行，最多一个在途，正常关闭
+控制器会等待任务收尾。审阅后的应用与恢复使用
+[离线 CLI 流程](../apps/gta-claw-cli/README.md#offline-application-and-recovery)，表单不执行
+在线切换、自动重启或付费模型请求。
 
 ### 6.3 平台边界
 

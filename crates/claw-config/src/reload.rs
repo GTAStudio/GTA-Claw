@@ -95,6 +95,10 @@ pub(crate) fn changed_domains(
         ),
         (ConfigDomain::Copilot, previous.copilot != candidate.copilot),
         (
+            ConfigDomain::Provider,
+            previous.provider != candidate.provider,
+        ),
+        (
             ConfigDomain::LegacySkills,
             previous.legacy_skills != candidate.legacy_skills,
         ),
@@ -116,6 +120,7 @@ const fn restart_required(domain: ConfigDomain) -> bool {
             | ConfigDomain::Server
             | ConfigDomain::Admin
             | ConfigDomain::Network
+            | ConfigDomain::Provider
     )
 }
 

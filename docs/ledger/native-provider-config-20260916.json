@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-typed-provider-configuration-and-local-candidate-workflow",
+  "capturedOn": "2026-09-16",
+  "baseCommit": "c360c2b36d3df1bf998b83ac7d171f78a39aade8",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "taskIds": ["M3-06.01", "M3-06.03", "M3-07", "M5-01"],
+  "acceptedSubtasks": ["M3-06.01"],
+  "acceptedParentTasksAdded": 0,
+  "wholeProjectAccepted": false,
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "platform": "windows-x86_64",
+  "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01), stable",
+  "cargoLockSha256": "3cec96347169fcba527beac7b577ee05579c291f2e960902270da60efcd1e277",
+  "dependencyChange": "Only gta-claw-cli's direct dependency on the existing workspace claw-config crate was added to Cargo.toml/Cargo.lock; no external package version was changed or downloaded",
+  "sourceFiles": [
+    { "path": "crates/claw-config/src/lib.rs", "sha256": "73b2d64afcb0f68ee6da1e3d227351cdaf131c0b11b6cee4ee2396af6487837d" },
+    { "path": "crates/claw-config/src/model.rs", "sha256": "98c47ef46312a7d53ba43b8367575dd910c3266d4efbc7d04b5677095909c9d7" },
+    { "path": "crates/claw-config/src/wire.rs", "sha256": "7b4a07473bef737a76599ddb53038b903d5401f645facc25e31ab50f84766cc4" },
+    { "path": "crates/claw-config/src/layer.rs", "sha256": "11f69441370979da8819bbee7cc7fcdee5b47680e501717cb87c450e9334254c" },
+    { "path": "crates/claw-config/src/reload.rs", "sha256": "8ca66a0f0d1e27acad8dc384780cbff95435467b46444e1afdc27bf8609b99e0" },
+    { "path": "crates/claw-config/tests/configuration.rs", "sha256": "61df1bfe9adfa925c6ee054a47b9760a93773c8bea9e0a0dd8300732b23d393b" },
+    { "path": "crates/claw-config/tests/layering.rs", "sha256": "074017e85b8b9ea3553bfe3888e9866ef7b2ebacad53003641885095294d0908" },
+    { "path": "apps/gta-claw-daemon/src/production.rs", "sha256": "cddae70c2e1ff46703d948e0cd182d6594ae63c0bdf6ae6a4b0b51931da35be7" },
+    { "path": "apps/gta-claw-daemon/src/production/native_provider.rs", "sha256": "02e4cc4393c57808fcc589b0238470fa3279db00ce142616436646fdc1ed4f40" },
+    { "path": "apps/gta-claw-daemon/src/adapters/http_api.rs", "sha256": "b9ee924fd27ef471d82accde34e45a69ce5d5d30a17dc1a4e2d542825ab8453e" },
+    { "path": "apps/gta-claw-daemon/tests/production_composition.rs", "sha256": "9e0b848ea1b8da2cbb4155fe8f64e31b518e14c703fab4d865a5f81a36d767e2" },
+    { "path": "apps/gta-claw-cli/Cargo.toml", "sha256": "61166b52698f482bf7f39356c3966e6e1a190dcfb6f02c988c46aa135b239604" },
+    { "path": "apps/gta-claw-cli/src/lib.rs", "sha256": "484c987363829a81eb22f2edc9b0b5ee039d1256da15b12b576354670ae39646" },
+    { "path": "apps/gta-claw-cli/src/provider_config.rs", "sha256": "e282db5746b7e826040af443596e6468648ae58387d8793878343ca72840c999" },
+    { "path": "apps/gta-claw-cli/src/state_snapshot.rs", "sha256": "bdc0dbd55681a83a24c92169d84612658506d612a2ef4ff39f434e2c78bf35ed" },
+    { "path": "apps/gta-claw-cli/tests/foundation.rs", "sha256": "546ac974a21a4e88a046355d323b2fbd99ec9962b3522123a35fb751f30a569c" }
+  ],
+  "checks": [
+    {
+      "command": "cargo +stable test -p claw-config -p gta-claw-daemon -p gta-claw-cli --all-targets --no-fail-fast --locked --offline -j 2",
+      "result": "passed", "exitCode": 0, "passed": 457, "failed": 0, "ignored": 5, "testBinaries": 25,
+      "packageCounts": { "claw-config": 109, "gta-claw-cli": 104, "gta-claw-daemon": 244 },
+      "log": "target/native-provider-config-tests-20260916.log",
+      "sha256": "8919a847c3fbca5cb1a2c8db674ad8b5778e52537deed1719db2826d45fdbf12"
+    },
+    {
+      "command": "cargo +stable clippy -p claw-config -p gta-claw-daemon -p gta-claw-cli --all-targets --locked --offline -j 2 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-provider-config-clippy-20260916.log",
+      "sha256": "1898d80750c3b0e1f4850584179c1bf2d67a0b604abc04f175713928a5789e6e"
+    },
+    {
+      "command": "cargo +stable check --workspace --all-targets --locked --offline -j 2",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-provider-config-check-20260916.log",
+      "sha256": "5f8e59a22c2a38caa482f354e1e57d74f6b2a20eb3a735dbefa0d7500b64549c"
+    }
+  ],
+  "artifacts": [
+    { "path": "target/debug/gta-claw-cli.exe", "sha256": "f8ededeb4f1ee2ca8101427a54821c2e3eb1913f0013dd613a604e2a649a465e" },
+    { "path": "target/debug/gta-claw-daemon.exe", "sha256": "164233e4c4861a3fcabc1c32dc3ebd1f4478d8bab208ed3115e1d8f046f42ec6" }
+  ],
+  "behaviorEvidence": [
+    "explicit_provider_selection_is_typed_and_does_not_require_unused_github_auth",
+    "explicit_provider_configuration_rejects_invalid_or_inapplicable_settings_and_requires_restart",
+    "provider_edit_revalidates_the_whole_snapshot_and_rejects_ambiguous_input",
+    "provider_layers_replace_changed_kinds_without_inheriting_credentials_or_endpoints",
+    "provider_layers_reject_duplicate_selection_fields_before_merging",
+    "typed_provider_selection_preserves_bindings_and_rejects_legacy_policy_conflicts",
+    "bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection",
+    "typed_provider_configuration_checks_reject_conflicts_without_network_or_fallback",
+    "typed_disabled_provider_is_manageable_without_authentication_or_model_requests",
+    "provider_config_commands_require_local_paths_explicit_digest_and_stdin_selection",
+    "provider_config_cli_prepares_verified_new_files_without_network_secrets_or_source_changes",
+    "documentation_never_places_literal_secrets_in_command_arguments"
+  ],
+  "retainedFailures": [
+    "The first targeted test failed on unknown core.provider, proving the missing main-config route before implementation. The identical test passed after typed configuration and validation were added",
+    "The first production compile found check_configuration still using the old environment-only parser. Updated that actual entry point to the shared selection rules; the same focused production test passed",
+    "The initial provider-edit API insertion duplicated to_json5. Removed only the accidental duplicate; the identical configuration compile and the dedicated behavior test passed",
+    "The duplicate-provider-field layering regression first failed because Value deserialization silently kept the last field. UniqueLayerValue now rejects duplicate object keys before merging, and that same test plus all config targets passed. Normal cross-layer overrides are unchanged",
+    "Strict lint found a missing semicolon, a format-collect test digest and a fourth boolean fixture parameter. Fixed locally, replaced provider source with an enum and reran strict Clippy without new lint waivers",
+    "Earlier native credential/OAuth/stdio anomalies remain open. This final three-package run passed, but no credential backend, retry, lock or root-cause correction was made"
+  ],
+  "notes": [
+    "core.provider is an additive strict native configuration domain. OpenAI/Anthropic/Copilot/disabled selections preserve exact model, SecretRef, URL, declared credential origin, bounded timeout, optional OpenAI dialect and observed-token threshold. The old 47-domain upstream contract and sealed compatibility materials are unchanged",
+    "Omitted core.provider preserves legacy behavior. Any explicit selection rejects simultaneous GTA_CLAW_PROVIDER_POLICY, even empty input, and rejects smoke replacement. OpenAI/Anthropic/disabled no longer require irrelevant GitHub authentication. Copilot continues to use core.auth.github and its real activation/Device Flow path",
+    "Declared credential_origin must equal the endpoint origin and is not enrollment. Custom provider credential disclosure still requires independent GTA_CLAW_PROVIDER_ORIGINS; enrollment is checked before resolving the reference. Existing proxy transport/retry controls are reused",
+    "Changing kind in a higher layer replaces the complete provider object, preventing one provider from inheriting another's credential or endpoint. Same-kind partial overrides preserve sibling fields. Duplicate fields and nonfinite numbers in native JSON5 layers fail before merge",
+    "Actual daemon processes tested OpenAI Chat, OpenAI Responses and Anthropic through both legacy environment and main-file selections, with real loopback HTTP/Gateway traffic, partial accounting, owner boundaries and fixed default-model refusals. Typed runs had no GITHUB_TOKEN injected",
+    "For each of three typed dialects, changing model, API reference, timeout or observed-token threshold was rejected by live reload with unchanged config/provider generations, exact model and upstream request counts. This is an explicit restart boundary, not a claim of complete online switching",
+    "Ten actual check/start subprocess scenarios prove static success or explicit refusal without opening the role/model witness listener. Disabled mode can start a manageable daemon, reports provider disabled/not ready/generation zero and refuses inference without authenticating or contacting a model",
+    "CLI inspect reads the saved file only, never environment overlays or secrets. prepare consumes <=16KiB strict JSON stdin with a 30-second input bound, checks source SHA, validates the entire candidate and uses pinned-parent create-new+sync for <=4MiB UTF8 files. It never applies a config, changes the source, overwrites, resolves credentials or contacts any endpoint",
+    "Nine actual CLI file scenarios cover normal/disabled candidates, changed source digest, duplicate selection, literal secret, unknown field, existing target, invalid endpoint and unauthenticated Copilot. Source bytes stayed unchanged, invalid candidates created no file and endpoint witnesses saw zero requests",
+    "Candidate serialization preserves typed settings/references but not comments/layout. Receipt omits credential reference identifiers and includes source/candidate hashes, restartRequired:true and applied:false. Local I/O failure can leave a candidate; no atomic rename, directory durability, source-writer exclusion or hard filesystem deadline is promised",
+    "M3-06.01 is closed only for its typed configuration, diagnostics and safe compatibility route. M3-06 parent remains open because complete activation/retirement and real-account acceptance are not complete; M3-06.03 has partial local evidence but remains open",
+    "Final checklist parser observed 98 parents, four accepted parents, 376 children and one accepted child. This is structural accounting, not a whole-project completion percentage",
+    "All downloads/builds were offline; no real cloud account, paid model, production proxy/server changes, remote origin enrollment, user-state migration, mobile hardware, deployment or release. All owned commands completed synchronously; no new branch, commit or push. Pre-existing accounting workflow edits were preserved"
+  ],
+  "recovery": [
+    "Invalid main configuration fails before readiness; do not replace it with smoke or an empty provider. Preserve the last-known-good file and inspect the precise rejected path with the normal config check",
+    "A refused runtime reload leaves the old committed config/provider generations live. Review the generated candidate separately and restart only under the appropriate operator authorization",
+    "If CLI source SHA differs, inspect the current file and deliberately prepare a new candidate. If candidate creation is unconfirmed, preserve any existing/partial file and select a new destination; no automatic overwrite, retry or rollback occurs"
+  ],
+  "unverified": [
+    "Complete provider online prepare/authenticate/publish/retire workflow and graph-wide active-resource retirement",
+    "Real Copilot/OpenAI/Anthropic account authorization, paid usage, remote DNS/proxy scenarios and external model-capability accuracy",
+    "Graphical provider configuration editors, live configuration application and end-to-end first-run onboarding",
+    "Full model catalog aliases, capability provenance, refresh, inventory and disabled/fallback client UX",
+    "Earlier intermittent native credential/OAuth/stdio failures, full cross-platform/device acceptance, migration and release gates"
+  ]
+}

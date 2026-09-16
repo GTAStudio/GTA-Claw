@@ -591,6 +591,453 @@ async fn native_tui_accounting_crosses_real_worker_without_granting_ack_or_repla
 }
 
 #[tokio::test]
+async fn native_tui_model_catalogue_reads_and_refreshes_without_chat_ack_or_selection() {
+    use gta_claw_tui::gateway::{ModelCatalogueAction, ModelCatalogueRequest};
+    use serde_json::Value;
+    use std::fmt::Write as _;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    for scenario in [
+        "pages",
+        "refresh",
+        "refresh-refused",
+        "bad-page",
+        "unavailable",
+        "stale",
+        "availability-disabled",
+        "availability-authentication_pending",
+        "availability-not_initialized",
+        "availability-retired",
+        "availability-private-remote-secret",
+        "availability-refused",
+    ] {
+        let availability = scenario.strip_prefix("availability-");
+        let snapshot = json!({"provider":"fixture","providerGeneration":1,"selectedModel":"fixture-model-0","selectionPinned":true,
+            "observedAtMs":123,"source":"provider_sdk_catalogue","liveCapabilitiesVerified":false,
+            "models":(0..9).map(|ordinal|json!({"id":format!("fixture-model-{ordinal}"),"displayName":null,
+                "contextWindow":null,"maxOutputTokens":null,"advertisedCapabilities":["completion"]})).collect::<Vec<_>>()});
+        let mut digest = String::with_capacity(64);
+        for byte in ring::digest::digest(
+            &ring::digest::SHA256,
+            &serde_json::to_vec(&snapshot).expect("snapshot"),
+        )
+        .as_ref()
+        {
+            write!(digest, "{byte:02x}").expect("snapshot digest");
+        }
+        let mut first = json!({"schemaVersion":1,"available":true,"offset":0,"endOffset":8,"nextOffset":8,"totalModels":9,"sha256":digest,
+            "provider":"fixture","providerGeneration":1,"selectedModel":"fixture-model-0","selectionPinned":true,"observedAtMs":123,
+            "source":"provider_sdk_catalogue","liveCapabilitiesVerified":false,"selectionChanged":false,"networkContacted":false,
+            "models":&snapshot["models"].as_array().expect("models")[..8]});
+        if scenario == "bad-page" {
+            first["models"][0]["displayName"] = json!("private-remote\nlabel");
+        }
+        if scenario == "unavailable" {
+            first = json!({"schemaVersion":1,"available":false,"selectionChanged":false,"networkContacted":false});
+        }
+        if let Some(reason) = availability {
+            first = json!({"schemaVersion":1,"available":false,"unavailableReason":reason,"selectionChanged":false,"networkContacted":false});
+        }
+        let mut actions = if availability.is_some() {
+            vec![ModelCatalogueAction::Availability]
+        } else {
+            vec![ModelCatalogueAction::Read {
+                offset: 0,
+                sha256: None,
+            }]
+        };
+        let mut replies = vec![first.clone()];
+        if scenario == "pages" {
+            actions.push(ModelCatalogueAction::Read {
+                offset: 8,
+                sha256: Some(digest.clone()),
+            });
+            first["offset"] = json!(8);
+            first["endOffset"] = json!(9);
+            first["nextOffset"] = Value::Null;
+            first["models"] = json!([snapshot["models"][8]]);
+            replies.push(first);
+        } else if matches!(scenario, "refresh" | "refresh-refused") {
+            actions.push(ModelCatalogueAction::Refresh {
+                sha256: digest.clone(),
+            });
+            replies.push(json!({"schemaVersion":1,"refreshed":true,"provider":"fixture","providerGeneration":1,"requestedSha256":digest,
+                "selectedModel":"fixture-model-0","totalModels":9,"selectionChanged":false,"networkContacted":true,"inferenceInvoked":false}));
+        }
+        let expected_calls = if scenario == "stale" {
+            0
+        } else {
+            actions.len()
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let expected_actions = actions.clone();
+        let gateway = TestGateway::spawn(handler(move |mut socket,_| {
+            let replies = replies.clone();
+            let actions = expected_actions.clone();
+            let calls = Arc::clone(&observed);
+            async move {
+                complete_handshake(&mut socket,AUTHENTICATED_MAX_FRAME_BYTES).await;
+                let sessions = receive_request(&mut socket).await;
+                send_json(&mut socket,json!({"type":"res","id":sessions.id().as_str(),"ok":true,"payload":{"sessions":[]}})).await;
+                if scenario != "stale" {
+                    for (ordinal,(action,reply)) in actions.into_iter().zip(replies).enumerate() {
+                        let request = receive_request(&mut socket).await;
+                        calls.fetch_add(1,Ordering::SeqCst);
+                        assert_eq!(request.method().as_str(),"models.list");
+                        let actual:Value = serde_json::from_str(request.params().value().expect("params").as_json()).expect("JSON");
+                        let expected = match action {
+                            ModelCatalogueAction::Availability => json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true}}),
+                            ModelCatalogueAction::Read {offset,sha256} => {
+                                let mut params = json!({"nativeCatalogPage":{"offset":offset}});
+                                if let Some(digest) = sha256 {params["nativeCatalogPage"]["sha256"] = json!(digest);}
+                                params
+                            }
+                            ModelCatalogueAction::Refresh {sha256} => json!({"nativeCatalogRefresh":{"sha256":sha256}}),
+                        };
+                        assert_eq!(actual,expected);
+                        if scenario == "refresh-refused" && ordinal == 1 || scenario == "availability-refused" {
+                            send_json(&mut socket,json!({"type":"res","id":request.id().as_str(),"ok":false,"error":{"code":"INVALID_REQUEST","message":"private-remote-secret"}})).await;
+                        } else {send_json(&mut socket,json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":reply})).await;}
+                    }
+                }
+                loop {match socket.read_frame().await {
+                    Ok(frame) if frame.opcode == fastwebsockets::OpCode::Text => {calls.fetch_add(1,Ordering::SeqCst);}
+                    Ok(frame) if frame.opcode == fastwebsockets::OpCode::Close => break,
+                    Ok(_)=>{},Err(_)=>break,
+                }}
+            }
+        })).await;
+        let mut worker = spawn_gateway_worker(GatewayOptions {
+            url: gateway.url.clone(),
+            token: None,
+            device_profile: None,
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if matches!(worker.events.recv().await, Some(WorkerEvent::Sessions(_))) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("ready worker");
+        for (ordinal, action) in actions.into_iter().enumerate() {
+            let request = ModelCatalogueRequest {
+                connection_id: 1,
+                sequence: u64::try_from(ordinal + 1).expect("sequence"),
+                action,
+            };
+            worker
+                .commands
+                .send(
+                    UiCommand::ModelCatalogue(request.clone())
+                        .for_connection(if scenario == "stale" { 2 } else { 1 }),
+                )
+                .await
+                .expect("queued catalogue");
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match worker.events.recv().await.expect("catalogue outcome") {
+                        WorkerEvent::ModelCatalogue {
+                            request: returned,
+                            result,
+                        } => {
+                            assert_eq!(returned, request);
+                            assert_eq!(
+                                result.is_ok(),
+                                !(scenario == "bad-page"
+                                    || scenario == "refresh-refused" && ordinal == 1
+                                    || matches!(
+                                        scenario,
+                                        "availability-private-remote-secret"
+                                            | "availability-refused"
+                                    )),
+                                "{scenario}: {result:?}"
+                            );
+                            match result {
+                                Ok(page) => {
+                                    if let Some(reason) = availability {
+                                        assert_eq!(page["unavailableReason"], reason);
+                                    }
+                                }
+                                Err(error) => assert!(!error.contains("private-remote")),
+                            }
+                            break;
+                        }
+                        WorkerEvent::Notice(notice) if scenario == "stale" => {
+                            assert!(notice.contains("previous connection"));
+                            break;
+                        }
+                        WorkerEvent::NativeRun { .. } | WorkerEvent::ResultAcknowledged { .. } => {
+                            panic!("catalogue cannot deliver or acknowledge chat")
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("bounded catalogue result");
+        }
+        worker
+            .commands
+            .send(
+                UiCommand::AcknowledgeRun {
+                    run_id: "a".repeat(64),
+                    revision: 4,
+                }
+                .for_connection(1),
+            )
+            .await
+            .expect("attempt ACK");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let WorkerEvent::Notice(notice) =
+                    worker.events.recv().await.expect("ACK refusal")
+                {
+                    assert!(notice.contains("not delivered completely"));
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("local ACK refusal");
+        worker.shutdown().await;
+        gateway.shutdown().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            expected_calls,
+            "{scenario}: no extra RPC"
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_tui_accounting_pages_are_bound_read_only_and_never_acknowledge_results() {
+    use gta_claw_tui::gateway::AccountingPageRequest;
+    use serde_json::Value;
+    use std::fmt::Write as _;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    for scenario in [
+        "valid",
+        "zero",
+        "missing",
+        "bad-digest",
+        "identity",
+        "provenance",
+        "extra",
+        "stale",
+    ] {
+        let total = if matches!(scenario, "valid" | "provenance") {
+            17
+        } else {
+            1
+        };
+        let tokens = json!({"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0});
+        let snapshot = json!({"summary":{"available":true,"recordedRounds":total,"completeCounterRounds":1,"partialCounterRounds":0,"unreportedRounds":total-1,
+            "allPrimaryCountersReported":total==1,"observedTokens":tokens,"aggregationOverflow":false,"costCalculated":false,"billingReconciled":false,
+            "recordSource":"provider_journal","journalRevision":7,"journalClosed":false,"attemptsMayBeUnsent":true},
+            "rounds":(0..total).map(|round| json!({"round":round,"response":if round == 0 { json!({"provider":"fixture","model":"private-model",
+                "responseId":"response-123","usageReporting":"complete","finishReason":"stop","observedTokens":tokens}) } else {Value::Null}})).collect::<Vec<_>>()});
+        let mut digest = String::with_capacity(64);
+        for byte in ring::digest::digest(
+            &ring::digest::SHA256,
+            &serde_json::to_vec(&snapshot).expect("snapshot"),
+        )
+        .as_ref()
+        {
+            write!(digest, "{byte:02x}").expect("digest");
+        }
+        let first_end = total.min(16);
+        let mut page = json!({"runId":"a".repeat(64),"sessionId":"owned","revision":4,"turn":0,"status":"outcome_unknown",
+            "durable":true,"acknowledged":false,"automaticReplay":false,"accounting":{"available":true,"offset":0,"endOffset":first_end,
+                "nextOffset":(total > 16).then_some(16),"totalRounds":total,"sha256":digest,"summary":snapshot["summary"],
+                "rounds":&snapshot["rounds"].as_array().expect("rounds")[..first_end]}});
+        if scenario == "missing" {
+            page["accounting"] = json!({"available":false});
+        }
+        if scenario == "bad-digest" {
+            page["accounting"]["sha256"] = json!("0".repeat(64));
+        }
+        if scenario == "identity" {
+            page["sessionId"] = json!("other");
+        }
+        if scenario == "extra" {
+            page["accounting"]["rounds"][0]["response"]["prompt"] = json!("private-prompt");
+        }
+        let mut pages = vec![page.clone()];
+        if total > 16 {
+            page["accounting"]["offset"] = json!(16);
+            page["accounting"]["endOffset"] = json!(17);
+            page["accounting"]["nextOffset"] = Value::Null;
+            page["accounting"]["rounds"] = json!([snapshot["rounds"][16]]);
+            if scenario == "provenance" {
+                page["accounting"]["summary"]["journalRevision"] = json!(8);
+            }
+            pages.push(page);
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&calls);
+        let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+            let pages = pages.clone();
+            let calls = Arc::clone(&captured);
+            let digest = digest.clone();
+            async move {
+                complete_handshake(&mut socket,AUTHENTICATED_MAX_FRAME_BYTES).await;
+                let sessions = receive_request(&mut socket).await;
+                send_json(&mut socket,json!({"type":"res","id":sessions.id().as_str(),"ok":true,"payload":{"sessions":[]}})).await;
+                if scenario != "stale" {
+                    for (index,page) in pages.into_iter().enumerate() {
+                        let request = receive_request(&mut socket).await;
+                        calls.fetch_add(1,Ordering::SeqCst);
+                        assert_eq!(request.method().as_str(),"agent.wait");
+                        let actual:Value = serde_json::from_str(request.params().value().expect("params").as_json()).expect("JSON");
+                        let mut expected = json!({"runId":"a".repeat(64),"accountingPage":{"revision":4,"offset":index*16}});
+                        if index > 0 {expected["accountingPage"]["sha256"] = json!(digest);}
+                        assert_eq!(actual,expected,"no ACK, wait, inference or replay");
+                        send_json(&mut socket,json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":page})).await;
+                    }
+                }
+                loop {
+                    match socket.read_frame().await {
+                        Ok(frame) if frame.opcode == fastwebsockets::OpCode::Text => {calls.fetch_add(1,Ordering::SeqCst);}
+                        Ok(frame) if frame.opcode == fastwebsockets::OpCode::Close => break,
+                        Ok(_) => {}, Err(_) => break,
+                    }
+                }
+            }
+        })).await;
+        let mut worker = spawn_gateway_worker(GatewayOptions {
+            url: gateway.url.clone(),
+            token: None,
+            device_profile: None,
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if matches!(worker.events.recv().await, Some(WorkerEvent::Sessions(_))) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("ready");
+        let request = AccountingPageRequest {
+            connection_id: 1,
+            session_id: "owned".to_owned(),
+            run_id: "a".repeat(64),
+            revision: 4,
+            turn: 0,
+            state: RunState::OutcomeUnknown,
+            offset: 0,
+            total_rounds: None,
+            sha256: None,
+            summary: None,
+        };
+        worker
+            .commands
+            .send(
+                UiCommand::ReadAccounting(request).for_connection(if scenario == "stale" {
+                    9
+                } else {
+                    1
+                }),
+            )
+            .await
+            .expect("page command");
+        let pages_received = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut received = 0;
+            loop {
+                match worker.events.recv().await.expect("event") {
+                    WorkerEvent::AccountingPage(page) => {
+                        received += 1;
+                        if let Some(offset) = page.next_offset {
+                            let next = AccountingPageRequest {
+                                offset,
+                                total_rounds: Some(page.total_rounds),
+                                sha256: Some(page.sha256),
+                                summary: Some(page.summary),
+                                ..page.request
+                            };
+                            worker
+                                .commands
+                                .send(UiCommand::ReadAccounting(next).for_connection(1))
+                                .await
+                                .expect("next page");
+                        } else {
+                            break received;
+                        }
+                    }
+                    WorkerEvent::Notice(notice) => {
+                        assert!(
+                            !matches!(scenario, "valid" | "zero"),
+                            "{scenario}: {notice}"
+                        );
+                        assert!(
+                            !notice.contains("private-model") && !notice.contains("private-prompt")
+                        );
+                        break received;
+                    }
+                    WorkerEvent::NativeRun { .. } => {
+                        panic!("accounting cannot become a complete result")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("bounded page response");
+        assert_eq!(
+            pages_received,
+            match scenario {
+                "valid" => 2,
+                "zero" | "provenance" => 1,
+                _ => 0,
+            },
+            "{scenario}"
+        );
+        worker
+            .commands
+            .send(
+                UiCommand::AcknowledgeRun {
+                    run_id: "a".repeat(64),
+                    revision: 4,
+                }
+                .for_connection(1),
+            )
+            .await
+            .expect("attempt ACK");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let WorkerEvent::Notice(notice) =
+                    worker.events.recv().await.expect("refused ACK")
+                {
+                    assert!(notice.contains("not delivered completely"), "{notice}");
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("ACK refused locally");
+        worker.shutdown().await;
+        gateway.shutdown().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            if scenario == "stale" {
+                0
+            } else {
+                total.div_ceil(16)
+            },
+            "{scenario}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn native_tui_send_cancel_and_result_ack_keep_exact_run_and_revision() {
     let baseline = ReleaseBaseline::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compat/releases/v2026.9.4"),

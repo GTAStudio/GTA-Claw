@@ -686,9 +686,11 @@ name = "claw-platform"
 version = "0.1.0"
 dependencies = [
  "claw-application",
+ "claw-config",
  "claw-protocol",
  "claw-provider-sdk",
  "claw-security",
+ "claw-tools",
  "ring",
  "rustix",
  "sha2 0.11.0",
@@ -1789,6 +1791,7 @@ dependencies = [
  "age",
  "base64",
  "claw-application",
+ "claw-config",
  "claw-conformance",
  "claw-gateway-client",
  "claw-mcp",

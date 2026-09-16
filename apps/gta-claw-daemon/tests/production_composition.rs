@@ -13,6 +13,119 @@ use claw_config::{migrate_legacy_environment, to_json5};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProviderFixtureSource {
+    ModelAliases,
+    Environment,
+    Configuration,
+    EditedModel,
+    CliModel,
+}
+
+fn apply_cli_model_fixture(config: &Path, model: &str) {
+    use serde_json::Value;
+    let executable = std::env::var_os("GTA_CLAW_TEST_PROVIDER_CLI")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_file())
+        .expect("explicit built CLI executable required for isolated integration");
+    let run = |arguments: &[std::ffi::OsString]| -> Value {
+        let mut command = Command::new(&executable);
+        command.env_clear();
+        for name in ["SystemRoot", "SystemDrive", "WINDIR"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        let output = command
+            .args(arguments)
+            .output()
+            .expect("owned CLI operation");
+        let text = String::from_utf8(output.stdout).expect("CLI metadata");
+        assert!(output.status.success(), "{text}");
+        assert!(output.stderr.is_empty() && !text.contains("NATIVE_PROVIDER_KEY"));
+        let receipt: Value = serde_json::from_str(&text).expect("CLI JSON");
+        assert_eq!(receipt["applied"], false);
+        assert_eq!(receipt["networkContacted"], false);
+        assert_eq!(receipt["credentialsResolved"], false);
+        receipt
+    };
+    let original = std::fs::read(config).expect("original config bytes");
+    let source = run(&[
+        "config".into(),
+        "provider".into(),
+        "inspect".into(),
+        "--source".into(),
+        config.as_os_str().to_owned(),
+    ]);
+    let root = config.parent().expect("owned root");
+    let candidate = root.join("model-candidate.json5");
+    let backup = root.join("model-original.json5");
+    let prepared = run(&[
+        "config".into(),
+        "provider".into(),
+        "prepare".into(),
+        "--source".into(),
+        config.as_os_str().to_owned(),
+        "--destination".into(),
+        candidate.as_os_str().to_owned(),
+        "--expected-sha256".into(),
+        source["sourceSha256"]
+            .as_str()
+            .expect("source digest")
+            .into(),
+        "--model".into(),
+        model.into(),
+    ]);
+    assert_eq!(prepared["modelOnly"], true);
+    assert_eq!(prepared["catalogueVerified"], false);
+    assert_eq!(
+        std::fs::read(config).expect("source before apply"),
+        original
+    );
+    let saved = run(&[
+        "config".into(),
+        "provider".into(),
+        "apply".into(),
+        "--source".into(),
+        config.as_os_str().to_owned(),
+        "--candidate".into(),
+        candidate.as_os_str().to_owned(),
+        "--backup".into(),
+        backup.as_os_str().to_owned(),
+        "--expected-sha256".into(),
+        source["sourceSha256"]
+            .as_str()
+            .expect("source digest")
+            .into(),
+        "--candidate-sha256".into(),
+        prepared["candidateSha256"]
+            .as_str()
+            .expect("candidate digest")
+            .into(),
+        "--confirm-apply".into(),
+        "--confirm-offline".into(),
+    ]);
+    assert_eq!(saved["configurationSaved"], true);
+    assert_eq!(saved["restartRequired"], true);
+    assert_eq!(
+        std::fs::read(&backup).expect("backed up original"),
+        original
+    );
+    assert_eq!(
+        std::fs::read(config).expect("saved source"),
+        std::fs::read(&candidate).expect("candidate")
+    );
+    assert_eq!(
+        claw_config::load_file(config)
+            .expect("saved typed config")
+            .core()
+            .provider()
+            .expect("provider")
+            .model(),
+        Some(model)
+    );
+}
+
 const fn process_fixture_arguments() -> [&'static str; 5] {
     [
         "--exact",
@@ -232,6 +345,36 @@ impl Running {
         mcp: Option<serde_json::Value>,
         max_observed_turn_tokens: Option<u64>,
     ) -> Self {
+        Self::start_at_with_provider_source(
+            root,
+            model,
+            teams,
+            whatsapp,
+            role_url,
+            workspace,
+            provider,
+            memory_enabled,
+            mcp,
+            max_observed_turn_tokens,
+            ProviderFixtureSource::Environment,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_at_with_provider_source(
+        root: PathBuf,
+        model: &str,
+        teams: bool,
+        whatsapp: bool,
+        role_url: &str,
+        workspace: Option<serde_json::Value>,
+        provider: Option<(&str, &str, &str, Option<&str>)>,
+        memory_enabled: bool,
+        mcp: Option<serde_json::Value>,
+        max_observed_turn_tokens: Option<u64>,
+        provider_source: ProviderFixtureSource,
+    ) -> Self {
+        let typed_provider = provider_source != ProviderFixtureSource::Environment;
         std::fs::create_dir_all(&root).expect("temporary root is created");
         let config = root.join("config.json5");
         write_config_fixture(&config, model, role_url, teams, whatsapp);
@@ -258,12 +401,63 @@ impl Running {
             if let Some(limit) = max_observed_turn_tokens {
                 policy["maxObservedTurnTokens"] = serde_json::json!(limit);
             }
-            command.env("GTA_CLAW_PROVIDER_POLICY", policy.to_string());
-            command.env(
-                "GTA_CLAW_PROVIDER_ORIGINS",
-                serde_json::json!({provider: [origin]}).to_string(),
-            );
-            command.env("NATIVE_PROVIDER_KEY", "native-provider-fixture");
+            if typed_provider {
+                let mut document: serde_json::Value =
+                    json5::from_str(&std::fs::read_to_string(&config).expect("fixture config"))
+                        .expect("JSON5");
+                document["core"]["auth"]["github"]["pat"] = serde_json::Value::Null;
+                document["core"]["provider"] = if provider == "disabled" {
+                    serde_json::json!({"kind":"disabled"})
+                } else {
+                    serde_json::json!({"kind":provider,"model":model,"api_key":"env:NATIVE_PROVIDER_KEY","base_url":base_url,
+                        "credential_origin":origin,"request_timeout_ms":5000,"completion_api":completion_api,"max_observed_turn_tokens":max_observed_turn_tokens})
+                };
+                if provider_source == ProviderFixtureSource::ModelAliases {
+                    document["core"]["provider"]["model_aliases"] = serde_json::json!([
+                        {"alias":"work-native","model":model},
+                        {"alias":"work-other","model":"other-fixture"}
+                    ]);
+                }
+                let contents = if matches!(
+                    provider_source,
+                    ProviderFixtureSource::EditedModel
+                        | ProviderFixtureSource::CliModel
+                        | ProviderFixtureSource::ModelAliases
+                ) {
+                    document["core"]["provider"]["model"] =
+                        serde_json::json!("original-unselected-model");
+                    let original =
+                        claw_config::parse_json5(&document.to_string(), "owned-original-provider")
+                            .expect("original selection");
+                    let candidate = claw_config::with_provider_model(&original, model)
+                        .expect("exact model candidate");
+                    assert_eq!(
+                        claw_config::with_provider_model(&candidate, "original-unselected-model")
+                            .expect("unchanged remaining config"),
+                        original
+                    );
+                    if provider_source == ProviderFixtureSource::CliModel {
+                        document.to_string()
+                    } else {
+                        claw_config::to_json5(&candidate).expect("model candidate bytes")
+                    }
+                } else {
+                    document.to_string()
+                };
+                std::fs::write(&config, contents).expect("typed provider configuration");
+                if provider_source == ProviderFixtureSource::CliModel {
+                    apply_cli_model_fixture(&config, model);
+                }
+            } else {
+                command.env("GTA_CLAW_PROVIDER_POLICY", policy.to_string());
+            }
+            if provider != "disabled" {
+                command.env(
+                    "GTA_CLAW_PROVIDER_ORIGINS",
+                    serde_json::json!({provider: [origin]}).to_string(),
+                );
+                command.env("NATIVE_PROVIDER_KEY", "native-provider-fixture");
+            }
         } else {
             command.arg("--smoke");
         }
@@ -304,6 +498,9 @@ impl Running {
                 "execution":{"kind":"wasm","plugin_id":"gta-claw-fixture-probe","export":"x"}
             }]}).to_string());
         }
+        if !typed_provider {
+            command.env("GITHUB_TOKEN", "test");
+        }
         let mut child = command
             .args([
                 "--config",
@@ -319,7 +516,6 @@ impl Running {
                 "--state-dir",
                 root.to_str().expect("temporary path is UTF-8"),
             ])
-            .env("GITHUB_TOKEN", "test")
             .env("ADMIN_TOKEN", "operator-token")
             .env("GTA_CLAW_MCP_OWNER_TOKEN", "mcp-owner-fixture")
             .env("GTA_CLAW_MCP_TOKEN", "mcp-reader-fixture")
@@ -1804,7 +2000,252 @@ fn bound_native_workspace_tools_require_bound_approval_and_record_safe_audit() {
 }
 
 #[test]
+fn typed_provider_configuration_checks_reject_conflicts_without_network_or_fallback() {
+    use serde_json::{Value, json};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("no-network witness");
+    listener.set_nonblocking(true).expect("nonblocking witness");
+    let origin = format!("http://{}", listener.local_addr().expect("address"));
+    let root = std::env::temp_dir().join(format!(
+        "gta-claw-typed-config-{}-{}",
+        std::process::id(),
+        NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("owned config directory");
+    let path = root.join("config.json5");
+    for scenario in [
+        "openai",
+        "anthropic",
+        "copilot",
+        "disabled",
+        "missing-key",
+        "unenrolled",
+        "origin-mismatch",
+        "mixed",
+        "mixed-disabled",
+        "smoke",
+    ] {
+        write_config_fixture(
+            &path,
+            "legacy-model",
+            &format!("{origin}/role"),
+            false,
+            false,
+        );
+        let mut document: Value =
+            json5::from_str(&std::fs::read_to_string(&path).expect("base config")).expect("JSON5");
+        document["core"]["auth"]["github"]["pat"] = Value::Null;
+        let kind = match scenario {
+            "anthropic" => "anthropic",
+            "copilot" => "copilot",
+            "disabled" | "mixed-disabled" => "disabled",
+            _ => "openai",
+        };
+        document["core"]["provider"] = match kind {
+            "disabled" => json!({"kind":"disabled"}),
+            "copilot" => {
+                json!({"kind":"copilot","model":"explicit-model","request_timeout_ms":5000})
+            }
+            _ => {
+                json!({"kind":kind,"model":"explicit-model","api_key":"env:NATIVE_PROVIDER_KEY","base_url":format!("{origin}/v1/"),"credential_origin":origin})
+            }
+        };
+        if kind == "copilot" {
+            document["core"]["auth"]["github"]["pat"] = json!("env:FIXTURE_GITHUB_KEY");
+        }
+        if kind == "disabled" {
+            document["core"]["auth"]["github"]["pat"] =
+                json!("env:MUST_NOT_RESOLVE_DISABLED_GITHUB_KEY");
+        }
+        if scenario == "origin-mismatch" {
+            document["core"]["provider"]["credential_origin"] =
+                json!("https://different.example.test");
+        }
+        std::fs::write(&path, document.to_string()).expect("typed config written");
+        let mut command = isolated_daemon();
+        command
+            .args([
+                "--config",
+                path.to_str().expect("path"),
+                "--state-dir",
+                root.to_str().expect("root"),
+            ])
+            .env("ADMIN_TOKEN", "operator-token")
+            .env("GTA_CLAW_LOG", "off");
+        if scenario == "smoke" {
+            command.arg("--smoke");
+        } else {
+            command.arg("--check-config");
+        }
+        if scenario != "missing-key" {
+            command.env("NATIVE_PROVIDER_KEY", "private-fixture-provider-key");
+        }
+        command.env("FIXTURE_GITHUB_KEY", "private-fixture-github-key");
+        if scenario != "unenrolled" {
+            command.env(
+                "GTA_CLAW_PROVIDER_ORIGINS",
+                json!({kind:[origin]}).to_string(),
+            );
+        }
+        if matches!(scenario, "mixed" | "mixed-disabled") {
+            command.env(
+                "GTA_CLAW_PROVIDER_POLICY",
+                r#"{"provider":"openai","model":"other","apiKey":"env:NATIVE_PROVIDER_KEY"}"#,
+            );
+        }
+        let output = command.output().expect("configuration check completes");
+        let success = matches!(scenario, "openai" | "anthropic" | "copilot" | "disabled");
+        let stderr = String::from_utf8(output.stderr).expect("diagnostic UTF8");
+        assert_eq!(output.status.success(), success, "{scenario}: {stderr}");
+        assert!(!stderr.contains("private-fixture"));
+        if !success {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("ready protocol"));
+        }
+        assert!(
+            matches!(listener.accept(),Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{scenario}: no role/model/credential network allowed"
+        );
+    }
+    std::fs::remove_dir_all(root).expect("owned config cleanup");
+}
+
+fn assert_catalogue_unavailability(address: SocketAddr, reason: &str) {
+    use serde_json::{Value, json};
+    let detailed = json!({"method":"models.list","params":{"nativeCatalogPage":{"offset":0,"includeAvailability":true}}});
+    let refused = request(
+        address,
+        "POST",
+        "/api/v1/admin/rpc",
+        None,
+        Some(&detailed.to_string()),
+    );
+    assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+    for include_details in [false, true] {
+        let mut query = json!({"method":"models.list","params":{"nativeCatalogPage":{"offset":0}}});
+        let mut expected = json!({"schemaVersion":1,"available":false,"selectionChanged":false,"networkContacted":false});
+        if include_details {
+            query["params"]["nativeCatalogPage"]["includeAvailability"] = json!(true);
+            expected["unavailableReason"] = json!(reason);
+        }
+        let response = request(
+            address,
+            "POST",
+            "/api/v1/admin/rpc",
+            Some("operator-token"),
+            Some(&query.to_string()),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let document: Value =
+            serde_json::from_str(response_body(&response)).expect("catalogue JSON");
+        assert_eq!(document["payload"], expected);
+        claw_protocol::native_models::validate_page(&document["payload"].to_string(), 0, None)
+            .expect("real unavailable state");
+    }
+}
+
+#[test]
+fn typed_disabled_provider_is_manageable_without_authentication_or_model_requests() {
+    use serde_json::{Value, json};
+    use std::sync::{Arc, atomic::AtomicUsize};
+    let executor = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("local fixture runtime");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::clone(&requests);
+    let router = axum::Router::new()
+        .route(
+            "/role",
+            axum::routing::get(|| async { "Disabled-provider role" }),
+        )
+        .fallback(move || {
+            let calls = Arc::clone(&captured);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        });
+    let listener = executor
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .expect("local role fixture");
+    let origin = format!("http://{}", listener.local_addr().expect("address"));
+    let stop = tokio_util::sync::CancellationToken::new();
+    let stopped = stop.clone();
+    let server = executor.spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(stopped.cancelled_owned())
+            .await
+            .expect("role fixture");
+    });
+    let root = std::env::temp_dir().join(format!(
+        "gta-claw-disabled-provider-{}-{}",
+        std::process::id(),
+        NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let daemon = Running::start_at_with_provider_source(
+        root,
+        "unused-model",
+        false,
+        false,
+        &format!("{origin}/role"),
+        None,
+        Some(("disabled", &origin, &origin, None)),
+        false,
+        None,
+        None,
+        ProviderFixtureSource::Configuration,
+    );
+    let status = request(
+        daemon.http,
+        "POST",
+        "/api/v1/admin/rpc",
+        Some("operator-token"),
+        Some(r#"{"method":"status","params":{}}"#),
+    );
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let status: Value = serde_json::from_str(response_body(&status)).expect("status JSON");
+    assert_eq!(
+        status["payload"]["configuration"]["providerSelection"],
+        json!({"source":"core.provider","kind":"disabled","credentialOrigin":null,"requestTimeoutMs":null,"disabled":true})
+    );
+    assert_eq!(
+        status["payload"]["ready"], false,
+        "disabled is not authenticated readiness"
+    );
+    assert_eq!(status["payload"]["providerGeneration"], 0);
+    let refused = request(
+        daemon.http,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        Some(r#"{"model":"openclaw","messages":[{"role":"user","content":"must not invoke"}]}"#),
+    );
+    assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
+    assert_catalogue_unavailability(daemon.http, "disabled");
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    daemon.stop();
+    stop.cancel();
+    executor.block_on(server).expect("role fixture joined");
+}
+
+#[test]
 fn bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection() {
+    verify_native_provider_selection(&[
+        ProviderFixtureSource::Environment,
+        ProviderFixtureSource::Configuration,
+        ProviderFixtureSource::EditedModel,
+        ProviderFixtureSource::ModelAliases,
+    ]);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires an explicitly built CLI path via GTA_CLAW_TEST_PROVIDER_CLI; runs only isolated loopback fixtures"]
+fn bound_cli_provider_model_prepare_apply_and_daemon_start_use_the_saved_selection() {
+    verify_native_provider_selection(&[ProviderFixtureSource::CliModel]);
+}
+
+fn verify_native_provider_selection(sources: &[ProviderFixtureSource]) {
     use axum::extract::Json;
     use axum::http::HeaderMap;
     use axum::response::IntoResponse;
@@ -1816,11 +2257,14 @@ fn bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection(
         .enable_all()
         .build()
         .expect("fixture runtime");
-    for (provider, completion_api) in [
-        ("openai", None),
-        ("anthropic", None),
-        ("openai", Some("responses")),
-    ] {
+    for (provider, completion_api, provider_source) in sources.iter().flat_map(|source| {
+        [
+            ("openai", None, *source),
+            ("anthropic", None, *source),
+            ("openai", Some("responses"), *source),
+        ]
+    }) {
+        let typed_provider = provider_source != ProviderFixtureSource::Environment;
         let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
         let models = Arc::clone(&requests);
         let completions = Arc::clone(&requests);
@@ -1891,7 +2335,7 @@ fn bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection(
         ));
         let origin = format!("http://{address}");
         let endpoint = format!("{origin}/{}", if provider == "openai" { "v1/" } else { "" });
-        let mut daemon = Running::start_at_with_workspace(
+        let mut daemon = Running::start_at_with_provider_source(
             root,
             "native-fixture",
             false,
@@ -1900,7 +2344,82 @@ fn bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection(
             None,
             Some((provider, &endpoint, &origin, completion_api)),
             false,
+            None,
+            None,
+            provider_source,
         );
+        let status = request(
+            daemon.http,
+            "POST",
+            "/api/v1/admin/rpc",
+            Some("operator-token"),
+            Some(r#"{"method":"status","params":{}}"#),
+        );
+        let status: Value =
+            serde_json::from_str(response_body(&status)).expect("provider source status");
+        let selection = &status["payload"]["configuration"]["providerSelection"];
+        assert_eq!(
+            selection["source"],
+            if typed_provider {
+                "core.provider"
+            } else {
+                "GTA_CLAW_PROVIDER_POLICY"
+            }
+        );
+        assert_eq!(selection["kind"], provider);
+        assert_eq!(selection["disabled"], false);
+        if typed_provider {
+            assert_eq!(selection["credentialOrigin"], origin);
+            assert_eq!(selection["requestTimeoutMs"], 5000);
+            let original = std::fs::read_to_string(&daemon.config).expect("typed source file");
+            let baseline_requests = requests.lock().expect("request witness").len();
+            for (field, value) in [
+                ("model", json!("other-fixture")),
+                ("api_key", json!("env:MUST_NOT_RESOLVE_DURING_RELOAD")),
+                ("request_timeout_ms", json!(1000)),
+                ("max_observed_turn_tokens", json!(0)),
+                (
+                    "model_aliases",
+                    json!([{"alias":"reload-alias","model":"native-fixture"}]),
+                ),
+            ] {
+                let mut candidate: Value = json5::from_str(&original).expect("typed source JSON5");
+                candidate["core"]["provider"][field] = value;
+                std::fs::write(&daemon.config, candidate.to_string())
+                    .expect("owned reload candidate");
+                let refused = daemon.control("reload");
+                assert!(
+                    refused.contains("restart") && !refused.contains("reloaded"),
+                    "{field}: {refused}"
+                );
+                let current = request(
+                    daemon.http,
+                    "POST",
+                    "/api/v1/admin/rpc",
+                    Some("operator-token"),
+                    Some(r#"{"method":"status","params":{}}"#),
+                );
+                let current: Value =
+                    serde_json::from_str(response_body(&current)).expect("current source status");
+                assert_eq!(
+                    current["payload"]["configGeneration"], status["payload"]["configGeneration"],
+                    "{field}"
+                );
+                assert_eq!(
+                    current["payload"]["providerGeneration"],
+                    status["payload"]["providerGeneration"],
+                    "{field}"
+                );
+                assert_eq!(current["payload"]["model"], "native-fixture");
+                assert_eq!(
+                    requests.lock().expect("no extra network").len(),
+                    baseline_requests,
+                    "{field}"
+                );
+            }
+            std::fs::write(&daemon.config, original).expect("restore owned source fixture");
+        }
+        assert!(!status.to_string().contains("NATIVE_PROVIDER_KEY"));
         let response = request(
             daemon.http,
             "POST",
@@ -1915,6 +2434,46 @@ fn bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection(
             response.contains(&format!("native {provider} answer")),
             "{response}"
         );
+        if provider_source == ProviderFixtureSource::ModelAliases {
+            for path in ["/v1/chat/completions", "/v1/responses"] {
+                let body = if path == "/v1/responses" {
+                    json!({"model":"work-native","input":"hello using an explicit alias"})
+                } else {
+                    json!({"model":"work-native","messages":[{"role":"user","content":"hello using an explicit alias"}]})
+                };
+                let allowed = request(
+                    daemon.http,
+                    "POST",
+                    path,
+                    Some("operator-token"),
+                    Some(&body.to_string()),
+                );
+                assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+                assert!(
+                    allowed.contains("native-fixture"),
+                    "response records the exact model: {allowed}"
+                );
+                assert!(
+                    !allowed.contains("work-native"),
+                    "alias is not the provider response identity"
+                );
+            }
+            let before_denied = requests.lock().expect("request witness").len();
+            for model in [
+                "work-other",
+                "other-fixture",
+                "WORK-NATIVE",
+                "missing-alias",
+            ] {
+                let refused = request(daemon.http, "POST", "/v1/chat/completions", Some("operator-token"),
+                    Some(&json!({"model":model,"messages":[{"role":"user","content":"must not send"}]}).to_string()));
+                assert!(refused.starts_with("HTTP/1.1 400"), "{model}: {refused}");
+            }
+            assert_eq!(
+                requests.lock().expect("no denied provider requests").len(),
+                before_denied
+            );
+        }
         let rejected = request(
             daemon.http,
             "POST",
@@ -2022,8 +2581,22 @@ fn bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection(
             use claw_security::identity::DeviceIdentity;
             use getrandom::{SysRng, rand_core::UnwrapErr};
 
-            let identity = Arc::new(DeviceIdentity::generate(&mut UnwrapErr(SysRng)));
             let endpoint = url::Url::parse(&format!("ws://{}/",daemon.gateway)).expect("owned gateway");
+            let export_profile = if provider_source == ProviderFixtureSource::CliModel {
+                let root = daemon.root.join("gta-claw-device-locks-v1");
+                std::fs::create_dir_all(&root).expect("owned CLI coordination directory");
+                let alias = format!("export-{}", NEXT_ROOT.fetch_add(1, Ordering::Relaxed));
+                let profile = claw_platform::identity::DeviceProfile::new(endpoint.as_str(), &alias, &root).expect("isolated device profile");
+                let store = claw_platform::identity::native_store().expect("native fixture identity store");
+                Some((alias, profile, store))
+            } else {
+                None
+            };
+            let identity = Arc::new(if let Some((_, profile, store)) = &export_profile {
+                profile.load_or_create(store.as_ref()).expect("owned fixture identity")
+            } else {
+                DeviceIdentity::generate(&mut UnwrapErr(SysRng))
+            });
             let config = || {
                 let mut config = GatewayClientConfig::new(endpoint.clone(),Arc::clone(&identity));
                 config.reconnect = ReconnectPolicy::Never;
@@ -2041,6 +2614,70 @@ fn bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection(
             assert!(approved.starts_with("HTTP/1.1 200"));
             let (client,mut events) = GatewayClient::start(config()).expect("paired client");
             client.wait_ready().await.expect("gateway ready");
+            let prior_requests = requests.lock().expect("model request witness").len();
+            let catalogue = client.request(
+                RequestId::new("native-model-catalogue",4096).expect("request ID"),
+                GatewayMethodName::Core(resolve_core_method("models.list").expect("model list")),
+                &json!({"nativeCatalogPage":{"offset":0}}),
+            ).await.expect("cached model catalogue");
+            assert!(catalogue.ok(),"read scope permits explicit native catalogue");
+            let catalogue:Value = serde_json::from_str(catalogue.payload().value().expect("catalogue").as_json()).expect("catalogue JSON");
+            claw_protocol::native_models::validate_page(&catalogue.to_string(),0,None).expect("actual daemon page matches shared client validation");
+            assert_eq!(catalogue["provider"],provider);
+            assert_eq!(catalogue["selectedModel"],"native-fixture");
+            assert_eq!(catalogue["selectionPinned"],true);
+            assert_eq!(catalogue["source"],"provider_sdk_catalogue");
+            assert_eq!(catalogue["liveCapabilitiesVerified"],false);
+            assert_eq!(catalogue["networkContacted"],false);
+            assert_eq!(catalogue["totalModels"],2);
+            assert!(catalogue["models"][0]["contextWindow"].is_null());
+            if let Some((alias, profile, store)) = &export_profile {
+                let executable = std::env::var_os("GTA_CLAW_TEST_PROVIDER_CLI")
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_absolute() && path.is_file())
+                    .expect("explicit built CLI executable");
+                let destination = daemon.config.parent().expect("owned root").join("model-catalogue.json");
+                let mut command = Command::new(executable);
+                command.env_clear();
+                command.env("LOCALAPPDATA", &daemon.root);
+                for name in ["SystemRoot", "SystemDrive", "WINDIR"] {
+                    if let Some(value) = std::env::var_os(name) {
+                        command.env(name, value);
+                    }
+                }
+                let mut child = command.args(["gateway", "export-models", "--endpoint", endpoint.as_str().trim_end_matches('/'), "--device-profile", alias, "--token-stdin", "--json", "--timeout-ms", "10000", "--destination"])
+                    .arg(&destination).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                    .spawn().expect("actual CLI model export");
+                child.stdin.take().expect("owned fixture token input").write_all(b"operator-token\n").expect("fixture token");
+                let output = child.wait_with_output().expect("model export process");
+                assert!(profile.forget(store.as_ref()).expect("delete only owned fixture identity"));
+                assert!(output.status.success(), "{provider}: {} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                let receipt: Value = serde_json::from_slice(&output.stdout).expect("export receipt");
+                assert_eq!(receipt["result"]["snapshotVerified"], true);
+                assert_eq!(receipt["result"]["sha256"], catalogue["sha256"]);
+                assert_eq!(receipt["result"]["fileCreated"], true);
+                let archive: Value = serde_json::from_slice(&std::fs::read(&destination).expect("new archive")).expect("archive JSON");
+                assert_eq!(archive["snapshot"], catalogue);
+                claw_protocol::native_models::validate_snapshot(&archive["snapshot"].to_string(), catalogue["sha256"].as_str().expect("digest")).expect("actual daemon full catalogue");
+                assert_eq!(requests.lock().expect("export must not contact provider").len(), prior_requests);
+                std::fs::remove_file(destination).expect("owned catalogue cleanup");
+            }
+            if provider_source == ProviderFixtureSource::ModelAliases {
+                let entries = catalogue["models"].as_array().expect("model entries");
+                assert_eq!(entries.iter().find(|entry| entry["id"] == "native-fixture").expect("exact entry")["aliases"], json!(["work-native"]));
+                assert_eq!(entries.iter().find(|entry| entry["id"] == "other-fixture").expect("other entry")["aliases"], json!(["work-other"]));
+            }
+            for (ordinal, parameters) in [json!({"nativeCatalogPage":{"offset":0},"refresh":true}),json!({"nativeCatalogPage":{"offset":1}})].into_iter().enumerate() {
+                let refused = client.request(RequestId::new(format!("invalid-native-catalogue-{ordinal}"),4096).expect("request ID"),GatewayMethodName::Core(resolve_core_method("models.list").expect("model list")),&parameters).await.expect("rejection response");
+                assert!(!refused.ok());
+            }
+            assert_eq!(requests.lock().expect("no model refresh").len(),prior_requests);
+            let refreshed=client.request(RequestId::new("explicit-catalogue-refresh",4096).expect("request ID"),
+                GatewayMethodName::Core(resolve_core_method("models.list").expect("model list")),
+                &json!({"nativeCatalogRefresh":{"sha256":catalogue["sha256"]}})).await.expect("refresh response");
+            assert!(refreshed.ok());
+            claw_protocol::native_models::validate_refresh(refreshed.payload().value().expect("refresh receipt").as_json(),catalogue["sha256"].as_str().expect("requested digest")).expect("valid refresh receipt");
+            assert_eq!(requests.lock().expect("one explicit directory request").len(),prior_requests+1);
             let mut runs = Vec::new();
             let mut foreign_page = None;
             for (ordinal,prompt) in ["truncate-native-request","filter-native-request"].into_iter().enumerate() {
@@ -2158,6 +2795,13 @@ fn bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection(
             assert!(request(daemon.http,"POST","/api/v1/admin/rpc",Some("operator-token"),Some(&approval)).starts_with("HTTP/1.1 200"));
             let (foreign_client,_) = GatewayClient::start(foreign_config()).expect("paired other device");
             foreign_client.wait_ready().await.expect("other device ready");
+            let before_readonly_refresh=requests.lock().expect("network witness").len();
+            let readable=foreign_client.request(RequestId::new("readonly-catalogue",4096).expect("request ID"),GatewayMethodName::Core(resolve_core_method("models.list").expect("models")),&json!({"nativeCatalogPage":{"offset":0}})).await.expect("readonly catalogue");
+            assert!(readable.ok());
+            let readable:Value=serde_json::from_str(readable.payload().value().expect("catalogue").as_json()).expect("JSON");
+            let readonly_refresh=foreign_client.request(RequestId::new("readonly-refresh",4096).expect("request ID"),GatewayMethodName::Core(resolve_core_method("models.list").expect("models")),&json!({"nativeCatalogRefresh":{"sha256":readable["sha256"]}})).await.expect("readonly refusal");
+            assert!(!readonly_refresh.ok());
+            assert_eq!(requests.lock().expect("no denied network").len(),before_readonly_refresh);
             let foreign_page = foreign_page.expect("owned page parameters");
             let denied_accounting = foreign_client.request(
                 RequestId::new("foreign-accounting-page",4096).expect("accounting request id"),
@@ -2178,10 +2822,14 @@ fn bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection(
             (runs,identity.device_id().gateway_wire_id())
         });
         let seen = requests.lock().expect("fixture requests");
-        assert_eq!(seen.iter().filter(|(kind, _)| kind == "models").count(), 3);
+        assert_eq!(seen.iter().filter(|(kind, _)| kind == "models").count(), 4);
         assert_eq!(
             seen.iter().filter(|(kind, _)| kind == "completion").count(),
-            9
+            if provider_source == ProviderFixtureSource::ModelAliases {
+                11
+            } else {
+                9
+            }
         );
         assert!(
             seen.iter()
@@ -3523,6 +4171,90 @@ fn telemetry_file_open_failure_is_fatal_before_readiness() {
 }
 
 #[test]
+fn bound_text_model_rejects_explicit_incompatible_inputs_without_external_reads() {
+    use serde_json::json;
+    let daemon = Running::start("gpt-4o");
+    let images = std::net::TcpListener::bind("127.0.0.1:0").expect("unused image witness");
+    images
+        .set_nonblocking(true)
+        .expect("nonblocking image witness");
+    let image_url = format!(
+        "http://{}/private-image.png",
+        images.local_addr().expect("image address")
+    );
+    for streamed in [false, true] {
+        for scenario in [
+            "tools",
+            "image",
+            "json-mode",
+            "output-limit",
+            "unknown-model",
+        ] {
+            let mut body = json!({"model":"openclaw","stream":streamed,"messages":[{"role":"user","content":"admission fixture"}]});
+            match scenario {
+                "tools" => {
+                    body["tools"] = json!([{"type":"function","function":{"name":"lookup","description":"fixture","parameters":{"type":"object","properties":{},"additionalProperties":false}}}]);
+                }
+                "image" => {
+                    body["messages"][0]["content"] = json!([{"type":"text","text":"inspect image"},{"type":"image_url","image_url":{"url":image_url}}]);
+                }
+                "json-mode" => body["response_format"] = json!({"type":"json_object"}),
+                "output-limit" => body["max_tokens"] = json!(4097),
+                _ => body["model"] = json!("absent-model"),
+            }
+            let response = request(
+                daemon.http,
+                "POST",
+                "/v1/chat/completions",
+                Some("operator-token"),
+                Some(&body.to_string()),
+            );
+            if !streamed {
+                assert!(
+                    response.starts_with("HTTP/1.1 400"),
+                    "{scenario}: {response}"
+                );
+            }
+            assert!(
+                response.contains("invalid_request"),
+                "{scenario}, streamed={streamed}: {response}"
+            );
+            assert!(
+                !response.contains("smoke:"),
+                "rejected request cannot produce model output"
+            );
+            assert!(
+                matches!(images.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock)
+            );
+        }
+    }
+    let accepted = request(
+        daemon.http,
+        "POST",
+        "/v1/chat/completions",
+        Some("operator-token"),
+        Some(
+            r#"{"model":"openclaw","max_tokens":4096,"messages":[{"role":"user","content":"allowed text"}]}"#,
+        ),
+    );
+    assert!(
+        accepted.starts_with("HTTP/1.1 200") && accepted.contains("smoke: user: allowed text"),
+        "{accepted}"
+    );
+    let status = request(
+        daemon.http,
+        "POST",
+        "/api/v1/admin/rpc",
+        Some("operator-token"),
+        Some(r#"{"method":"status","params":{}}"#),
+    );
+    let status: serde_json::Value = serde_json::from_str(response_body(&status)).expect("status");
+    assert_eq!(status["payload"]["model"], "gpt-4o");
+    assert_eq!(status["payload"]["providerGeneration"], 1);
+    daemon.stop();
+}
+
+#[test]
 fn bound_http_is_ready_and_dispatches_to_the_composed_provider() {
     let daemon = Running::start("gpt-4o");
 
@@ -3923,6 +4655,8 @@ fn device_flow_mode_serves_legacy_onboarding_before_provider_authentication() {
     let ready = request(legacy, "GET", "/ready", Some("operator-token"), None);
     assert!(ready.starts_with("HTTP/1.1 503"), "{ready}");
     assert!(ready.contains(r#""provider""#), "{ready}");
+    let http = field(&service, "http").parse().expect("main HTTP address");
+    assert_catalogue_unavailability(http, "authentication_pending");
 
     writeln!(stdin, "shutdown").expect("shutdown is written");
     stdin.flush().expect("shutdown is flushed");

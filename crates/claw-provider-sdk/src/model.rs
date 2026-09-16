@@ -884,9 +884,258 @@ pub struct ModelDescriptor {
     pub capabilities: CapabilitySet,
 }
 
+/// Explicit, case-sensitive aliases bound to one validated model catalogue.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelAliasTable {
+    exact: std::collections::BTreeSet<ModelId>,
+    aliases: std::collections::BTreeMap<ModelId, ModelId>,
+}
+
+/// Why an explicit model alias table could not be bound to a catalogue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelAliasError {
+    /// The catalogue exceeds the supported 1024 models.
+    CatalogueTooLarge,
+    /// The catalogue has more than one entry with the same exact identifier.
+    DuplicateModel,
+    /// More than 128 aliases were supplied.
+    TooManyAliases,
+    /// Alias names and targets together exceed 4096 UTF-8 bytes.
+    AliasesTooLarge,
+    /// An alias was supplied more than once, even with the same target.
+    DuplicateAlias,
+    /// An alias would hide an exact model identifier.
+    ExactModelCollision,
+    /// An alias would hide a reserved default-model selector.
+    ReservedAlias,
+    /// A target is absent from the catalogue; alias chains are not resolved.
+    UnknownTarget,
+}
+
+impl std::fmt::Display for ModelAliasError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CatalogueTooLarge => "model alias catalogue exceeds 1024 models",
+            Self::DuplicateModel => "model alias catalogue contains a duplicate exact identifier",
+            Self::TooManyAliases => "model alias table exceeds 128 entries",
+            Self::AliasesTooLarge => "model alias names and targets exceed 4096 UTF-8 bytes",
+            Self::DuplicateAlias => "model alias is declared more than once",
+            Self::ExactModelCollision => "model alias collides with an exact catalogue identifier",
+            Self::ReservedAlias => "model alias collides with a reserved default-model selector",
+            Self::UnknownTarget => "model alias target is not an exact catalogue identifier",
+        })
+    }
+}
+
+impl std::error::Error for ModelAliasError {}
+
+impl ModelAliasTable {
+    /// Binds explicit aliases to exact models without provider or account fallback.
+    ///
+    /// # Errors
+    /// Rejects oversized or duplicate catalogues, excessive or duplicate aliases,
+    /// aliases shadowing exact identifiers, and targets absent from this catalogue.
+    pub fn new(
+        catalogue: &[ModelDescriptor],
+        aliases: impl IntoIterator<Item = (ModelId, ModelId)>,
+    ) -> Result<Self, ModelAliasError> {
+        if catalogue.len() > 1024 {
+            return Err(ModelAliasError::CatalogueTooLarge);
+        }
+        let exact = catalogue
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if exact.len() != catalogue.len() {
+            return Err(ModelAliasError::DuplicateModel);
+        }
+        let mut bound = std::collections::BTreeMap::new();
+        let mut bytes = 0_usize;
+        for (alias, target) in aliases {
+            if bound.len() == 128 {
+                return Err(ModelAliasError::TooManyAliases);
+            }
+            bytes = bytes
+                .saturating_add(alias.as_str().len())
+                .saturating_add(target.as_str().len());
+            if bytes > 4096 {
+                return Err(ModelAliasError::AliasesTooLarge);
+            }
+            if exact.contains(&alias) {
+                return Err(ModelAliasError::ExactModelCollision);
+            }
+            if alias.as_str() == "openclaw" || alias.as_str().starts_with("openclaw/") {
+                return Err(ModelAliasError::ReservedAlias);
+            }
+            if !exact.contains(&target) {
+                return Err(ModelAliasError::UnknownTarget);
+            }
+            if bound.insert(alias, target).is_some() {
+                return Err(ModelAliasError::DuplicateAlias);
+            }
+        }
+        Ok(Self {
+            exact,
+            aliases: bound,
+        })
+    }
+
+    /// Returns the exact identifier for an exact name or a configured alias.
+    #[must_use]
+    pub fn resolve(&self, name: &ModelId) -> Option<&ModelId> {
+        self.exact.get(name).or_else(|| self.aliases.get(name))
+    }
+
+    /// Whether the name denotes an explicit alias rather than an exact identifier.
+    #[must_use]
+    pub fn is_alias(&self, name: &ModelId) -> bool {
+        self.aliases.contains_key(name)
+    }
+
+    /// Returns the explicit alias-to-exact pairs in stable alias order.
+    pub fn aliases(&self) -> impl Iterator<Item = (&ModelId, &ModelId)> {
+        self.aliases.iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_aliases_bind_exactly_without_case_folding_chains_or_fallback() {
+        let exact = ModelId::new("provider/model@2026").expect("exact model");
+        let other = ModelId::new("other-model").expect("second model");
+        let catalogue = [exact.clone(), other.clone()].map(|id| ModelDescriptor {
+            id,
+            display_name: None,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: CapabilitySet::EMPTY,
+        });
+        let alias = ModelId::new("work").expect("alias");
+        let table = ModelAliasTable::new(&catalogue, [(alias.clone(), exact.clone())])
+            .expect("explicit one-hop alias");
+        assert_eq!(table.resolve(&alias), Some(&exact));
+        assert_eq!(table.resolve(&exact), Some(&exact));
+        assert_eq!(table.resolve(&other), Some(&other));
+        assert_eq!(
+            table.resolve(&ModelId::new("WORK").expect("case-sensitive")),
+            None
+        );
+        assert!(table.is_alias(&alias));
+        assert!(!table.is_alias(&exact));
+        assert_eq!(table.aliases().collect::<Vec<_>>(), vec![(&alias, &exact)]);
+        assert_eq!(
+            ModelAliasTable::new(&catalogue, [(other, exact.clone())]),
+            Err(ModelAliasError::ExactModelCollision)
+        );
+        assert_eq!(
+            ModelAliasTable::new(
+                &catalogue,
+                [(ModelId::new("openclaw").expect("reserved"), exact.clone())]
+            ),
+            Err(ModelAliasError::ReservedAlias)
+        );
+        assert_eq!(
+            ModelAliasTable::new(
+                &catalogue,
+                [(
+                    ModelId::new("openclaw/custom-agent").expect("reserved route"),
+                    exact.clone()
+                )]
+            ),
+            Err(ModelAliasError::ReservedAlias)
+        );
+        assert_eq!(
+            ModelAliasTable::new(
+                &catalogue,
+                [
+                    (alias.clone(), exact.clone()),
+                    (alias.clone(), exact.clone())
+                ]
+            ),
+            Err(ModelAliasError::DuplicateAlias)
+        );
+        assert_eq!(
+            ModelAliasTable::new(
+                &catalogue,
+                [(alias.clone(), ModelId::new("missing").expect("missing"))]
+            ),
+            Err(ModelAliasError::UnknownTarget)
+        );
+        assert_eq!(
+            ModelAliasTable::new(
+                &catalogue,
+                [
+                    (ModelId::new("chain").expect("alias"), alias.clone()),
+                    (alias.clone(), exact.clone())
+                ]
+            ),
+            Err(ModelAliasError::UnknownTarget)
+        );
+        assert_eq!(
+            ModelAliasTable::new(&catalogue[1..], [(alias.clone(), exact.clone())]),
+            Err(ModelAliasError::UnknownTarget)
+        );
+        let mut collision = catalogue.to_vec();
+        collision.push(ModelDescriptor {
+            id: alias.clone(),
+            ..catalogue[0].clone()
+        });
+        assert_eq!(
+            ModelAliasTable::new(&collision, [(alias, exact)]),
+            Err(ModelAliasError::ExactModelCollision)
+        );
+    }
+
+    #[test]
+    fn model_aliases_refuse_ambiguous_and_oversized_inputs() {
+        let model = ModelDescriptor {
+            id: ModelId::new("model").expect("model"),
+            display_name: None,
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: CapabilitySet::EMPTY,
+        };
+        let aliases = |count| {
+            (0..count).map(|index| {
+                (
+                    ModelId::new(format!("alias-{index}")).expect("alias"),
+                    model.id.clone(),
+                )
+            })
+        };
+        assert!(ModelAliasTable::new(std::slice::from_ref(&model), aliases(128)).is_ok());
+        assert_eq!(
+            ModelAliasTable::new(std::slice::from_ref(&model), aliases(129)),
+            Err(ModelAliasError::TooManyAliases)
+        );
+        let large = (0..20).map(|index| {
+            (
+                ModelId::new(format!("{}{index}", "a".repeat(240))).expect("long alias"),
+                model.id.clone(),
+            )
+        });
+        assert_eq!(
+            ModelAliasTable::new(std::slice::from_ref(&model), large),
+            Err(ModelAliasError::AliasesTooLarge)
+        );
+        assert_eq!(
+            ModelAliasTable::new(&[model.clone(), model.clone()], []),
+            Err(ModelAliasError::DuplicateModel)
+        );
+        assert_eq!(
+            ModelAliasTable::new(&vec![model; 1025], []),
+            Err(ModelAliasError::CatalogueTooLarge)
+        );
+        assert_eq!(
+            ModelAliasTable::new(&[], [])
+                .expect("empty catalogue")
+                .resolve(&ModelId::new("missing").expect("id")),
+            None
+        );
+    }
 
     #[test]
     fn provider_identifiers_reject_separators_and_overlong_values() {

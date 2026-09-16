@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-explicit-single-hop-model-aliases",
+  "capturedOn": "2026-09-16",
+  "baseCommit": "30f97d0f53c1973a9e55a3bcef9469bd5ade8037",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "taskIds": ["M3-07.01", "M3-07.03", "M3-07.04", "M5-01", "M5-02.02"],
+  "platform": "windows-x86_64",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "developmentPublished": false,
+  "cargoLockSha256": "03ae0a54ee93bb13ccaf84f53747742ef5fd48103ef6032b07e4793baeae7834",
+  "desktopCargoLockSha256": "010bfa56d6a6e3d3e6479c705dc6da6e6065ea8471d542c837eaa025459bbd20",
+  "sourceFiles": [
+    { "path": "crates/claw-provider-sdk/src/lib.rs", "sha256": "04219412bbc94f570b9f6f567a0e741018475935c389e310e1606ba4a9ccb87a" },
+    { "path": "crates/claw-provider-sdk/src/model.rs", "sha256": "4372df6692ae15726d2c516b6e7bc6a581f45f26307430865dca7bd9743ae6d8" },
+    { "path": "crates/claw-config/src/lib.rs", "sha256": "589f0aef67ea5226c9939d1ea810493b007598f3d2df4dbacd45bc1075f06194" },
+    { "path": "crates/claw-config/src/model.rs", "sha256": "b741010a555d2697c03c549d060c6bdc530040686cabc03220d54547b9f57a13" },
+    { "path": "crates/claw-config/src/wire.rs", "sha256": "9b0b051576bbbe54a2a4371741dede22a9921307a884e9f68d7af1854325ff66" },
+    { "path": "crates/claw-config/src/reload.rs", "sha256": "8ca66a0f0d1e27acad8dc384780cbff95435467b46444e1afdc27bf8609b99e0" },
+    { "path": "crates/claw-config/tests/configuration.rs", "sha256": "235f727bdf59af54e2951250095a2ee03e6a72221d3fdede6ca67fc8cbbca8b4" },
+    { "path": "crates/claw-config/tests/layering.rs", "sha256": "074017e85b8b9ea3553bfe3888e9866ef7b2ebacad53003641885095294d0908" },
+    { "path": "crates/claw-http-api/src/ports.rs", "sha256": "50932fafe85f85e717cad52208833715fbd064633848a59f1155a0f1fc26a432" },
+    { "path": "crates/claw-http-api/src/openai.rs", "sha256": "791be1b0006cb3cbb692b8a626d99cbf0f5891e4983394a34bf20053cd27b874" },
+    { "path": "crates/claw-protocol/src/native_models.rs", "sha256": "71bd6533c3bf5c32a6c9d556cbc7ca557d6286c0dbdf27cf0483d1a96c93b82a" },
+    { "path": "apps/gta-claw-daemon/src/adapters/http_api.rs", "sha256": "5dfacaf56838dd72f4905a4ebdb185f3f1c7e866346020acac3c67a5cf90f3f6" },
+    { "path": "apps/gta-claw-daemon/src/production.rs", "sha256": "13bb823029e4c881a944cb78167842cd6cde58eb9c1d6f8f3f2de7f65ecce557" },
+    { "path": "apps/gta-claw-daemon/src/production/native_provider.rs", "sha256": "02e4cc4393c57808fcc589b0238470fa3279db00ce142616436646fdc1ed4f40" },
+    { "path": "apps/gta-claw-daemon/tests/production_composition.rs", "sha256": "ee491a1010eb40bfb6779064c6297321032a2d4872d8f7fe7daebc342a0a1641" },
+    { "path": "apps/gta-claw-cli/tests/gateway_health.rs", "sha256": "8ed52718fc9bf6faba89e5d2a90d6f31a1649f03f8816b111dd032937876923d" },
+    { "path": "apps/gta-claw-tui/src/render.rs", "sha256": "6a3381e152a011edd71f1239b92beedeba054507d8ad2ae3522969e9d575afb1" },
+    { "path": "apps/gta-claw-tui/tests/rendering.rs", "sha256": "7e361d5e280239babbfa13c6493e47cf51d203b498e3535213ee63ca3109e93d" },
+    { "path": "desktop/apps/gta-claw-desktop/src/product_state.rs", "sha256": "8fe22dfa74e09845495852934e01f44466328c4e25e9470256005a4ab022f70e" }
+  ],
+  "checks": [
+    {
+      "command": "cargo +stable test -p claw-config -p claw-http-api -p claw-protocol -p claw-provider-sdk -p gta-claw-cli -p gta-claw-daemon -p gta-claw-tui --all-targets --no-fail-fast --locked --offline -j 1",
+      "result": "passed", "exitCode": 0, "passed": 1015, "failed": 0, "ignored": 9, "testBinaries": 51,
+      "log": "target/native-model-alias-final-tests-20260916.log",
+      "sha256": "22a2f4aed7ba7c9cf792c36d46673c48eb6f17623bbbc596776e297cda646da5"
+    },
+    {
+      "command": "cargo +stable clippy -p claw-config -p claw-http-api -p claw-protocol -p claw-provider-sdk -p gta-claw-cli -p gta-claw-daemon -p gta-claw-tui --all-targets --locked --offline -j 1 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-model-alias-final-clippy-20260916.log",
+      "sha256": "2c694c5887a44337b731c4087c9acd8ad329d17f7fa6333381195f15dd3c6794"
+    },
+    {
+      "command": "cargo +stable check --workspace --all-targets --locked --offline -j 1",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-model-alias-final-check-20260916.log",
+      "sha256": "0d735603bd35155b2eaa8bed5b08225ad042887ba214f66cd7aa852a2e7fd979"
+    },
+    {
+      "command": "cargo +stable test --manifest-path desktop/Cargo.toml --workspace --all-targets --no-fail-fast --locked --offline -j 1 --config profile.test.package.gta-claw-desktop.debug=0 --config profile.test.package.gta-claw-desktop.codegen-units=16",
+      "result": "passed", "exitCode": 0, "passed": 97, "failed": 0, "ignored": 0,
+      "log": "target/native-model-alias-desktop-completed-tests-20260916.log",
+      "sha256": "f95fdbfa330d78d1ab8ebc2e33b7ad99977acb0f634c50e9018f30b8fda4636c"
+    },
+    {
+      "command": "cargo +stable clippy --manifest-path desktop/Cargo.toml --workspace --all-targets --locked --offline -j 1 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-model-alias-desktop-final-clippy-20260916.log",
+      "sha256": "5189b7da9a062116cd053b7111d618974e964a99c0fc901cec0385923ef5c747"
+    }
+  ],
+  "behaviorEvidence": [
+    "model_aliases_bind_exactly_without_case_folding_chains_or_fallback",
+    "model_aliases_refuse_ambiguous_and_oversized_inputs",
+    "provider_model_aliases_are_explicit_bounded_and_preserved_without_changing_identity",
+    "model_alias_requests_preserve_exact_ids_and_pinned_selection_before_provider_calls",
+    "model_alias_catalogue_pages_fit_the_wire_byte_budget_and_preserve_exact_ids",
+    "model_alias_metadata_is_bounded_distinct_and_covered_by_the_catalogue_digest",
+    "bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection",
+    "native_model_catalogue_state_pins_pages_and_does_not_mutate_chat_or_selection"
+  ],
+  "documentation": ["apps/gta-claw-cli/README.md", "docs/usage-guide-en.md", "docs/usage-guide-zh.md"],
+  "notes": [
+    "SDK ModelAliasTable binds at most 128 case-sensitive aliases and 4096 name-plus-target UTF-8 bytes to at most 1024 exact models. No duplicate, exact-name shadowing, openclaw namespace, chain or absent target is accepted",
+    "Closed core.provider.model_aliases configuration preserves exact primary model IDs and provider/account/endpoint identity. Disabled providers reject aliases. Alias edits require restart, and exact-model candidate editing retains the alias table",
+    "Startup and refresh validate against the entire candidate catalogue before publication. Alias collision and deleted-target refresh scenarios preserve the existing catalogue and generation",
+    "Native adapter resolves aliases before fixed-model and capability admission for completion, streaming and embeddings. An alias to another listed model still cannot override the pinned selection. Provider counters confirm rejection precedes generation",
+    "The generic HTTP port previously rejected non-openclaw selectors before the provider adapter. A default-disabled alias resolver admits only explicitly configured native aliases; legacy HTTP contract tests keep arbitrary names rejected",
+    "Twelve source/dialect combinations exercise environment, typed configuration, exact-model candidate and alias configuration across Chat Completions, Responses and Anthropic using isolated real daemon processes and owned local HTTP fixtures",
+    "Optional per-model aliases are configuration metadata included in the existing ordered JSON catalogue digest. Server pages shrink to the actual 16 KiB encoded budget; protocol rejects invalid/duplicate/reserved aliases and collisions present in the page. Complete single-page digests are independently checked; continuations only bind the server snapshot digest",
+    "Thirteen actual CLI catalogue scenarios, TUI bounded rendering and Slint pinned-page state exercise alias metadata without changing exact-ID candidate choices. Existing software-renderer and local-candidate callbacks also pass in the full 97-test desktop run",
+    "New readers accept old pages with no aliases, and no-alias pages retain their representation. Old strict readers may reject alias-bearing pages; this is not a bidirectional compatibility claim",
+    "The first desktop log ends during compilation after user interruption and has no test result. It is retained as target/native-model-alias-desktop-final-tests-20260916.log and is not counted as passed; the separately completed run above owns the 97 passes",
+    "Nine ignored native helper/integration entries are not counted as executed by this batch. Earlier OAuth and MCP native-credential intermittency remains unresolved; passing this seven-package batch does not repair or erase the prior ten-package joint failure",
+    "The base commit changed only GitHub CI while native tests were being finalized. Commit 30f97d0 contains dependency-only CI cleanup, not this alias application development. No cloud account, paid model call, mobile device, deployment, production proxy modification or user configuration mutation occurred"
+  ],
+  "unverified": [
+    "Live per-account capabilities, upstream model deprecation and authenticated model availability",
+    "Full online provider/account switching, retirement and graphically applied configuration",
+    "Exact token accounting, prices, monetary reservations and invoice settlement",
+    "Cross-platform runtime qualification, old strict-client upgrades and original credential intermittency",
+    "Whole-project acceptance; no parent or child task is closed by this alias-only record"
+  ]
+}

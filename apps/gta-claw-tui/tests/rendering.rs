@@ -68,6 +68,229 @@ fn accounting_wraps_without_overlapping_and_does_not_turn_missing_usage_into_zer
 }
 
 #[test]
+fn model_catalogue_rows_wrap_and_keep_unknown_metadata_distinct() {
+    let mut model = AppModel {
+        screen: Screen::Models,
+        model_catalogue: Some(serde_json::json!({
+            "available":true,"provider":"fixture","providerGeneration":2,"selectedModel":"fixture-model","selectionPinned":true,
+            "observedAtMs":123,"offset":0,"endOffset":1,"totalModels":1,"models":[{"id":"fixture-model",
+                "aliases":[format!("{}ALIAS-END", "a".repeat(240))],
+                "displayName":format!("{}MODEL-END", "\u{754c}".repeat(80)),"contextWindow":null,"maxOutputTokens":1024,"advertisedCapabilities":["completion","vision"]}]
+        })),
+        ..AppModel::default()
+    };
+    for width in [20, 40, 80, 120] {
+        for height in [10, 24] {
+            let mut visible = String::new();
+            let mut logical = String::new();
+            for scroll in 0..60 {
+                model.scroll = scroll;
+                let grid = render(&model, width, height, true);
+                assert!(
+                    grid.line(2).contains("[Models]"),
+                    "active tab remains visible"
+                );
+                logical.extend(
+                    grid.line(6)
+                        .chars()
+                        .filter(|character| !character.is_whitespace()),
+                );
+                for row in 6..height - 2 {
+                    assert!(
+                        grid.line(row)
+                            .chars()
+                            .all(|character| !character.is_control())
+                    );
+                    visible.push_str(&grid.line(row));
+                    visible.push('\n');
+                }
+            }
+            assert!(visible.contains("MODEL-END"), "{width}x{height}");
+            assert!(logical.contains("Alias(config):") && logical.contains("ALIAS-END"));
+            assert!(visible.contains("unverified"));
+            assert!(logical.contains("Context:notreported"));
+            assert!(!visible.contains("Context: 0"));
+            assert!(visible.contains("Output: 1024"));
+        }
+    }
+    for reason in [
+        claw_protocol::native_models::CatalogueUnavailableReason::Disabled,
+        claw_protocol::native_models::CatalogueUnavailableReason::AuthenticationPending,
+        claw_protocol::native_models::CatalogueUnavailableReason::NotInitialized,
+        claw_protocol::native_models::CatalogueUnavailableReason::Retired,
+    ] {
+        model.model_catalogue =
+            Some(serde_json::json!({"available":false,"unavailableReason":reason}));
+        for width in [20, 40, 80, 120] {
+            for height in [10, 24] {
+                let mut logical = String::new();
+                for scroll in 0..8 {
+                    model.scroll = scroll;
+                    let grid = render(&model, width, height, true);
+                    logical.extend(
+                        grid.line(6)
+                            .chars()
+                            .filter(|character| !character.is_whitespace()),
+                    );
+                }
+                let expected: String = reason
+                    .to_string()
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect();
+                assert!(logical.contains(&expected), "{width}x{height}: {reason}");
+            }
+        }
+    }
+    assert!(model.transcript.is_empty() && model.pending_acks.is_empty());
+}
+
+#[tokio::test]
+async fn local_configuration_receipts_render_long_ids_without_secrets_or_chat_results() {
+    struct OwnedRoot(std::path::PathBuf);
+    impl Drop for OwnedRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = OwnedRoot(std::env::temp_dir().join(format!(
+            "claw-tui-config-render-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        )));
+    std::fs::create_dir(&root.0).expect("owned render fixture");
+    let source = root.0.join("source.json5");
+    let exact = format!("{}MODEL-END", "m".repeat(240));
+    std::fs::write(&source,serde_json::json!({"schema_version":1,"core":{"role":{"source_url":"http://127.0.0.1:9/role"},
+        "channels":{"teams":{"enabled":false}},"auth":{},"server":{},"logging":{},"sessions":{},"copilot":{},"legacy":{},"updates":{},"admin":{},"network":{},
+        "provider":{"kind":"openai","model":exact,"api_key":"env:DO_NOT_RENDER_REFERENCE"}}}).to_string()).expect("source");
+    let mut model = AppModel {
+        screen: Screen::Models,
+        ..AppModel::default()
+    };
+    model
+        .local_configuration
+        .begin(
+            &serde_json::json!({"action":"inspect","source":source}).to_string(),
+            None,
+        )
+        .expect("local inspect");
+    model.local_configuration.receive().await;
+    for width in [20, 40, 80, 120] {
+        for height in [10, 24] {
+            let mut text = String::new();
+            for scroll in 0..85 {
+                model.scroll = scroll;
+                let grid = render(&model, width, height, true);
+                assert_eq!(grid.width(), width);
+                assert_eq!(grid.height(), height);
+                assert!(grid.line(2).contains("[Models]"));
+                text.extend(
+                    grid.line(6)
+                        .chars()
+                        .filter(|character| !character.is_whitespace()),
+                );
+                for row in 6..height - 2 {
+                    assert!(
+                        grid.line(row)
+                            .chars()
+                            .all(|character| !character.is_control())
+                    );
+                }
+            }
+            assert!(text.contains("SourceSHA256:"), "{width}x{height}");
+            assert!(text.contains("Savedmodel:") && text.contains("MODEL-END"));
+            assert!(!text.contains("DO_NOT_RENDER_REFERENCE"));
+        }
+    }
+    assert!(model.transcript.is_empty() && model.pending_acks.is_empty());
+}
+
+#[test]
+fn accounting_round_details_wrap_with_unknown_and_explicit_zero_kept_distinct() {
+    use claw_protocol::native_accounting::{
+        AccountingResponse, AccountingRound, ObservedTokens, ProviderAccounting,
+    };
+    use gta_claw_tui::gateway::{AccountingPage, AccountingPageRequest};
+    let summary = ProviderAccounting::parse(&serde_json::json!({"available":true,"recordedRounds":2,"completeCounterRounds":1,"partialCounterRounds":0,"unreportedRounds":1,
+        "allPrimaryCountersReported":false,"observedTokens":{"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0},
+        "aggregationOverflow":false,"costCalculated":false,"billingReconciled":false,"recordSource":"terminal_turn","attemptsMayBeUnsent":true})).expect("summary").expect("present");
+    let mut model = AppModel {
+        screen: Screen::Workspace,
+        active_run: Some(("owned".to_owned(), "a".repeat(64))),
+        provider_accounting: Some(summary.clone()),
+        ..AppModel::default()
+    };
+    model.accounting_page = Some(AccountingPage {
+        request: AccountingPageRequest {
+            connection_id: 1,
+            session_id: "owned".to_owned(),
+            run_id: "a".repeat(64),
+            revision: 4,
+            turn: 0,
+            state: RunState::OutcomeUnknown,
+            offset: 0,
+            total_rounds: None,
+            sha256: None,
+            summary: None,
+        },
+        end_offset: 2,
+        next_offset: None,
+        total_rounds: 2,
+        sha256: "b".repeat(64),
+        summary,
+        rounds: vec![
+            AccountingRound {
+                round: 0,
+                response: None,
+            },
+            AccountingRound {
+                round: 1,
+                response: Some(AccountingResponse {
+                    provider: "fixture".to_owned(),
+                    model: format!("{}MODEL-END", "\u{754c}".repeat(80)),
+                    response_id: Some("response-123".to_owned()),
+                    usage_reporting: "complete".to_owned(),
+                    finish_reason: "stop".to_owned(),
+                    observed_tokens: ObservedTokens {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_tokens: 0,
+                        cached_input_tokens: 0,
+                        reasoning_tokens: 0,
+                    },
+                }),
+            },
+        ],
+    });
+    for width in [40, 80, 120] {
+        for height in [10, 24] {
+            let mut visible = String::new();
+            for scroll in 0..90 {
+                model.scroll = scroll;
+                let grid = render(&model, width, height, true);
+                for row in 6..height - 2 {
+                    assert_eq!(
+                        grid.cell(width * 2 / 3, row).expect("separator").symbol,
+                        '|'
+                    );
+                    visible.push_str(&grid.line(row));
+                    visible.push('\n');
+                }
+            }
+            assert!(visible.contains("delivery unknown"), "{width}x{height}");
+            assert!(visible.contains("Tokens (complete): 0"));
+            assert!(visible.contains("MODEL-END"));
+            assert!(visible.contains("response-123"));
+            assert!(model.pending_acks.is_empty());
+        }
+    }
+}
+
+#[test]
 fn composer_tail_keeps_latest_wide_character_input_visible_at_small_widths() {
     let model = AppModel {
         screen: Screen::Workspace,

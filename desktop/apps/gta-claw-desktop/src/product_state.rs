@@ -556,6 +556,18 @@ pub(crate) struct ProductState {
     extensions: Vec<ExtensionSummary>,
     sessions: BTreeMap<String, RunSessionData>,
     native: Option<NativeProjection>,
+    local_configuration: LocalConfigurationState,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LocalConfigurationState {
+    sequence: u64,
+    pending: Option<crate::controller::LocalConfigurationRequest>,
+    inspected: Option<(
+        std::path::PathBuf,
+        claw_platform::configuration::ProviderConfiguration,
+    )>,
+    notice: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -577,14 +589,43 @@ struct NativeProjection {
     queries: std::collections::VecDeque<(&'static str, serde_json::Value)>,
     completed_runs: BTreeMap<String, String>,
     accounting: BTreeMap<String, NativeAccounting>,
+    accounting_request: Option<NativeAccountingRequest>,
+    model_catalogue: Option<serde_json::Value>,
+    model_catalogue_request: Option<serde_json::Value>,
+    model_catalogue_notice: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeAccounting {
     run_id: String,
     revision: u64,
+    turn: Option<u64>,
+    state: RunState,
     connection: crate::controller::ProductConnection,
     report: Option<claw_protocol::native_accounting::ProviderAccounting>,
+    page: Option<NativeAccountingPage>,
+    page_error: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeAccountingPage {
+    offset: usize,
+    end_offset: usize,
+    next_offset: Option<usize>,
+    total_rounds: usize,
+    sha256: String,
+    summary: claw_protocol::native_accounting::ProviderAccounting,
+    rounds: Vec<claw_protocol::native_accounting::AccountingRound>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeAccountingRequest {
+    session: String,
+    params: serde_json::Value,
+    turn: u64,
+    state: RunState,
+    summary: Option<claw_protocol::native_accounting::ProviderAccounting>,
+    total_rounds: Option<usize>,
 }
 
 static EMPTY_DELIVERABLE: DeliverableSummary = DeliverableSummary {
@@ -650,6 +691,7 @@ impl Default for ProductState {
             extensions: demo_extensions(),
             sessions,
             native: None,
+            local_configuration: LocalConfigurationState::default(),
         }
     }
 }
@@ -680,15 +722,26 @@ impl ProductState {
             deliverables: Vec::new(),
             extensions: Vec::new(),
             native: Some(NativeProjection::default()),
+            local_configuration: LocalConfigurationState::default(),
         }
     }
 
     pub(crate) fn apply_native(&mut self, update: crate::controller::ProductUpdate) {
         use crate::controller::ProductUpdate;
+        let update = match update {
+            ProductUpdate::LocalConfiguration { request, result } => {
+                self.apply_local_configuration(request, result);
+                return;
+            }
+            update => update,
+        };
         let Some(native) = &mut self.native else {
             return;
         };
         let generation = match &update {
+            ProductUpdate::LocalConfiguration { .. } => {
+                unreachable!("local file task handled independently")
+            }
             ProductUpdate::Reset { generation } | ProductUpdate::Unavailable { generation } => {
                 *generation
             }
@@ -714,8 +767,13 @@ impl ProductState {
             return;
         }
         match update {
+            ProductUpdate::LocalConfiguration { .. } => {
+                unreachable!("local file task handled independently")
+            }
             ProductUpdate::Reset { generation } => {
+                let local = std::mem::take(&mut self.local_configuration);
                 *self = Self::native();
+                self.local_configuration = local;
                 self.native.as_mut().expect("native mode").generation = generation;
             }
             ProductUpdate::Ready { connection } => {
@@ -731,6 +789,10 @@ impl ProductState {
                     native.queries.clear();
                     native.history_requests.clear();
                     native.active_runs.clear();
+                    native.accounting_request = None;
+                    native.model_catalogue = None;
+                    native.model_catalogue_request = None;
+                    native.model_catalogue_notice = None;
                 }
                 native.connection = Some(connection);
                 native.ready = true;
@@ -769,6 +831,14 @@ impl ProductState {
                 definitive,
                 ..
             } => {
+                if method == "models.list" {
+                    self.fail_native_model_catalogue(&params);
+                    return;
+                }
+                if method == "agent.wait" && params.get("accountingPage").is_some() {
+                    self.fail_native_accounting(&params);
+                    return;
+                }
                 let session = params["sessionKey"]
                     .as_str()
                     .unwrap_or(self.selected_run.id.as_str())
@@ -869,6 +939,14 @@ impl ProductState {
         params: &serde_json::Value,
         payload: &serde_json::Value,
     ) {
+        if method == "models.list" {
+            self.native_model_catalogue_response(params, payload);
+            return;
+        }
+        if method == "agent.wait" && params.get("accountingPage").is_some() {
+            self.native_accounting_response(params, payload);
+            return;
+        }
         if method == "sessions.get" {
             let Some(session) = params["sessionKey"].as_str() else {
                 return;
@@ -1045,8 +1123,12 @@ impl ProductState {
                         NativeAccounting {
                             run_id: run.to_owned(),
                             revision,
+                            turn: payload["turn"].as_u64(),
+                            state: native_run_state(status),
                             connection,
                             report: accounting,
+                            page: None,
+                            page_error: None,
                         },
                     );
             }
@@ -1489,11 +1571,24 @@ impl ProductState {
         }
     }
 
+    pub(crate) fn product_updates_lost(&mut self) {
+        self.native_unavailable();
+        if self.local_configuration.pending.take().is_some() {
+            self.local_configuration.inspected = None;
+            "Local configuration result is unknown; preserve any candidate file and inspect the source again"
+                .clone_into(&mut self.local_configuration.notice);
+        }
+    }
+
     pub(crate) fn native_unavailable(&mut self) {
         if let Some(native) = &mut self.native {
             native.ready = false;
             native.memory_results.clear();
             native.accounting.clear();
+            native.accounting_request = None;
+            native.model_catalogue = None;
+            native.model_catalogue_request = None;
+            native.model_catalogue_notice = None;
             for (session, params) in &native.pending_submissions {
                 if params["message"]
                     .as_str()
@@ -1506,6 +1601,604 @@ impl ProductState {
             native.approvals.clear();
             native.queries.clear();
             native.history_requests.clear();
+        }
+    }
+
+    pub(crate) fn model_choice_binding(&self) -> String {
+        self.native
+            .as_ref()
+            .filter(|native| native.ready && native.model_catalogue_request.is_none())
+            .and_then(|native| native.connection.zip(native.model_catalogue.as_ref()))
+            .filter(|(_, page)| page["available"] == true)
+            .map_or_else(String::new, |(connection, page)| {
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    connection.generation,
+                    connection.epoch,
+                    page["offset"],
+                    page["endOffset"],
+                    page["sha256"].as_str().unwrap_or("")
+                )
+            })
+    }
+
+    pub(crate) fn model_choices(&self) -> Vec<String> {
+        if self.model_choice_binding().is_empty() {
+            return Vec::new();
+        }
+        self.native
+            .as_ref()
+            .and_then(|native| native.model_catalogue.as_ref())
+            .and_then(|page| page["models"].as_array())
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(|model| model["id"].as_str())
+                    .map(native_text)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) const fn local_configuration_busy(&self) -> bool {
+        self.local_configuration.pending.is_some()
+    }
+
+    pub(crate) fn local_configuration_text(&self) -> String {
+        let mut lines = vec![self.local_configuration.notice.clone()];
+        if let Some((_, source)) = &self.local_configuration.inspected {
+            lines.push(format!("Source SHA256: {}", source.source_sha256));
+            if let Some(provider) = source.snapshot.core().provider() {
+                lines.push(format!("Saved provider: {:?}", provider.kind()));
+                lines.push(format!(
+                    "Saved model: {}",
+                    native_text(provider.model().unwrap_or("disabled"))
+                ));
+            } else {
+                lines.push("Saved provider: legacy/default selection".to_owned());
+            }
+        }
+        lines.join("\n")
+    }
+
+    pub(crate) fn begin_local_configuration(
+        &mut self,
+        action: i32,
+        source: &str,
+        destination: &str,
+        binding: &str,
+        selected: i32,
+    ) -> Result<crate::controller::LocalConfigurationRequest, &'static str> {
+        use crate::controller::{LocalConfigurationAction, LocalConfigurationRequest};
+        if self.local_configuration_busy() {
+            return Err("Local configuration operation is already pending");
+        }
+        if source.len() > 4096 || source.chars().any(char::is_control) {
+            return Err("Source path is invalid");
+        }
+        let source = std::path::PathBuf::from(source);
+        if !source.is_absolute() {
+            return Err("Choose an explicit local source file");
+        }
+        let action = match action {
+            0 => LocalConfigurationAction::Inspect,
+            1 => {
+                if binding.is_empty() || binding != self.model_choice_binding() {
+                    return Err(
+                        "Model choices changed; read the current catalogue before selecting",
+                    );
+                }
+                let page = self
+                    .native
+                    .as_ref()
+                    .and_then(|native| native.model_catalogue.as_ref())
+                    .ok_or("Model catalogue is unavailable")?;
+                let model = page["models"]
+                    .as_array()
+                    .and_then(|models| {
+                        usize::try_from(selected)
+                            .ok()
+                            .and_then(|index| models.get(index))
+                    })
+                    .and_then(|model| model["id"].as_str())
+                    .ok_or("Select a model from the current page")?;
+                let (path, configuration) = self
+                    .local_configuration
+                    .inspected
+                    .as_ref()
+                    .filter(|(path, _)| *path == source)
+                    .ok_or("Inspect the selected local source before preparing a candidate")?;
+                let provider = configuration
+                    .snapshot
+                    .core()
+                    .provider()
+                    .filter(|provider| provider.model().is_some())
+                    .ok_or("Local source has no explicit active provider")?;
+                if provider.catalogue_provider_id() != page["provider"].as_str()
+                    || provider.model() != page["selectedModel"].as_str()
+                {
+                    return Err(
+                        "The local source provider/model differs from the observed catalogue selection",
+                    );
+                }
+                if provider.model() == Some(model) {
+                    return Err("The selected model is already configured");
+                }
+                if destination.len() > 4096 || destination.chars().any(char::is_control) {
+                    return Err("Candidate destination is invalid");
+                }
+                let destination = std::path::PathBuf::from(destination);
+                if !destination.is_absolute() || destination == *path {
+                    return Err(
+                        "Choose a new local candidate destination distinct from the source",
+                    );
+                }
+                LocalConfigurationAction::PrepareModel {
+                    destination,
+                    expected_sha256: configuration.source_sha256.clone(),
+                    model: model.to_owned(),
+                }
+            }
+            _ => return Err("Unknown local configuration action"),
+        };
+        self.local_configuration.sequence = self
+            .local_configuration
+            .sequence
+            .checked_add(1)
+            .ok_or("Local request sequence exhausted")?;
+        let request = LocalConfigurationRequest {
+            sequence: self.local_configuration.sequence,
+            source,
+            action,
+        };
+        self.local_configuration.pending = Some(request.clone());
+        "Local configuration operation pending".clone_into(&mut self.local_configuration.notice);
+        Ok(request)
+    }
+
+    pub(crate) fn reject_local_configuration(
+        &mut self,
+        request: crate::controller::LocalConfigurationRequest,
+    ) {
+        self.apply_local_configuration(
+            request,
+            Err(claw_platform::configuration::ConfigurationFileError {
+                message: "Local configuration command was not queued",
+                output_may_exist: false,
+            }),
+        );
+    }
+
+    fn apply_local_configuration(
+        &mut self,
+        request: crate::controller::LocalConfigurationRequest,
+        result: Result<
+            crate::controller::LocalConfigurationResult,
+            claw_platform::configuration::ConfigurationFileError,
+        >,
+    ) {
+        use crate::controller::{LocalConfigurationAction, LocalConfigurationResult};
+        if self.local_configuration.pending.as_ref() != Some(&request) {
+            return;
+        }
+        self.local_configuration.pending = None;
+        match (request.action, result) {
+            (
+                LocalConfigurationAction::Inspect,
+                Ok(LocalConfigurationResult::Inspected(configuration)),
+            ) => {
+                self.local_configuration.inspected = Some((request.source, *configuration));
+                "Local source verified; no configuration applied"
+                    .clone_into(&mut self.local_configuration.notice);
+            }
+            (
+                LocalConfigurationAction::PrepareModel {
+                    expected_sha256,
+                    model,
+                    ..
+                },
+                Ok(LocalConfigurationResult::Prepared(prepared)),
+            ) if expected_sha256 == prepared.source_sha256
+                && prepared
+                    .snapshot
+                    .core()
+                    .provider()
+                    .and_then(|provider| provider.model())
+                    == Some(model.as_str()) =>
+            {
+                self.local_configuration.notice = format!(
+                    "Candidate created and read back\nModel: {}\nCandidate SHA256: {}\nSource unchanged; not applied\nRestart required after explicit application\nGateway file association and live readiness: unverified",
+                    native_text(&model),
+                    prepared.candidate_sha256
+                );
+            }
+            (_, Err(error)) => {
+                self.local_configuration.notice = format!(
+                    "{}{}",
+                    error.message,
+                    if error.output_may_exist {
+                        "; preserve any candidate file"
+                    } else {
+                        "; no candidate confirmed"
+                    }
+                );
+            }
+            _ => {
+                "Local result was not confirmed; preserve any candidate file"
+                    .clone_into(&mut self.local_configuration.notice);
+            }
+        }
+    }
+
+    pub(crate) fn native_model_catalogue(&self, action: i32) -> Option<serde_json::Value> {
+        let native = self
+            .native
+            .as_ref()
+            .filter(|native| native.ready && native.model_catalogue_request.is_none())?;
+        if action == 0 {
+            return Some(serde_json::json!({"nativeCatalogPage":{"offset":0}}));
+        }
+        if action == 3 {
+            return Some(
+                serde_json::json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true}}),
+            );
+        }
+        let page = native
+            .model_catalogue
+            .as_ref()
+            .filter(|page| page["available"] == true)?;
+        let digest = page["sha256"].as_str()?;
+        match action {
+            1 => Some(
+                serde_json::json!({"nativeCatalogPage":{"offset":page["nextOffset"].as_u64()?,"sha256":digest}}),
+            ),
+            2 => Some(serde_json::json!({"nativeCatalogRefresh":{"sha256":digest}})),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn native_model_catalogue_enqueued(&mut self, params: &serde_json::Value) {
+        let action = if params.get("nativeCatalogRefresh").is_some() {
+            2
+        } else if params["nativeCatalogPage"]["includeAvailability"] == true {
+            3
+        } else {
+            i32::from(
+                params["nativeCatalogPage"]["offset"]
+                    .as_u64()
+                    .is_some_and(|offset| offset > 0),
+            )
+        };
+        if self.native_model_catalogue(action).as_ref() != Some(params) {
+            return;
+        }
+        let native = self.native.as_mut().expect("native mode");
+        native.model_catalogue_request = Some(params.clone());
+        native.model_catalogue_notice = Some(if action == 2 {
+            "Refreshing provider catalogue"
+        } else {
+            "Reading cached catalogue"
+        });
+    }
+
+    fn fail_native_model_catalogue(&mut self, params: &serde_json::Value) {
+        let Some(native) = self.native.as_mut() else {
+            return;
+        };
+        if native.model_catalogue_request.as_ref() != Some(params) {
+            return;
+        }
+        native.model_catalogue_request = None;
+        native.model_catalogue_notice =
+            Some("Catalogue request failed or could not be verified; previous data retained");
+    }
+
+    fn native_model_catalogue_response(
+        &mut self,
+        params: &serde_json::Value,
+        payload: &serde_json::Value,
+    ) {
+        let Some(native) = self.native.as_mut() else {
+            return;
+        };
+        if native.model_catalogue_request.as_ref() != Some(params) {
+            return;
+        }
+        let encoded = payload.to_string();
+        let accepted = params.get("nativeCatalogRefresh").map_or_else(
+            || {
+                params["nativeCatalogPage"]["offset"]
+                    .as_u64()
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .is_some_and(|offset| {
+                        claw_protocol::native_models::validate_page(
+                            &encoded,
+                            offset,
+                            params["nativeCatalogPage"]["sha256"].as_str(),
+                        )
+                        .is_ok()
+                            && (offset == 0
+                                || native.model_catalogue.as_ref().is_some_and(|previous| {
+                                    previous["nextOffset"].as_u64() == u64::try_from(offset).ok()
+                                        && [
+                                            "provider",
+                                            "providerGeneration",
+                                            "selectedModel",
+                                            "selectionPinned",
+                                            "observedAtMs",
+                                            "totalModels",
+                                            "sha256",
+                                            "source",
+                                        ]
+                                        .iter()
+                                        .all(|field| previous[field] == payload[field])
+                                }))
+                    })
+            },
+            |refresh| {
+                refresh["sha256"].as_str().is_some_and(|digest| {
+                    claw_protocol::native_models::validate_refresh(&encoded, digest).is_ok()
+                })
+            },
+        );
+        if !accepted {
+            self.fail_native_model_catalogue(params);
+            return;
+        }
+        native.model_catalogue_request = None;
+        if params.get("nativeCatalogRefresh").is_some() {
+            native.model_catalogue = None;
+            native.model_catalogue_notice = Some("Catalogue refreshed; selection unchanged");
+        } else {
+            native.model_catalogue = Some(payload.clone());
+            native.model_catalogue_notice = None;
+        }
+    }
+
+    pub(crate) fn model_catalogue_text(&self) -> String {
+        let Some(native) = self.native.as_ref().filter(|native| native.ready) else {
+            return "Gateway disconnected".to_owned();
+        };
+        let mut lines = Vec::new();
+        if let Some(notice) = native.model_catalogue_notice {
+            lines.push(notice.to_owned());
+        }
+        if let Some(page) = &native.model_catalogue {
+            if page["available"] == true {
+                lines.push(format!(
+                    "Provider: {} [generation {}]",
+                    native_text(page["provider"].as_str().unwrap_or("unknown")),
+                    page["providerGeneration"]
+                ));
+                lines.push(format!(
+                    "Selected: {}{}",
+                    native_text(page["selectedModel"].as_str().unwrap_or("unknown")),
+                    if page["selectionPinned"] == true {
+                        " (pinned)"
+                    } else {
+                        ""
+                    }
+                ));
+                lines.push(format!(
+                    "Models: {}..{} of {}",
+                    page["offset"], page["endOffset"], page["totalModels"]
+                ));
+                lines.push(format!("Observed: {} (Unix ms)", page["observedAtMs"]));
+                lines.push("Source: provider SDK catalogue".to_owned());
+                lines.push("Live capabilities: unverified".to_owned());
+                if let Some(models) = page["models"].as_array() {
+                    for model in models {
+                        lines.push(String::new());
+                        lines.push(native_text(model["id"].as_str().unwrap_or("unknown")));
+                        if let Some(aliases) = model["aliases"].as_array() {
+                            for alias in aliases.iter().filter_map(serde_json::Value::as_str) {
+                                lines.push(format!("Alias (config): {}", native_text(alias)));
+                            }
+                        }
+                        if let Some(name) = model["displayName"].as_str() {
+                            lines.push(native_text(name));
+                        }
+                        for (name, field) in
+                            [("Context", "contextWindow"), ("Output", "maxOutputTokens")]
+                        {
+                            lines.push(format!(
+                                "{name}: {}",
+                                model[field].as_u64().map_or_else(
+                                    || "not reported".to_owned(),
+                                    |value| value.to_string()
+                                )
+                            ));
+                        }
+                        let capabilities = model["advertisedCapabilities"]
+                            .as_array()
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(serde_json::Value::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default();
+                        lines.push(format!(
+                            "Advertised: {}",
+                            if capabilities.is_empty() {
+                                "none reported"
+                            } else {
+                                &capabilities
+                            }
+                        ));
+                    }
+                }
+            } else {
+                lines.push(
+                    serde_json::from_value::<
+                        claw_protocol::native_models::CatalogueUnavailableReason,
+                    >(page["unavailableReason"].clone())
+                    .map_or_else(
+                        |_| "Provider catalogue unavailable".to_owned(),
+                        |reason| reason.to_string(),
+                    ),
+                );
+            }
+        } else if native.model_catalogue_notice.is_none() {
+            lines.push("No cached catalogue loaded".to_owned());
+        }
+        lines.join("\n")
+    }
+
+    pub(crate) fn native_accounting(&self, next: bool) -> Option<serde_json::Value> {
+        let native = self
+            .native
+            .as_ref()
+            .filter(|native| native.ready && native.accounting_request.is_none())?;
+        let snapshot = native.accounting.get(&self.selected_run.id)?;
+        if Some(snapshot.connection) != native.connection
+            || snapshot.turn.is_none()
+            || !snapshot.state.is_terminal()
+            || self.selected_run.state != snapshot.state
+            || native
+                .active_runs
+                .get(&self.selected_run.id)
+                .or_else(|| native.completed_runs.get(&self.selected_run.id))
+                != Some(&snapshot.run_id)
+        {
+            return None;
+        }
+        let mut params = serde_json::json!({"runId":snapshot.run_id,"accountingPage":{"revision":snapshot.revision,"offset":0}});
+        if next {
+            let page = snapshot.page.as_ref()?;
+            params["accountingPage"]["offset"] = serde_json::json!(page.next_offset?);
+            params["accountingPage"]["sha256"] = serde_json::json!(page.sha256);
+        }
+        Some(params)
+    }
+
+    pub(crate) fn native_accounting_enqueued(&mut self, params: &serde_json::Value) {
+        let next = params["accountingPage"]["offset"]
+            .as_u64()
+            .is_some_and(|offset| offset > 0);
+        if self.native_accounting(next).as_ref() != Some(params) {
+            return;
+        }
+        let native = self.native.as_mut().expect("native mode");
+        let snapshot = native
+            .accounting
+            .get_mut(&self.selected_run.id)
+            .expect("validated snapshot");
+        snapshot.page_error = None;
+        native.accounting_request = Some(NativeAccountingRequest {
+            session: self.selected_run.id.clone(),
+            params: params.clone(),
+            turn: snapshot.turn.expect("bound turn"),
+            state: snapshot.state,
+            summary: if next {
+                snapshot.page.as_ref().map(|page| page.summary.clone())
+            } else {
+                None
+            },
+            total_rounds: if next {
+                snapshot.page.as_ref().map(|page| page.total_rounds)
+            } else {
+                None
+            },
+        });
+    }
+
+    fn fail_native_accounting(&mut self, params: &serde_json::Value) {
+        let Some(native) = self.native.as_mut() else {
+            return;
+        };
+        if native
+            .accounting_request
+            .as_ref()
+            .is_none_or(|request| request.params != *params)
+        {
+            return;
+        }
+        let request = native.accounting_request.take().expect("matching request");
+        if let Some(snapshot) = native.accounting.get_mut(&request.session)
+            && params["runId"].as_str() == Some(snapshot.run_id.as_str())
+            && params["accountingPage"]["revision"].as_u64() == Some(snapshot.revision)
+        {
+            snapshot.page_error = Some("Provider round read failed or could not be verified.");
+        }
+    }
+
+    fn native_accounting_response(
+        &mut self,
+        params: &serde_json::Value,
+        payload: &serde_json::Value,
+    ) {
+        let Some(native) = self.native.as_mut() else {
+            return;
+        };
+        let Some(request) = native
+            .accounting_request
+            .as_ref()
+            .filter(|request| request.params == *params)
+        else {
+            return;
+        };
+        let valid = || -> Option<NativeAccountingPage> {
+            let snapshot = native.accounting.get(&request.session)?;
+            if request.session != self.selected_run.id
+                || payload["sessionId"].as_str() != Some(request.session.as_str())
+                || payload["turn"].as_u64() != Some(request.turn)
+                || native_run_state(payload["status"].as_str()?) != request.state
+                || request.state != self.selected_run.state
+                || params["runId"].as_str() != Some(snapshot.run_id.as_str())
+                || params["accountingPage"]["revision"].as_u64() != Some(snapshot.revision)
+                || snapshot.turn != Some(request.turn)
+                || snapshot.state != request.state
+                || Some(snapshot.connection) != native.connection
+            {
+                return None;
+            }
+            claw_protocol::native_accounting::validate_page(&payload.to_string(), params).ok()?;
+            let page = &payload["accounting"];
+            if page["available"] != true {
+                return None;
+            }
+            let summary =
+                claw_protocol::native_accounting::ProviderAccounting::parse(&page["summary"])
+                    .ok()??;
+            let total_rounds = usize::try_from(page["totalRounds"].as_u64()?).ok()?;
+            if request
+                .summary
+                .as_ref()
+                .is_some_and(|expected| *expected != summary)
+                || request
+                    .total_rounds
+                    .is_some_and(|expected| expected != total_rounds)
+            {
+                return None;
+            }
+            Some(NativeAccountingPage {
+                offset: usize::try_from(page["offset"].as_u64()?).ok()?,
+                end_offset: usize::try_from(page["endOffset"].as_u64()?).ok()?,
+                next_offset: page["nextOffset"]
+                    .as_u64()
+                    .map(usize::try_from)
+                    .transpose()
+                    .ok()?,
+                total_rounds,
+                sha256: page["sha256"].as_str()?.to_owned(),
+                summary,
+                rounds: serde_json::from_value(page["rounds"].clone()).ok()?,
+            })
+        }();
+        if let Some(page) = valid {
+            let session = request.session.clone();
+            native.accounting_request = None;
+            let snapshot = native
+                .accounting
+                .get_mut(&session)
+                .expect("validated snapshot");
+            snapshot.report = Some(page.summary.clone());
+            snapshot.page = Some(page);
+            snapshot.page_error = None;
+        } else {
+            self.fail_native_accounting(params);
         }
     }
 
@@ -1578,6 +2271,67 @@ impl ProductState {
         }
         lines.push("Cost: uncalculated".to_owned());
         lines.push("Billing: unreconciled".to_owned());
+        if let Some(snapshot) = native
+            .accounting
+            .get(&self.selected_run.id)
+            .filter(|snapshot| {
+                snapshot.run_id == *run && Some(snapshot.connection) == native.connection
+            })
+        {
+            if let Some(error) = snapshot.page_error {
+                lines.push(error.to_owned());
+            }
+            if let Some(page) = &snapshot.page {
+                lines.push(format!(
+                    "Provider rounds {}..{} of {}",
+                    page.offset, page.end_offset, page.total_rounds
+                ));
+                lines.push(format!(
+                    "Snapshot: {}",
+                    if page.offset == 0 && page.end_offset == page.total_rounds {
+                        "verified complete page"
+                    } else {
+                        "pinned page; full digest not independently verified"
+                    }
+                ));
+                for round in &page.rounds {
+                    let Some(response) = &round.response else {
+                        lines.push(format!(
+                            "Round {}: report unavailable; delivery unknown",
+                            round.round
+                        ));
+                        continue;
+                    };
+                    lines.push(format!(
+                        "Round {}: {} / {}",
+                        round.round,
+                        native_text(&response.provider),
+                        native_text(&response.model)
+                    ));
+                    lines.push(format!(
+                        "Response: {}",
+                        native_text(response.response_id.as_deref().unwrap_or("not reported"))
+                    ));
+                    lines.push(format!("Finish: {}", response.finish_reason));
+                    if response.usage_reporting == "unreported" {
+                        lines.push("Tokens: unknown (unreported)".to_owned());
+                    } else {
+                        let tokens = &response.observed_tokens;
+                        lines.push(format!(
+                            "Tokens ({}): {} [input {}, output {}]",
+                            response.usage_reporting,
+                            tokens.total_tokens,
+                            tokens.input_tokens,
+                            tokens.output_tokens
+                        ));
+                        lines.push(format!(
+                            "Included subsets: cached {}, reasoning {}",
+                            tokens.cached_input_tokens, tokens.reasoning_tokens
+                        ));
+                    }
+                }
+            }
+        }
         lines.join("\n")
     }
 
@@ -3466,6 +4220,589 @@ fn demo_diff(run: &RunSummary, file_name: &str, offset: usize) -> Vec<DiffLine> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_copilot_candidate_uses_the_sdk_catalogue_identity_not_config_spelling() {
+        use crate::controller::{LocalConfigurationResult, ProductConnection, ProductUpdate};
+        use serde_json::json;
+        struct OwnedRoot(std::path::PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = OwnedRoot(std::env::temp_dir().join(format!(
+                "claw-copilot-candidate-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            )));
+        std::fs::create_dir(&root.0).expect("owned directory");
+        let source = root.0.join("source.json5");
+        let destination = root.0.join("candidate.json5");
+        std::fs::write(&source,json!({"schema_version":1,"core":{"auth":{"github":{"pat":"env:UNRESOLVED_COPILOT_CONFIG"}},
+            "role":{"source_url":"http://127.0.0.1:9/role"},"channels":{"teams":{"enabled":false}},"server":{},"logging":{},"sessions":{},"copilot":{},"legacy":{},"updates":{},"admin":{},"network":{},
+            "provider":{"kind":"copilot","model":"before"}}}).to_string()).expect("source");
+        let mut state = super::ProductState::native();
+        let source_text = source.to_str().expect("path");
+        let request = state
+            .begin_local_configuration(0, source_text, "", "", -1)
+            .expect("inspection");
+        let inspected =
+            claw_platform::configuration::inspect_provider(&source).expect("complete source");
+        assert_eq!(
+            inspected
+                .snapshot
+                .core()
+                .provider()
+                .expect("provider")
+                .catalogue_provider_id(),
+            Some("github-copilot")
+        );
+        state.apply_native(ProductUpdate::LocalConfiguration {
+            request,
+            result: Ok(LocalConfigurationResult::Inspected(Box::new(inspected))),
+        });
+        state.apply_native(ProductUpdate::Ready {
+            connection: ProductConnection {
+                generation: 0,
+                epoch: 1,
+            },
+        });
+        state.native.as_mut().expect("native").model_catalogue = Some(
+            json!({"available":true,"provider":"github-copilot","selectedModel":"before","sha256":"a".repeat(64),"offset":0,"endOffset":2,"models":[{"id":"before"},{"id":"after"}]}),
+        );
+        let binding = state.model_choice_binding();
+        let request = state
+            .begin_local_configuration(
+                1,
+                source_text,
+                destination.to_str().expect("path"),
+                &binding,
+                1,
+            )
+            .expect("SDK identity matched");
+        state.reject_local_configuration(request);
+        state
+            .native
+            .as_mut()
+            .expect("native")
+            .model_catalogue
+            .as_mut()
+            .expect("page")["provider"] = json!("another-provider");
+        assert!(
+            state
+                .begin_local_configuration(
+                    1,
+                    source_text,
+                    destination.to_str().expect("path"),
+                    &binding,
+                    1
+                )
+                .is_err()
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn lost_local_configuration_receipts_release_busy_and_reject_late_results() {
+        use crate::controller::{
+            LocalConfigurationAction, LocalConfigurationRequest, ProductUpdate,
+        };
+        let mut state = super::ProductState::native();
+        let source = std::env::temp_dir().join("owned-source.json5");
+        for action in [
+            LocalConfigurationAction::Inspect,
+            LocalConfigurationAction::PrepareModel {
+                destination: std::env::temp_dir().join("owned-candidate.json5"),
+                expected_sha256: "a".repeat(64),
+                model: "exact-model".to_owned(),
+            },
+        ] {
+            state.local_configuration.sequence += 1;
+            let request = LocalConfigurationRequest {
+                sequence: state.local_configuration.sequence,
+                source: source.clone(),
+                action,
+            };
+            state.local_configuration.pending = Some(request.clone());
+            assert!(state.local_configuration_busy());
+            state.product_updates_lost();
+            assert!(!state.local_configuration_busy());
+            assert!(state.local_configuration.inspected.is_none());
+            let notice = state.local_configuration_text();
+            assert!(notice.contains("unknown") && notice.contains("preserve any candidate"));
+            state.apply_native(ProductUpdate::LocalConfiguration {
+                request,
+                result: Err(claw_platform::configuration::ConfigurationFileError {
+                    message: "late local result",
+                    output_may_exist: true,
+                }),
+            });
+            assert_eq!(state.local_configuration_text(), notice);
+            let inspected = state
+                .begin_local_configuration(0, source.to_str().expect("path"), "", "", -1)
+                .expect("explicit reinspection remains available");
+            state.reject_local_configuration(inspected);
+            assert!(state.transcript().is_empty());
+        }
+    }
+
+    #[test]
+    fn local_model_candidate_state_binds_source_catalogue_and_preserves_receipts_across_reset() {
+        use crate::controller::{LocalConfigurationResult, ProductConnection, ProductUpdate};
+        use serde_json::json;
+        struct OwnedRoot(std::path::PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = OwnedRoot(std::env::temp_dir().join(format!(
+                "claw-desktop-local-model-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            )));
+        std::fs::create_dir(&root.0).expect("owned directory");
+        let source = root.0.join("source.json5");
+        let target = root.0.join("candidate.json5");
+        std::fs::write(&source,json!({"schema_version":1,"core":{"role":{"source_url":"http://127.0.0.1:9/role"},"channels":{"teams":{"enabled":false}},
+            "auth":{},"server":{},"logging":{},"sessions":{},"copilot":{},"legacy":{},"updates":{},"admin":{},"network":{},
+            "provider":{"kind":"openai","model":"current-model","api_key":"env:UNRESOLVED_DESKTOP_KEY"}}}).to_string()).expect("source");
+        let mut state = super::ProductState::native();
+        let source_text = source.to_str().expect("path");
+        let target_text = target.to_str().expect("path");
+        let inspected = state
+            .begin_local_configuration(0, source_text, "", "", -1)
+            .expect("inspect request");
+        assert!(
+            state
+                .begin_local_configuration(0, source_text, "", "", -1)
+                .is_err()
+        );
+        let configuration = claw_platform::configuration::inspect_provider(&source)
+            .expect("actual source inspection");
+        state.apply_native(ProductUpdate::LocalConfiguration {
+            request: inspected,
+            result: Ok(LocalConfigurationResult::Inspected(Box::new(configuration))),
+        });
+        assert!(!state.local_configuration_busy());
+        assert!(state.local_configuration_text().contains("current-model"));
+        assert!(
+            !state
+                .local_configuration_text()
+                .contains("UNRESOLVED_DESKTOP_KEY")
+        );
+        let connection = ProductConnection {
+            generation: 0,
+            epoch: 1,
+        };
+        state.apply_native(ProductUpdate::Ready { connection });
+        state.native.as_mut().expect("native").model_catalogue = Some(
+            json!({"available":true,"provider":"openai","selectedModel":"current-model","sha256":"a".repeat(64),
+            "models":[{"id":"current-model"},{"id":"selected-model"}]}),
+        );
+        let binding = state.model_choice_binding();
+        assert_eq!(state.model_choices(), ["current-model", "selected-model"]);
+        let original_page = state
+            .native
+            .as_ref()
+            .expect("native")
+            .model_catalogue
+            .clone()
+            .expect("first page");
+        let mut next_page = original_page.clone();
+        next_page["offset"] = json!(8);
+        next_page["endOffset"] = json!(10);
+        next_page["models"] = json!([{"id":"other-model"},{"id":"unreviewed-model"}]);
+        state.native.as_mut().expect("native").model_catalogue = Some(next_page);
+        assert!(
+            state
+                .begin_local_configuration(1, source_text, target_text, &binding, 1)
+                .is_err(),
+            "same-digest next page must not reinterpret an old selected index"
+        );
+        state.native.as_mut().expect("native").model_catalogue = Some(original_page);
+        assert!(
+            state
+                .begin_local_configuration(1, source_text, target_text, "old-binding", 1)
+                .is_err()
+        );
+        assert!(
+            state
+                .begin_local_configuration(1, source_text, target_text, &binding, 0)
+                .is_err()
+        );
+        assert!(
+            state
+                .begin_local_configuration(1, source_text, source_text, &binding, 1)
+                .is_err()
+        );
+        let request = state
+            .begin_local_configuration(1, source_text, target_text, &binding, 1)
+            .expect("exact local candidate");
+        let candidate = claw_platform::configuration::prepare_provider(
+            &source,
+            &target,
+            &state
+                .local_configuration
+                .inspected
+                .as_ref()
+                .expect("source")
+                .1
+                .source_sha256,
+            claw_platform::configuration::ProviderEdit::ExactModel("selected-model"),
+        )
+        .expect("actual new candidate");
+        state.apply_native(ProductUpdate::Reset { generation: 1 });
+        assert!(state.local_configuration_busy());
+        assert!(state.model_choice_binding().is_empty());
+        state.apply_native(ProductUpdate::LocalConfiguration {
+            request: request.clone(),
+            result: Ok(LocalConfigurationResult::Prepared(Box::new(
+                candidate.clone(),
+            ))),
+        });
+        assert!(!state.local_configuration_busy());
+        assert!(state.local_configuration_text().contains("not applied"));
+        let receipt = state.local_configuration_text();
+        state.apply_native(ProductUpdate::LocalConfiguration {
+            request,
+            result: Ok(LocalConfigurationResult::Prepared(Box::new(candidate))),
+        });
+        assert_eq!(state.local_configuration_text(), receipt);
+        assert!(
+            state
+                .begin_local_configuration(1, source_text, target_text, &binding, 1)
+                .is_err()
+        );
+        assert!(state.transcript().is_empty());
+    }
+
+    #[test]
+    fn native_model_catalogue_availability_is_explicit_typed_and_connection_bound() {
+        use crate::controller::{ProductConnection, ProductUpdate};
+        use serde_json::json;
+        let connection = ProductConnection {
+            generation: 0,
+            epoch: 1,
+        };
+        let mut state = super::ProductState::native();
+        assert!(state.native_model_catalogue(3).is_none());
+        state.apply_native(ProductUpdate::Ready { connection });
+        while state.next_native_query().is_some() {}
+        for (reason, expected) in [
+            ("disabled", "Provider is explicitly disabled"),
+            (
+                "authentication_pending",
+                "Provider authentication is pending",
+            ),
+            ("not_initialized", "Provider catalogue is not initialized"),
+            ("retired", "Provider has been shut down"),
+        ] {
+            let params = state
+                .native_model_catalogue(3)
+                .expect("explicit status read");
+            assert_eq!(
+                params,
+                json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true}})
+            );
+            state.native_model_catalogue_enqueued(&params);
+            assert!(state.native_model_catalogue(0).is_none());
+            let page = json!({"schemaVersion":1,"available":false,"selectionChanged":false,"networkContacted":false,"unavailableReason":reason});
+            state.apply_native(ProductUpdate::Response {
+                connection: ProductConnection {
+                    epoch: 2,
+                    ..connection
+                },
+                method: "models.list",
+                params: params.clone(),
+                payload: page.clone(),
+            });
+            assert!(state.native_model_catalogue(3).is_none());
+            state.apply_native(ProductUpdate::Response {
+                connection,
+                method: "models.list",
+                params,
+                payload: page,
+            });
+            assert_eq!(state.model_catalogue_text(), expected);
+            assert!(state.model_choices().is_empty());
+            assert!(state.native_model_catalogue(1).is_none());
+            assert!(state.native_model_catalogue(2).is_none());
+        }
+        let params = state.native_model_catalogue(3).expect("status read");
+        state.native_model_catalogue_enqueued(&params);
+        state.apply_native(ProductUpdate::Response {
+            connection, method: "models.list", params,
+            payload: json!({"schemaVersion":1,"available":false,"selectionChanged":false,"networkContacted":false,"unavailableReason":"private-secret-error"}),
+        });
+        assert!(
+            state
+                .model_catalogue_text()
+                .contains("Provider has been shut down")
+        );
+        assert!(
+            !state
+                .model_catalogue_text()
+                .contains("private-secret-error")
+        );
+        assert!(state.transcript().is_empty());
+        let params = state
+            .native_model_catalogue(0)
+            .expect("legacy read still available");
+        assert_eq!(params, json!({"nativeCatalogPage":{"offset":0}}));
+        state.native_model_catalogue_enqueued(&params);
+        state.apply_native(ProductUpdate::Response {
+            connection, method: "models.list", params,
+            payload: json!({"schemaVersion":1,"available":false,"selectionChanged":false,"networkContacted":false}),
+        });
+        assert_eq!(
+            state.model_catalogue_text(),
+            "Provider catalogue unavailable"
+        );
+    }
+
+    #[test]
+    fn native_model_catalogue_state_pins_pages_and_does_not_mutate_chat_or_selection() {
+        use crate::controller::{ProductConnection, ProductUpdate};
+        use serde_json::{Value, json};
+        let connection = ProductConnection {
+            generation: 0,
+            epoch: 1,
+        };
+        let mut state = super::ProductState::native();
+        assert!(state.native_model_catalogue(0).is_none());
+        state.apply_native(ProductUpdate::Ready { connection });
+        while state.next_native_query().is_some() {}
+        let mut first = json!({"schemaVersion":1,"available":true,"offset":0,"endOffset":8,"nextOffset":8,"totalModels":9,"sha256":"a".repeat(64),
+            "provider":"fixture","providerGeneration":1,"selectedModel":"fixture-model-0","selectionPinned":true,"observedAtMs":123,
+            "source":"provider_sdk_catalogue","liveCapabilitiesVerified":false,"selectionChanged":false,"networkContacted":false,
+            "models":(0..8).map(|ordinal|json!({"id":format!("fixture-model-{ordinal}"),"displayName":null,"contextWindow":null,"maxOutputTokens":null,"advertisedCapabilities":["completion"]})).collect::<Vec<_>>()});
+        first["models"][0]["aliases"] = json!(["work", "Work"]);
+        let params = state.native_model_catalogue(0).expect("cache read");
+        state.native_model_catalogue_enqueued(&params);
+        assert!(state.native_model_catalogue(0).is_none());
+        state.apply_native(ProductUpdate::Response {
+            connection: ProductConnection {
+                epoch: 2,
+                ..connection
+            },
+            method: "models.list",
+            params: params.clone(),
+            payload: first.clone(),
+        });
+        assert!(!state.model_catalogue_text().contains("fixture-model-0"));
+        state.apply_native(ProductUpdate::Response {
+            connection,
+            method: "models.list",
+            params,
+            payload: first.clone(),
+        });
+        assert!(
+            state
+                .model_catalogue_text()
+                .contains("Live capabilities: unverified")
+        );
+        assert!(
+            state
+                .model_catalogue_text()
+                .contains("Context: not reported")
+        );
+        let previous = state.model_catalogue_text();
+        assert!(
+            previous.contains("Alias (config): work") && previous.contains("Alias (config): Work")
+        );
+        assert_eq!(
+            state.model_choices()[0],
+            "fixture-model-0",
+            "candidate choices remain exact model IDs"
+        );
+        let next = state.native_model_catalogue(1).expect("next page");
+        assert_eq!(
+            next,
+            json!({"nativeCatalogPage":{"offset":8,"sha256":"a".repeat(64)}})
+        );
+        state.native_model_catalogue_enqueued(&next);
+        let mut last = first;
+        last["offset"] = json!(8);
+        last["endOffset"] = json!(9);
+        last["nextOffset"] = Value::Null;
+        last["models"] = json!([{"id":"fixture-model-8","displayName":null,"contextWindow":null,"maxOutputTokens":null,"advertisedCapabilities":[]}]);
+        last["providerGeneration"] = json!(2);
+        state.apply_native(ProductUpdate::Response {
+            connection,
+            method: "models.list",
+            params: next.clone(),
+            payload: last.clone(),
+        });
+        assert!(state.model_catalogue_text().ends_with(&previous));
+        state.native_model_catalogue_enqueued(&next);
+        last["providerGeneration"] = json!(1);
+        state.apply_native(ProductUpdate::Response {
+            connection,
+            method: "models.list",
+            params: next,
+            payload: last,
+        });
+        assert!(state.native_model_catalogue(1).is_none());
+        assert!(state.model_catalogue_text().contains("fixture-model-8"));
+        let refresh = state.native_model_catalogue(2).expect("explicit refresh");
+        state.native_model_catalogue_enqueued(&refresh);
+        state.apply_native(ProductUpdate::Failed {
+            connection,
+            method: "models.list",
+            params: refresh.clone(),
+            definitive: true,
+        });
+        assert!(state.model_catalogue_text().contains("fixture-model-8"));
+        state.native_model_catalogue_enqueued(&refresh);
+        let mut receipt = json!({"schemaVersion":1,"refreshed":true,"provider":"fixture","providerGeneration":1,"requestedSha256":"b".repeat(64),
+            "selectedModel":"fixture-model-0","totalModels":9,"selectionChanged":false,"networkContacted":true,"inferenceInvoked":false});
+        state.apply_native(ProductUpdate::Response {
+            connection,
+            method: "models.list",
+            params: refresh.clone(),
+            payload: receipt.clone(),
+        });
+        assert!(state.model_catalogue_text().contains("fixture-model-8"));
+        state.native_model_catalogue_enqueued(&refresh);
+        receipt["requestedSha256"] = json!("a".repeat(64));
+        state.apply_native(ProductUpdate::Response {
+            connection,
+            method: "models.list",
+            params: refresh,
+            payload: receipt,
+        });
+        assert!(!state.model_catalogue_text().contains("fixture-model-8"));
+        assert!(state.native_model_catalogue(2).is_none());
+        assert!(state.transcript().is_empty() && state.next_native_query().is_none());
+        assert_eq!(state.selected_run().state, super::RunState::Draft);
+        state.native_unavailable();
+        assert_eq!(state.model_catalogue_text(), "Gateway disconnected");
+        assert!(state.native_model_catalogue(0).is_none());
+    }
+
+    #[test]
+    fn accounting_round_pages_preserve_run_outcome_and_reject_stale_or_changed_snapshots() {
+        use crate::controller::{ProductConnection, ProductUpdate};
+        use serde_json::{Value, json};
+        for scenario in [
+            "valid",
+            "identity",
+            "provenance",
+            "stale",
+            "failure",
+            "missing",
+        ] {
+            let connection = ProductConnection {
+                generation: 0,
+                epoch: 1,
+            };
+            let mut state = super::ProductState::native();
+            state.apply_native(ProductUpdate::Ready { connection });
+            let summary = json!({"available":true,"recordedRounds":17,"completeCounterRounds":0,"partialCounterRounds":0,"unreportedRounds":17,
+                "allPrimaryCountersReported":false,"observedTokens":{"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0},
+                "aggregationOverflow":false,"costCalculated":false,"billingReconciled":false,"recordSource":"provider_journal",
+                "journalRevision":7,"journalClosed":false,"attemptsMayBeUnsent":true});
+            state.apply_native(ProductUpdate::Response {connection,method:"agent.wait",params:json!({"runId":"a".repeat(64)}),
+                payload:json!({"runId":"a".repeat(64),"sessionId":"native-session","phase":"outcome_unknown","status":"outcome_unknown",
+                    "turn":0,"revision":4,"durable":true,"result":{"status":"outcome_unknown","text":"retained result"},"providerAccounting":summary})});
+            while state.next_native_query().is_some() {}
+            let transcript = state.transcript().to_vec();
+            let first = state
+                .native_accounting(false)
+                .expect("owned terminal request");
+            assert_eq!(
+                first,
+                json!({"runId":"a".repeat(64),"accountingPage":{"revision":4,"offset":0}})
+            );
+            state.native_accounting_enqueued(&first);
+            assert!(state.native_accounting(false).is_none());
+            let page = json!({"runId":"a".repeat(64),"sessionId":"native-session","revision":4,"turn":0,"status":"outcome_unknown",
+                "durable":true,"acknowledged":false,"automaticReplay":false,"accounting":{"available":true,"offset":0,"endOffset":16,"nextOffset":16,
+                    "totalRounds":17,"sha256":"b".repeat(64),"summary":summary,"rounds":(0..16).map(|round|json!({"round":round,"response":null})).collect::<Vec<_>>()}});
+            state.apply_native(ProductUpdate::Response {
+                connection,
+                method: "agent.wait",
+                params: first,
+                payload: page.clone(),
+            });
+            assert!(
+                state
+                    .accounting_summary()
+                    .contains("Provider rounds 0..16 of 17")
+            );
+            let next = state.native_accounting(true).expect("pinned next");
+            assert_eq!(next["accountingPage"]["offset"], 16);
+            assert_eq!(next["accountingPage"]["sha256"], "b".repeat(64));
+            state.native_accounting_enqueued(&next);
+            let mut last = page;
+            last["accounting"]["offset"] = json!(16);
+            last["accounting"]["endOffset"] = json!(17);
+            last["accounting"]["nextOffset"] = Value::Null;
+            last["accounting"]["rounds"] = json!([{"round":16,"response":null}]);
+            if scenario == "identity" {
+                last["turn"] = json!(1);
+            }
+            if scenario == "provenance" {
+                last["accounting"]["summary"]["journalRevision"] = json!(8);
+            }
+            if scenario == "missing" {
+                last["accounting"] = json!({"available":false});
+            }
+            if scenario == "failure" {
+                state.apply_native(ProductUpdate::Failed {
+                    connection,
+                    method: "agent.wait",
+                    params: next,
+                    definitive: true,
+                });
+            } else {
+                state.apply_native(ProductUpdate::Response {
+                    connection: if scenario == "stale" {
+                        ProductConnection {
+                            epoch: 2,
+                            ..connection
+                        }
+                    } else {
+                        connection
+                    },
+                    method: "agent.wait",
+                    params: next,
+                    payload: last,
+                });
+            }
+            assert_eq!(state.selected_run().state, super::RunState::OutcomeUnknown);
+            assert_eq!(state.transcript(), transcript.as_slice());
+            assert!(state.next_native_query().is_none(), "no page ACK or replay");
+            if scenario == "valid" {
+                assert!(
+                    state
+                        .accounting_summary()
+                        .contains("Round 16: report unavailable")
+                );
+                assert!(state.native_accounting(true).is_none());
+            } else {
+                assert!(
+                    state
+                        .accounting_summary()
+                        .contains("Provider rounds 0..16 of 17")
+                );
+                if scenario != "stale" {
+                    assert!(state.accounting_summary().contains("could not be verified"));
+                }
+            }
+            state.native_unavailable();
+            assert!(state.native_accounting(false).is_none());
+            assert!(state.accounting_summary().is_empty());
+        }
+    }
+
     use super::*;
 
     #[test]

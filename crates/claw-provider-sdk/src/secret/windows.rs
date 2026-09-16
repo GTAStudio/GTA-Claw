@@ -71,6 +71,141 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "subprocess fixture invoked by independent_processes_read_the_same_native_credential"]
+    fn native_cross_process_read_fixture() {
+        let account = std::env::var("GTA_CLAW_NATIVE_CREDENTIAL_FIXTURE_ACCOUNT")
+            .expect("owned fixture account");
+        let stage: u8 = std::env::var("GTA_CLAW_NATIVE_CREDENTIAL_FIXTURE_STAGE")
+            .expect("owned fixture stage")
+            .parse()
+            .expect("bounded fixture stage");
+        assert!(
+            account.starts_with("fixture-")
+                && account.len() <= 128
+                && account
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        );
+        assert!(stage <= 4);
+        let key =
+            CredentialKey::new("gta-claw.test.process-native", account).expect("owned namespace");
+        let store = WindowsCredentialManagerStore::new().expect("native store");
+        let observed = store.get(&key).expect("fresh process read");
+        if stage == 4 {
+            assert!(
+                observed.is_none(),
+                "deleted fixture remains present in a fresh process"
+            );
+        } else {
+            assert!(
+                observed
+                    .as_ref()
+                    .is_some_and(|value| value
+                        == &SecretString::new(format!("synthetic-process-stage-{stage}"))),
+                "native fixture read mismatch: stage={stage}, present={}",
+                observed.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn independent_processes_read_the_same_native_credential() {
+        struct OwnedCredential {
+            store: WindowsCredentialManagerStore,
+            key: CredentialKey,
+        }
+        impl Drop for OwnedCredential {
+            fn drop(&mut self) {
+                let _ = self.store.delete(&self.key);
+            }
+        }
+        let account = format!(
+            "fixture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("fixture clock")
+                .as_nanos()
+        );
+        let owned = OwnedCredential {
+            store: WindowsCredentialManagerStore::new().expect("native backend"),
+            key: CredentialKey::new("gta-claw.test.process-native", &account)
+                .expect("owned fixture key"),
+        };
+        assert!(
+            owned
+                .store
+                .get(&owned.key)
+                .expect("unique preflight")
+                .is_none()
+        );
+        let reader = WindowsCredentialManagerStore::new().expect("independent parent reader");
+        for stage in 0_u8..=4 {
+            if stage == 4 {
+                assert!(
+                    owned
+                        .store
+                        .delete(&owned.key)
+                        .expect("confirmed owned deletion")
+                );
+            } else {
+                let expected = SecretString::new(format!("synthetic-process-stage-{stage}"));
+                owned
+                    .store
+                    .set(&owned.key, &expected)
+                    .expect("fixture write");
+                assert!(
+                    reader
+                        .get(&owned.key)
+                        .expect("independent parent read")
+                        .is_some_and(|observed| observed == expected)
+                );
+            }
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("test binary"));
+            command.env_clear();
+            for name in ["SystemRoot", "SystemDrive", "WINDIR"] {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+            let output = command
+                .args([
+                    "--exact",
+                    "secret::windows::tests::native_cross_process_read_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("GTA_CLAW_NATIVE_CREDENTIAL_FIXTURE_ACCOUNT", &account)
+                .env(
+                    "GTA_CLAW_NATIVE_CREDENTIAL_FIXTURE_STAGE",
+                    stage.to_string(),
+                )
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("fresh reader process");
+            let stdout = String::from_utf8(output.stdout).expect("fixture output");
+            let stderr = String::from_utf8(output.stderr).expect("fixture diagnostic");
+            assert!(
+                !stdout.contains("synthetic-process-stage")
+                    && !stderr.contains("synthetic-process-stage")
+            );
+            assert!(output.status.success(), "stage {stage}: {stdout} {stderr}");
+            assert!(
+                stdout.contains("1 passed; 0 failed"),
+                "fresh process must actually execute the fixture"
+            );
+        }
+        assert!(
+            owned
+                .store
+                .get(&owned.key)
+                .expect("cleanup readback")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn independent_native_handles_isolate_concurrent_credential_lifecycles() {
         use std::sync::{Arc, Barrier};
 

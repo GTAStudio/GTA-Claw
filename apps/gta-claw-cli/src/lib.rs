@@ -41,6 +41,7 @@ mod mcp_credential;
 mod mcp_oauth;
 mod migration_preview;
 mod native_gateway;
+mod provider_config;
 mod state_snapshot;
 
 use diagnostics::{Diagnostics, LOG_FILE_UNUSABLE, Verbosity, bool_field, sanitize};
@@ -170,6 +171,7 @@ async fn dispatch(arguments: Vec<OsString>) -> RenderedResult {
         Ok(Invocation::Snapshot(command)) => state_snapshot::run(command).await,
         Ok(Invocation::McpCredential(command)) => mcp_credential::run(command).await,
         Ok(Invocation::McpLogin(command)) => mcp_oauth::run(*command).await,
+        Ok(Invocation::ProviderConfig(command)) => provider_config::run(command).await,
         Err(failure) => render_parse_failure(failure),
     }
 }
@@ -211,6 +213,9 @@ usage:
             [--http-proxy <loopback-url>] [--timeout-ms <250..120000>]
     gta-claw-cli state snapshot <export|restore> --source <absolute-file>
             --destination <new-absolute-file> --passphrase-stdin
+        gta-claw-cli config provider inspect --source <absolute-config-file> [--json]
+        gta-claw-cli config provider prepare --source <absolute-config-file>
+            --destination <new-absolute-file> --expected-sha256 <source-digest> --selection-stdin [--json]
     gta-claw-cli migrate openclaw preview --source <absolute-state-root>
             [--after <relative-path> --fingerprint <sha256>]
     gta-claw-cli send <session-id> <message> --idempotency-key <key> <gateway-options>
@@ -226,6 +231,16 @@ commands:
   --version                   print `gta-claw-cli <version>` and exit 0
   --help, -h                  print this text and exit 0
   health                      report local runtime health; contacts nothing
+    config provider inspect     read only the saved provider selection and source SHA; no secret resolution or network
+    config provider prepare     validate a complete JSON selection from stdin and create a new configuration
+                                                            requires the inspected source SHA; never overwrites or applies to a live daemon
+                                                            alternatively --model <exact-id> preserves the existing provider's other settings
+    config provider apply       save a provider-only change during explicitly confirmed offline maintenance (Windows)
+                                                            --source <file> --candidate <file> --backup <new-file>
+                                                            --expected-sha256 <source> --candidate-sha256 <candidate> --confirm-apply --confirm-offline
+    config provider restore     restore a complete reviewed configuration while preserving even invalid current bytes
+                                                            same paths/digests, but requires --confirm-restore --confirm-offline
+                                                            both back up and verify before non-atomic writes; no restart, network, retry or automatic rollback
     mcp credential reference    print a server/origin-bound native tokenRef; no store/network access
     mcp credential status       report whether that native credential exists, never its value
     mcp credential set          read token stdin and update the bound entry; requires --token-stdin --confirm-write
@@ -249,6 +264,13 @@ commands:
     send <session-id> <message> native Gateway send; requires --idempotency-key
   gateway health              run one authenticated Gateway v4 health probe
     gateway sessions            list stored native sessions
+    gateway models              read cached native model metadata; --offset <models> --sha256 <snapshot-digest>
+                                                            no refresh, selection change, credential resolution or inference
+                                                            --availability explicitly requests typed unavailable status on the first page
+    gateway refresh-models      explicitly fetch the current provider catalogue; requires --sha256 <observed-digest>
+                                                            requests read/write scope; no model switch or inference; failure keeps the previous cache
+    gateway export-models --destination <absolute-file>
+                                verify and export the complete cached model catalogue without refresh or selection
     gateway describe <session>  read owned persistent session metadata, without message content
     gateway history <session>   read the bounded context checkpoint; optional --limit <1..1000>
     gateway send <session> <message> --idempotency-key <key>
@@ -257,6 +279,8 @@ commands:
     gateway run <run-id>        query a durable run; optional --wait-ms <0..120000>
     gateway partial-run <run-id> <revision>  read partial text; --offset <bytes> --sha256 <digest>
     gateway accounting-run <run-id> <revision>  read usage rounds; --offset <rounds> --sha256 <digest>
+    gateway export-accounting <run-id> <revision> --destination <absolute-file>
+                                                            export verified usage rounds as JSON; no ACK, replay or billing settlement
     gateway export-partial <run-id> <revision> --destination <absolute-file>
                                                             export all verified partial-text pages without ACK or replay
     gateway results <session>   list pending results; optional --after <cursor>
@@ -353,6 +377,7 @@ enum Invocation {
     Snapshot(state_snapshot::SnapshotCommand),
     McpCredential(mcp_credential::CredentialCommand),
     McpLogin(Box<mcp_oauth::LoginCommand>),
+    ProviderConfig(provider_config::ProviderConfigCommand),
 }
 
 #[derive(Clone, Copy)]
@@ -398,6 +423,7 @@ fn parse_invocation(arguments: &[OsString]) -> Result<Invocation, ParseFailure> 
         "send" => native_gateway::parse(arguments, 0).map(Invocation::Native),
         "migrate" => migration_preview::parse(arguments).map(Invocation::Migration),
         "state" => state_snapshot::parse(arguments).map(Invocation::Snapshot),
+        "config" => provider_config::parse(arguments).map(Invocation::ProviderConfig),
         "mcp"
             if arguments.get(1).and_then(|value| value.to_str()) == Some("oauth")
                 && matches!(

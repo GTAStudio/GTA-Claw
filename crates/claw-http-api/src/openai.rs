@@ -265,7 +265,7 @@ pub(crate) async fn embeddings(
                 "invalid_request_error",
             )
         })?;
-    validate_model(&state, &model)?;
+    let model = validate_model(&state, &model)?;
     let input = embedding_inputs(body.input)?;
     validate_embedding_inputs(&input)?;
     let dimensions = embedding_dimensions(body.dimensions.as_ref())?;
@@ -342,7 +342,7 @@ pub(crate) async fn chat(
         .and_then(Value::as_str)
         .unwrap_or("openclaw")
         .to_owned();
-    validate_model(&state, &model)?;
+    let model = validate_model(&state, &model)?;
     validate_sampling(&body)?;
     let prompt = chat_prompt(body.messages.as_ref())?;
     let tools = parse_chat_tools(body.tools.as_ref())?;
@@ -437,14 +437,14 @@ pub(crate) async fn responses(
     }
     let value = read_json_value(request, limits.openai_body_bytes, limits.body_timeout).await?;
     validate_responses_body(&value)?;
-    let body: ResponsesBody = serde_json::from_value(value).map_err(|error| {
+    let mut body: ResponsesBody = serde_json::from_value(value).map_err(|error| {
         ApiError::openai(
             StatusCode::BAD_REQUEST,
             error.to_string(),
             "invalid_request_error",
         )
     })?;
-    validate_model(&state, &body.model)?;
+    body.model = validate_model(&state, &body.model)?;
     if body
         .temperature
         .is_some_and(|value| !(0.0..=2.0).contains(&value))
@@ -1535,7 +1535,22 @@ fn validate_embedding_inputs(input: &[String]) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_model(state: &ApiState, model: &str) -> Result<(), ApiError> {
+fn validate_model(state: &ApiState, model: &str) -> Result<String, ApiError> {
+    if !is_model_reference(model)
+        && let Some(exact) = state
+            .inner
+            .services
+            .provider
+            .resolve_model_alias(model)
+            .map_err(provider_api_error)?
+        && !exact.is_empty()
+        && exact.len() <= 256
+        && !exact
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Ok(exact);
+    }
     if !is_model_reference(model) || !model_ids(state).contains(&model.to_owned()) {
         return Err(ApiError::openai(
             StatusCode::BAD_REQUEST,
@@ -1543,7 +1558,7 @@ fn validate_model(state: &ApiState, model: &str) -> Result<(), ApiError> {
             "invalid_request_error",
         ));
     }
-    Ok(())
+    Ok(model.to_owned())
 }
 
 fn is_model_reference(model: &str) -> bool {

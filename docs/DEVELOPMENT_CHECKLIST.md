@@ -41,12 +41,12 @@
 | M0 基线/设计 | 10 | 0 | 10 | 40 |
 | M1 安全执行 | 11 | 2 | 9 | 36 |
 | M2 持久恢复 | 11 | 0 | 11 | 44 |
-| M3 协议/模型/接入 | 15 | 2 | 13 | 52 |
+| M3 协议/模型/接入 | 15 | 2 | 13 | 51 |
 | M4 Agent 能力 | 10 | 0 | 10 | 40 |
 | M5 客户端 | 10 | 0 | 10 | 40 |
 | M6 迁移/交付 | 20 | 0 | 20 | 80 |
 | M7 扩展/兼容 | 11 | 0 | 11 | 44 |
-| 合计 | 98 | 4 | 94 | 376 |
+| 合计 | 98 | 4 | 94 | 375 |
 
 ## 当前工程进度
 
@@ -103,6 +103,17 @@
 | M1-11 / M3-10 | OAuth新CLI同profile/origin非阻塞进程锁，覆盖login/refresh/logout完整生命周期；Windows锁路径不可替换，真实竞争/中断后释放；四包570通过/7忽略及严格lint | 仅同协调目录的协作CLI，非原生CAS；外部编辑器/旧客户端/直接SDK/macOS仍有边界；见[OAuth协调记录](ledger/native-oauth-coordination-20260915.json) |
 | M3-06 / M3-07 | 原生OpenAI/Anthropic显式策略装配、独立凭据origin、无自动付费重试；目录内其他模型也不能覆盖固定默认模型 | 统一配置、完整能力目录、真实账号与所有流式合同 |
 | M3-06 | 修复候选模型验证前提前发布与回滚重启旧provider：原失败generation 0→2可复现，准备/提交/关闭同锁、配置代次复查及关闭取消；六种受控daemon场景和发布锁/容量边界，providers/daemon479通过/4忽略、严格lint及根全目标check | 统一typed配置/客户端编辑、完整退役清理、真实账号切换和费用仍开放；首个根检查不完整日志保留，见[模型发布记录](ledger/native-provider-publication-20260915.json) |
+| M3-06.01 / M3-07 / M5-01 | 主配置显式Copilot/OpenAI/Anthropic/disabled、SecretRef/端点/origin/超时/阈值与来源诊断；CLI inspect/prepare验证源SHA后独占新建候选；跨层换kind不继承旧凭据、重复键先失败后修复；六种真实进程方言/来源、十种静态检查、禁用启动及12次字段reload拒绝；三包457通过/5忽略、严格lint/根check | M3-06.01关闭；真实账号与完整在线切换/退役、图形配置编辑和全部旧凭据异常仍开放；生成文件不算已应用，见[统一配置记录](ledger/native-provider-config-20260916.json) |
+| M3-06.02 / M3-07 / M5-01 | 重复/超限/无效目录发布先失败后修复；原生Gateway/Admin八项元数据页及CLI models，固定完整SHA/默认模型/观察时间；显式refresh-models要求写权限/原SHA、单在途/10秒/取消与实例复查，八种生命周期和六种真实方言权限/网络计数通过；四包533通过/5忽略、严格lint/根check | SDK能力声明非实号验证，别名/账号与完整在线切换、图形选择仍开放；初轮OAuth原生状态失败保留，后续通过非根因修复；见[目录记录](ledger/native-model-catalogue-20260916.json) |
+| M3-06.02 / M3-07 | 同毫秒同目录替换实例导致SHA碰撞先失败后修复；目录加入providerGeneration，同锁核验摘要/捕获实例，刷新回执绑定requestedSha256；10种页/7种刷新CLI场景及真实daemon通过；最终四包534通过/5忽略、严格lint/根check | 代次为进程内，不是持久跨重启身份；所有旧凭据问题及完整M3-07仍开放；见[目录实例追加记录](ledger/native-model-catalogue-20260916.json) |
+| M3-07.04 / M5-01 | TUI独立Models视图、缓存读取/续页/显式刷新、连接与请求序号拒旧、单在途/失败保留/刷新后失效；六种真实WebSocket流程、20/40/80/120列和10/24行渲染；TUI全目标77通过、严格lint和根check | 仅目录展示与刷新，非图形模型选择或配置应用；完整目录归档、Slint及真实账号仍开放；见[终端目录追加记录](ledger/native-model-catalogue-20260916.json) |
+| M3-07.04 / M5-02 / M1-11 | Slint Models占位替换为真实目录、三图标控制/单在途/来源校验/拒旧及失败保留；七种真实控制器WS、双尺寸软件像素，桌面91通过；SDK五阶段独立进程凭据探针通过，最终六包869通过/7忽略、双workspace严格lint/根check | 仍非图形模型选择/配置应用或实号能力；新探针未复现旧原生凭据故障，绝不算根因修复；见[桌面与联合追加记录](ledger/native-model-catalogue-20260916.json) |
+| M3-06 / M3-07.04 / M4-10 / M5-01 / M5-02.02 | CLI精确model候选、Windows双SHA/离线确认/先验备份后保存及损坏恢复；20种文件场景/10种I/O故障/3个真实进程退出；Slint本地目录选择生成候选、同SHA换页拒旧及回执丢失恢复；九种daemon来源/方言和三种真实CLI到daemon启动通过；八包1087通过/11忽略、桌面96通过、双workspace严格lint/根check | 保存非原子且不等于在线应用，其他平台维护、TUI编辑/GUI应用/实号仍开放；OAuth损坏记录状态意外成功只增诊断未修根因；见[配置应用记录](ledger/native-provider-application-20260916.json) |
+| M3-07.03 / M3-08 | 模型声明工具限制绕过先失败后修复；完成/流式/嵌入/typed历史按精确缓存模型与已知上限调用前校验；区分未声明能力，可选宿主工具仅对已知不支持者省略，显式工具/图像不偷偷丢弃；计数型零调用/零事件和十种真实HTTP/SSE拒绝、正常边界文本通过；三包617通过/5忽略、严格lint/根check | 空能力集合仍未知非实号验收，无输入token精算/完整别名/跨账号能力保证；旧OAuth异常不关闭；见[能力准入记录](ledger/native-model-admission-20260916.json) |
+| M3-07.04 / M5-01 / M5-02.02 | TUI封闭JSON本地检查/精确model候选、目录与源SHA绑定、无Gateway命令/ACK、断线及取消等待保留任务、正常退出收尾；Copilot配置到SDK标识映射；八尺寸长ID回执、TUI/配置192通过、桌面97通过，双workspace严格lint/根check | 十包联合1460通过/1项MCP凭据撤销失败/11忽略，单项复验通过但非根因修复；仅本地候选不等于远端配置或在线应用，完整M3/M5不关闭；见[客户端追加记录](ledger/native-provider-application-20260916.json) |
+| M3-07.01 / M3-07.03 / M3-07.04 | 有界显式单跳别名、精确模型/账号不变、碰撞/链式/保留名拒绝，启动/刷新完整目录验证；HTTP显式解析后仍固定模型准入、16KiB摘要页及精确ID客户端选择；十二种来源/方言、十三种CLI页场景，七包1015通过/9忽略、桌面97通过，双workspace严格lint/根check | 旧严格客户端可能拒绝别名页，真实账号/在线退役/完整模型档案及旧凭据异常仍开放，不关闭任务；见[别名记录](ledger/native-model-aliases-20260916.json) |
+| M3-07.01 / M3-07.04 / M5-01 | CLI完整目录明文导出、单epoch只读固定元数据/摘要，跨页ID与别名全量校验后才新建；十三种真实CLI场景、三种实际daemon方言，三包441通过/7忽略及独立生产测试1通过，严格lint/根check | 无刷新/推理/ACK，输出非配置或实号证明；写入未知保留文件，GUI导出/断电耐久/完整退役和原凭据问题仍开放；见[目录导出记录](ledger/native-model-export-20260916.json) |
+| M3-07.02 / M3-07.04 / M5-01 / M5-02.02 | 显式只读生命周期原因、普通页旧格式保留；禁用/关闭启动前零调用，真实daemon鉴权/客户端传输/八尺寸TUI及双尺寸桌面验证；原生525通过/7忽略、桌面98通过、双workspace严格lint/根check | 状态非实号推理就绪，旧服务可拒绝显式查询；缓存过期/完整退役/旧凭据异常仍开放；见[状态记录](ledger/native-model-status-20260916.json) |
 | M3-08 | 显式原生Responses、store:false文本/图片/函数历史、终态/片段/usage校验；Chat缺结束信号和坏工具回合拒绝；真实daemon三方言与HTTP取消/断流/并发释放，三包694通过/5忽略及严格lint | reasoning续接/phase、远端内置工具、完整费用unknown/切换与真实账号仍开放；见[Responses记录](ledger/native-provider-responses-20260915.json) |
 | M3-08 | Chat固定response/model/choice及函数ID，拒绝终结后追加、跨索引重用/更换ID和越界；六种真实HTTP错误关闭/不重放，最终三包697通过/5忽略及严格lint | 联合回归出现原生凭据查询失败，仅增诊断后通过，未定位根因；完整方言/费用/真实服务仍开放；见[Chat身份记录](ledger/native-chat-identity-20260915.json) |
 | M3-08 | Anthropic完整消息/块终态、工具延后完成、唯一ID和部分文本；缓存输入三项合计/累计回退溢出拒绝；七种HTTP场景，三包703通过/5忽略及严格lint | 签名thinking续接、完整计价/unknown账单、实号及先前凭据异常仍开放；见[Anthropic记录](ledger/native-anthropic-lifecycle-20260915.json) |
@@ -120,6 +131,7 @@
 | M3-08 / M5-01 | TUI partial/partial-next固定连接与选中run终态逐页查看，旧游标拒绝/不新增ACK；七种真实WebSocket与窄宽渲染，全目标66通过/0忽略及严格lint | 续页只固定全文摘要非独立全文校验，有界transcript非归档；费用/桌面/实机与旧异常仍开放；见[TUI部分页记录](ledger/native-tui-partial-20260915.json) |
 | M3-08 / M5-01 / M5-02 | TUI和Slint接入已有providerAccounting，共用有界协议模型；区分缺失/未报/部分/明确零值/溢出、终态与日志来源和未结算费用；九种真实WebSocket、七种桌面状态及多尺寸软件像素，protocol/TUI138与桌面86通过、严格lint/根check | 非货币硬限额/已结算账单，桌面完整partial导出、模型配置生命周期、实号/交互平台与旧凭据异常仍开放；见[客户端用量记录](ledger/native-accounting-clients-20260915.json) |
 | M2-05 / M3-05 / M3-08 | CLI accounting-run按设备/run/终态revision只读16轮分页，完整记录摘要固定来源/日志代次；实际响应身份与计数、unknown不补零；九种CLI子进程及三方言daemon/重启/跨设备拒绝，CLI/daemon340通过/5忽略及严格lint | 单独续页非全文独立验证，完整归档/GUI逐轮查看/定价/发票与货币硬限额仍开放，旧凭据异常保留；见[逐轮用量页记录](ledger/native-accounting-pages-20260915.json) |
+| M3-05 / M3-08 / M5-01 / M5-02 | CLI export-accounting固定连接/终态、全页计数及全文SHA独立校验后独占创建JSON；TUI accounting/next与Slint只读逐轮查看、来源绑定/拒旧/无新增ACK；共享协议校验保留既有v1字段顺序；四包486通过/5忽略、桌面88通过、严格lint/根check | 非发票/价格/货币限额，GUI单独续页不独立证明全文；真实账号/平台交互、原生凭据跨进程偶发缺失未关闭；见[用量工作流记录](ledger/native-accounting-workflow-20260915.json) |
 | M4-01 / M4-02 | 显式memory_notes接入模型/HTTP/MCP统一审批审计；身份分区、CAS保存/纠正/删除、分页/UTF-8游标、关键词跨会话召回；实际双设备模型夹具及两次重启验证 | 语义/自动召回、完整客户端/来源/备份遗忘、完整磁盘配额与真实模型账号；见[显式记忆记录](ledger/native-explicit-memory-20260914.json) |
 | M4-02 / M5-01 / M5-08 | CLI七种记忆动作使用持久设备与health能力预检；原生直接工具回合零模型请求、绑定审批/持久结果/幂等；固定revision摘要导出页、原子CAS导入、结构化stdin凭据分离；相关四包535测试通过 | 大归档分阶段导入/本地自动收集、TUI/Slint专用管理、语义与全历史/备份遗忘仍开放；见[记忆客户端记录](ledger/native-memory-client-20260914.json) |
 | M1-06 / M2-07 / M4-02 | 记忆全库256个持久笔记本配额在同一redb写事务检查；最后名额竞争、满额已有记录维护、重启和空笔记本保留；写锁等待后再次核权，相关三包301测试通过 | 完整磁盘/归档/产物配额、身份退役、全平台故障仍开放；见[记忆配额记录](ledger/native-memory-quota-20260914.json) |
@@ -264,7 +276,7 @@ M4-01、M4-03、M4-08、M5-01、M6-16 共同验证，不能用各 crate 的测�
 
 - [ ] M0-10 固定功能、性能、故障注入、真实账号和设备验证矩阵及整条任务流程；横向比较使用同模型/输入/权限/预算，记录成功率、成本、时延与恢复结果，先确认隔离环境和执行授权。
 
-  归属/入口：各模块测试、`claw-conformance`、发布工作流；[现有 Rust CI](../.github/workflows/rust.yml)。前置：M0-05、M0-06、M0-09。当前：已有多组局部测试，不是冻结的完整产品验证矩阵。
+  归属/入口：各模块测试、`claw-conformance`、手动打包脚本；[依赖检查 CI](../.github/workflows/dependencies.yml)。前置：M0-05、M0-06、M0-09。当前：按用户要求移除非依赖 CI，源码验证仍须本地执行；已有多组局部测试，不是冻结的完整产品验证矩阵。
 
   - [ ] M0-10.01 冻结功能场景、故障点、OS/架构、文件系统、模型/渠道、测试数据和输入指纹；用任务 ID 关联每个必测单元。
   - [ ] M0-10.02 定义本地替身、真实账号、真机、发布制品四层验证，明确测试所有权、端口、时限、费用上限、隐私数据和清理范围。
@@ -551,7 +563,7 @@ M4-01、M4-03、M4-08、M5-01、M6-16 共同验证，不能用各 crate 的测�
 
 - [ ] M3-04 运行固定版本双向互操作：Rust 客户端对上游、参考客户端对 Rust；本地 fixture 不冒充外部互通。
 
-  归属/入口：conformance、gateway-client、daemon；[参考网关工作流](../.github/workflows/upstream-gateway-reference.yml)。前置：M0-04、M3-01、M3-02、M3-03。当前：有合同和参考入口，未声明本轮真实双向互操作全部通过。
+  归属/入口：conformance、gateway-client、daemon；手动命令 `./compat/upstream/validate.ps1`。前置：M0-04、M3-01、M3-02、M3-03。当前：参考网关 CI 已按要求移除，合同和本地参考入口保留，未声明本轮真实双向互操作全部通过。
 
   - [ ] M3-04.01 冻结参考服务/客户端版本、安装来源、测试身份、token、端口和支持方法范围，外部 Node 工具需隔离批准。
   - [ ] M3-04.02 分别运行 Rust client -> 固定上游、固定参考 client -> Rust daemon，覆盖配对、会话、发送、审批、取消、历史和结果恢复。
@@ -566,9 +578,9 @@ M4-01、M4-03、M4-08、M5-01、M6-16 共同验证，不能用各 crate 的测�
 
 - [ ] M3-06 在已装配的 Copilot、OpenAI-compatible、Anthropic 路径上完成统一配置、就绪与切换；真实授权成功与 smoke/local fixture 成功分别记录。
 
-  归属/入口：provider-sdk/providers/config、daemon；[原生策略](../apps/gta-claw-daemon/src/production/native_provider.rs)。前置：M1-08、M1-11、M3-02。当前：显式 provider policy 和本地真实 HTTP 夹具已接通，typed 主配置与真实账号未齐。
+  归属/入口：provider-sdk/providers/config、daemon；[原生策略](../apps/gta-claw-daemon/src/production/native_provider.rs)。前置：M1-08、M1-11、M3-02。当前：typed 主配置、CLI 候选编辑及本地真实 HTTP 夹具已接通，完整在线切换/退役与真实账号未齐。
 
-  - [ ] M3-06.01 将 provider/model/SecretRef/base URL/origin/timeout 纳入统一 typed 配置及来源诊断，保留现有显式模式的安全兼容路径。
+  - [x] M3-06.01 将 provider/model/SecretRef/base URL/origin/timeout 纳入统一 typed 配置及来源诊断，保留现有显式模式的安全兼容路径。证据：[统一配置记录](ledger/native-provider-config-20260916.json)；仅关闭该类型与装配范围，不包含真实账号或完整在线切换。
   - [ ] M3-06.02 实现准备、认证/能力校验、发布和旧 provider 退役；固定默认模型不能被普通角色/配置 reload 静默覆盖。
   - [ ] M3-06.03 验证空/禁用/冲突配置、未登记 origin、无凭据、认证失败、切换取消和 smoke 混用均明确拒绝，不降级成假就绪。
   - [ ] M3-06.04 用批准的专用账号分别跑三类提供商最小聊天/工具/取消流程，记录实际授权和局部协议替身的区别。

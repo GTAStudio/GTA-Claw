@@ -335,6 +335,7 @@ GTA_CLAW_GATEWAY_TOKEN='…' gta-claw-tui --gateway wss://gateway.example.test
 | Diff | Workspace diff viewer. |
 | Artifacts | Session artifact viewer. |
 | Help | The keyboard reference. |
+| Models | Cached native provider descriptors and explicit catalogue refresh. |
 
 ### 4.3 Keys
 
@@ -348,7 +349,7 @@ x                 cancel the exact observed native run
 y / n             approve / deny
 r                 refresh from Gateway
 Ctrl-P or :       command palette
-1..6              jump to a screen
+1..7              jump to a screen
 Esc               close palette
 ?                 keyboard help
 q / Ctrl-C        quit safely
@@ -359,11 +360,47 @@ q / Ctrl-C        quit safely
 Press `:` or `Ctrl-P`, type a command, press Enter. Recognized commands, case-insensitive:
 
 `sessions`, `workspace`, `runs`, `diff`, `artifacts`, `help`, `refresh`, `quit` (or `q`),
-`new`, `message`, `send`, `run`, `partial`, `partial-next`, `cancel`, `retry-send`.
+`new`, `message`, `send`, `run`, `partial`, `partial-next`, `accounting`, `accounting-next`,
+`cancel`, `retry-send`, `models`, `models-next`, `refresh-models`, `config-provider <JSON>`.
 
 `discard-draft` explicitly clears unsubmitted input. `discard-send` clears a retained submission
 only when every attempt is known not to have been sent; queued or possibly delivered input cannot
 be discarded through that command. The memory actions below preserve their structured type on retry.
+
+The independent Models view shows the current connection's cached provider directory, selected
+model and instance generation, observation time, optional limits and SDK-advertised capabilities.
+`models` (also `r` in that view) reads cached data; `models-next` pins the original digest for the
+next eight-entry page. `refresh-models` explicitly fetches the provider directory without selecting
+a model or invoking inference. Only one catalogue operation is queued at a time. Failure preserves
+the last valid page; successful refresh invalidates it until a fresh `models` read. Connection or
+request sequence changes reject stale results. These pages never enter chat history or create ACK
+eligibility. Live capabilities and full online configuration application remain unverified.
+See the [TUI follow-up](ledger/native-model-catalogue-20260916.json).
+
+For a local model candidate, use the `config-provider` command followed by one strict JSON object:
+
+```text
+config-provider {"action":"inspect","source":"D:/Configs/claw.json5"}
+config-provider {"action":"prepare","source":"D:/Configs/claw.json5","destination":"D:/Configs/claw.model.json5","model":"exact-model-id"}
+```
+
+Source inspection is local and can run without a ready Gateway. Preparation requires a current
+validated Models page, no in-flight catalogue request, the same inspected source path and an exact
+model ID present on that page. Saved provider and current model must match the catalogue; Copilot
+configuration `copilot` correctly maps to SDK identity `github-copilot`. A match does not prove this
+local file belongs to the remote Gateway. The source hash is rechecked and the candidate is created
+without overwrite, synchronized and read back. The source, credentials and online model are not
+changed; use the [offline CLI workflow](../apps/gta-claw-cli/README.md#offline-application-and-recovery)
+for separately reviewed application. No live readiness or credential validation is inferred.
+
+The JSON is bounded to 16 KiB, paths to 4096 bytes and model IDs to 256 bytes. Spaces in paths stay
+data; use JSON escaping or forward slashes. Duplicate/unknown fields, unsupported actions, relative
+paths, missing/current models and mixed provider selections are refused. Paste is supported in the
+palette; ordinary palette commands retain their smaller bound. Only one local file task is in
+flight. Gateway reconnect does not discard its handle or result, and normal exit waits for a started
+task before returning. Local results appear in the Models view without entering chat history or ACK
+queues. A file I/O error or process interruption may leave a candidate; never overwrite or delete it
+as an automatic retry. This is not a crash-durable client journal or a filesystem I/O deadline.
 
 Native sends retain a random idempotency key until a durable receipt is received. Unknown delivery
 blocks another send; `retry-send` explicitly reuses the original session/text/key. Reconnection
@@ -386,6 +423,17 @@ A whole single-page result has its SHA256 checked. Later pages pin the whole-con
 not independently verify it, and the transcript remains a bounded view, not a complete archive.
 Use [CLI export-partial](../apps/gta-claw-cli/README.md#retained-partial-text) to collect and verify
 the entire retained text. See the [TUI record](ledger/native-tui-partial-20260915.json).
+
+`accounting` reads the first provider-round page for the selected observed terminal run;
+`accounting-next` reads its explicit continuation. Pages show at most 16 of 1024 retained rounds,
+including provider/model/response identifiers, primary-counter coverage, included cached/reasoning
+subsets and finish reason. Missing reports stay unknown; explicitly complete zeroes remain zero.
+Connection, session, run, turn, revision, terminal state, count, digest and summary provenance are
+pinned. A changed connection or run clears the cursor, and stale responses cannot update the view.
+Viewing usage never adds a result ACK or permits replay. A complete single page verifies its full
+digest, while a later page only pins the snapshot. Use
+[CLI export-accounting](../apps/gta-claw-cli/README.md) for a complete, independently verified
+plaintext JSON export. Cost remains uncalculated and billing unreconciled.
 
 Anything else reports `Unknown command: …` in the notice line. `Esc` closes the palette.
 
@@ -488,10 +536,116 @@ admin-token resolution, update and legacy/channel settings, channel coverage, an
 configuration and secret resolution. It does not open listeners. It only computes the state
 directory path: it does not create the directory, test its usability or permissions, or open the
 pairing, audit or goal stores. It also does not initialize telemetry or test its output, fetch the
-role, discover or activate plugins, or initialize a provider.
+role, discover or activate plugins, or authenticate/activate a provider. Native API clients and
+their transports are constructed for static validation without contacting their endpoints.
 `--check-config` accepts `--config` and `--state-dir`; it cannot be combined with `--probe` or any
 listener, logging, TLS-assertion or smoke option. Consequently, although the check calls the exposure
 policy, it cannot preflight proposed listener overrides or a routable deployment.
+
+The optional `core.provider` object selects one explicit backend independently of legacy
+`core.copilot` defaults. Its kinds are `openai`, `anthropic`, `copilot` and `disabled`:
+
+```json5
+{
+  core: {
+    provider: {
+      kind: "openai",
+      model: "exact-provider-model-id",
+      model_aliases: [{ alias: "work", model: "exact-provider-model-id" }],
+      api_key: "env:PROVIDER_API_KEY",
+      base_url: "https://api.openai.com/v1/",
+      credential_origin: "https://api.openai.com",
+      completion_api: "responses",
+      request_timeout_ms: 30000,
+    },
+  },
+}
+```
+
+This is a partial file layer; keep the rest of the required configuration, including the role
+source and channel settings. OpenAI/Anthropic require a SecretRef, not a literal key. Model IDs
+are exact, nonblank and at most 256 bytes; URLs are at most 2048 bytes, references at most 1024.
+Timeout is 1000..120000 ms, default 120000. HTTPS and literal loopback HTTP are accepted without
+userinfo, query, fragment, whitespace or ambiguous dot paths. Origin must match the endpoint and
+contain no path; absent origin is derived from the validated endpoint. Official API endpoints are
+defaults. Custom origins still require separate `GTA_CLAW_PROVIDER_ORIGINS` enrollment. A declared
+origin does not authorize credential disclosure. `completion_api` is OpenAI-only and defaults to
+`chat_completions`; `responses` is explicit and stateless.
+
+Copilot takes `kind:"copilot"`, an exact `model` and optional `request_timeout_ms`; authentication
+remains in `core.auth.github`, and native API-key/endpoint fields are refused. OpenAI/Anthropic and
+disabled mode do not require unused GitHub credentials. `kind:"disabled"` accepts no active
+provider settings, starts no model or Device Flow, and stays explicitly non-ready for model
+requests while administrative inspection remains available. The optional `max_observed_turn_tokens`
+is an observed per-turn stop threshold, not a monetary or single-request hard cap.
+
+Optional `model_aliases` also applies to Copilot and Anthropic. It is a case-sensitive, single-hop
+alias-to-exact-ID table, limited to 128 entries and 4096 total UTF-8 bytes of names and targets;
+each name uses the same 256-byte model-ID grammar. Duplicate names, chains, exact-ID collisions,
+`openclaw` and all `openclaw/` names are reserved or refused. Startup and refresh bind every target
+to the complete current provider catalogue; a bad refresh preserves the previous catalogue.
+`model` itself stays exact. Aliases resolve before fixed-model/capability checks, so an alias to
+another model does not bypass the explicit selection. They never infer credentials, change account
+or endpoint, or add fallback. Native HTTP accepts only explicitly configured extra aliases; the
+generic HTTP adapter's existing model-name contract remains unchanged. Alias edits require restart.
+
+With no `core.provider`, existing selection remains unchanged. Any explicit selection conflicts
+with `GTA_CLAW_PROVIDER_POLICY`, including an empty legacy policy value, and cannot use smoke.
+Explicit models cannot be replaced by remote role model changes or configuration reload. Provider
+edits require restart; refused reload leaves the running configuration/provider generations intact.
+Layer changes of `kind` replace the whole provider object so another provider never inherits its
+credentials. Same-kind partial layers preserve unmodified fields. Duplicate object fields in
+JSON5 layers are rejected before merging. Operator status identifies the selection source and
+declared origin without credential identifiers.
+
+[CLI provider inspect/prepare](../apps/gta-claw-cli/README.md#provider-configuration) provides a
+local file workflow with source SHA verification and exclusive new candidates. It does not resolve
+environment overrides or validate live credentials. See the
+[configuration record](ledger/native-provider-config-20260916.json) for tested and open boundaries.
+
+`config provider prepare --model <exact-id>` changes only the model while retaining the provider's
+credential reference, endpoint, protocol, timeout and budget. Windows `apply` additionally requires
+both reviewed digests, a new backup and `--confirm-apply --confirm-offline`; it verifies the backup
+before writing the held source file. This is non-atomic offline saving, not live configuration
+publication. A failure may leave source bytes unknown; `restore` uses a separate confirmation and
+preserves those bytes before restoring a complete reviewed snapshot. See the
+[offline application and recovery procedure](../apps/gta-claw-cli/README.md#offline-application-and-recovery).
+
+Native `gateway models` provides up to eight cached entries per page with exact IDs, declared
+capabilities, optional limits, configured aliases, selected model and observation timestamp.
+Aliases are configuration metadata covered by the digest, not live provider capability claims.
+Encoded pages stay within 16 KiB and can therefore be shorter. New readers accept old pages
+without aliases; old strict readers can reject alias-bearing pages and need an upgrade. TUI and
+Slint show aliases separately while candidate editors keep exact IDs. Reading performs no network request.
+`gateway refresh-models --sha256 <observed-digest>` is a separate explicit read/write operation:
+one model-list request, ten-second wait budget, no inference or model switch. Invalid/changed
+catalogues, cancelled reads or concurrent provider changes preserve the old cache. SDK-advertised
+capabilities are not live per-account capability proof. See the
+[CLI model catalogue guide](../apps/gta-claw-cli/README.md#model-catalogue) and
+[catalogue verification](ledger/native-model-catalogue-20260916.json).
+
+`gateway models --availability` reads explicit lifecycle status: `disabled`, `authentication_pending`,
+`not_initialized` or `retired`. TUI provides `models-status`, and desktop Models has a status control.
+These are read-only local facts, not live inference readiness. Ordinary directory queries retain
+their previous format; old-server refusal preserves the previous page, and unknown reasons are
+rejected. See the [status record](ledger/native-model-status-20260916.json).
+
+`gateway export-models --destination <new-absolute-file>` reads the entire cached directory through
+the same authenticated read-only connection. It pins all page metadata and independently verifies
+the complete digest and cross-page ID/alias uniqueness before creating a file. No refresh, inference,
+model change or ACK occurs. The result is a bounded plaintext metadata archive, not an account proof
+or configuration import. Interrupted reads create no file; an uncertain file write must be preserved
+and inspected. Existing files are never overwritten. See the
+[export procedure](../apps/gta-claw-cli/README.md#complete-catalogue-export) and
+[verification record](ledger/native-model-export-20260916.json).
+
+Before a provider completion, stream or embedding call, daemon checks that the exact model is
+still present and that provider capabilities, explicit per-model declarations and known output
+limits admit the request. Missing per-model declarations stay unknown and use only the existing
+provider support checks. Explicit client tools, required tools, image data and typed tool history
+are not discarded to force success. Only optional host/runtime declarations are omitted for a
+known text-only model. No fallback model, inferred context size or extra network request is added;
+see the [admission record](ledger/native-model-admission-20260916.json).
 
 ### 5.3 Serving
 
@@ -502,7 +656,8 @@ gta-claw-daemon
 Serving mode resolves configuration and initializes telemetry in `main`, then calls
 `serve_production`. `ProductionService` startup opens the durable Gateway pairing, security-audit
 and goal stores, activates signed plugins, conditionally activates the smoke provider or GitHub
-Copilot, starts configured channel transports, and binds four listener surfaces:
+Copilot or an explicit native OpenAI/Anthropic selection, starts configured channel transports,
+and binds four listener surfaces:
 
 - the main 17-route HTTP API;
 - the legacy Node-compatible HTTP facade;
@@ -674,6 +829,42 @@ and fails closed if it cannot be loaded. Issued device tokens remain bounded and
 Pending approvals are queried after reconnect, and approval is disabled until a complete bounded
 preview is available. Commands and results are tied to a connection epoch. Full streaming,
 history/event reconciliation, workspace trust and full credential lifecycle remain unfinished.
+
+For an observed native terminal run, the Session Usage area shows the stored accounting summary.
+Its refresh icon reads provider rounds from the start; the next arrow reads the next page when
+available. Controls disable while a page is in flight or the current run/connection cannot be
+matched. The scrollable read-only area distinguishes missing reports, complete zeroes, partial
+counters, persistence provenance and uncalculated cost. Failed reads preserve the prior valid
+page and never change the run outcome or acknowledge a result. Selection/epoch/revision changes
+reject stale replies. This is bounded inspection, not full export or invoice reconciliation; see
+the [accounting workflow record](ledger/native-accounting-workflow-20260915.json).
+
+Settings > Models now displays the native cached catalogue rather than an automatic-routing
+placeholder. The down arrow reads the first cached page, the right arrow reads a pinned next page,
+and the refresh icon explicitly fetches the provider directory. These controls use the existing
+authenticated connection, disable during a request and never select or configure a model.
+Failed/invalid replies keep the previous valid page; a successful refresh clears it until another
+cache read. Disconnect/epoch changes clear the view and reject stale responses. Optional limits
+stay unknown when absent, and SDK capability declarations remain explicitly unverified. The
+scrollable read-only view does not add chat results or ACKs. Full model selection/application is
+not implemented by these controls; see the [desktop follow-up](ledger/native-model-catalogue-20260916.json).
+
+The pencil control opens a separate **local** model candidate form. Enter an absolute source path,
+inspect it with the down-arrow control, choose an exact model from the current catalogue page,
+then enter a new absolute candidate path and create it with the plus control. The local provider
+kind and currently saved model must match the observed catalogue, but matching those fields is
+not proof that this file belongs to the connected Gateway. Review the source's endpoint and
+credential binding independently. Changing catalogue page, connection or instance invalidates
+the old selection. No alias, fallback model or new credential is inferred.
+
+The platform service rechecks the original file SHA, creates without overwrite and reads the
+candidate back. Only the model field changes; source and live daemon remain unchanged. Receipts
+include the source and candidate digests, not credential references, and remain visible across
+connection loss so an already created file is not mistaken for an unperformed operation. A local
+I/O error can leave a candidate; preserve it. File tasks run outside the UI thread with one task
+in flight and are drained on ordinary controller shutdown. For reviewed application and recovery,
+use the explicit [offline CLI workflow](../apps/gta-claw-cli/README.md#offline-application-and-recovery).
+No local form control applies to a running Gateway or authorizes a restart or a paid request.
 
 ### 6.3 Platform Boundaries
 

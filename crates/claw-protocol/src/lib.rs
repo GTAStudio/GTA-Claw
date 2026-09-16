@@ -13,6 +13,7 @@ pub mod gateway;
 pub mod methods;
 pub mod native_accounting;
 pub mod native_approval;
+pub mod native_models;
 
 /// The protocol version implemented by this workspace.
 pub const PROTOCOL_VERSION: u16 = 1;

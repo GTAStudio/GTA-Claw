@@ -528,6 +528,226 @@ fn parse_partial_page(
     })
 }
 
+/// A read-only accounting cursor bound to an observed connection and terminal run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountingPageRequest {
+    /// Worker connection observed by the UI.
+    pub connection_id: u64,
+    /// Session already selected by the user.
+    pub session_id: String,
+    /// Exact durable run identity.
+    pub run_id: String,
+    /// Observed terminal revision.
+    pub revision: u64,
+    /// Observed turn ordinal.
+    pub turn: u64,
+    /// Observed terminal state.
+    pub state: RunState,
+    /// First round index requested.
+    pub offset: usize,
+    /// Original round count required for a continuation.
+    pub total_rounds: Option<usize>,
+    /// Whole-snapshot digest required for a continuation.
+    pub sha256: Option<String>,
+    /// Original summary and provenance required for a continuation.
+    pub summary: Option<claw_protocol::native_accounting::ProviderAccounting>,
+}
+
+impl AccountingPageRequest {
+    fn parameters(&self) -> Result<Value, WorkerError> {
+        if self.connection_id == 0
+            || !valid_run_id(&self.run_id)
+            || self.session_id.is_empty()
+            || self.session_id.len() > 128
+            || self.session_id.chars().any(char::is_control)
+            || self.revision == 0
+            || self.offset > 1024
+            || !matches!(
+                self.state,
+                RunState::Completed
+                    | RunState::CompletedWithChanges
+                    | RunState::Cancelled
+                    | RunState::Failed
+                    | RunState::OutcomeUnknown
+            )
+            || (self.offset > 0
+                && (self.sha256.is_none() || self.total_rounds.is_none() || self.summary.is_none()))
+            || self
+                .total_rounds
+                .is_some_and(|total| total > 1024 || self.offset > total)
+            || self
+                .sha256
+                .as_ref()
+                .is_some_and(|digest| !valid_run_id(digest))
+        {
+            return Err(WorkerError("Invalid accounting page request".to_owned()));
+        }
+        let mut parameters = json!({"runId":self.run_id,"accountingPage":{"revision":self.revision,"offset":self.offset}});
+        if let Some(digest) = &self.sha256 {
+            parameters["accountingPage"]["sha256"] = json!(digest);
+        }
+        Ok(parameters)
+    }
+}
+
+/// A validated page of provider reports, separate from text results and ACK eligibility.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccountingPage {
+    /// The complete connection, run and cursor binding.
+    pub request: AccountingPageRequest,
+    /// Exclusive round end.
+    pub end_offset: usize,
+    /// Next round offset, absent at the snapshot end.
+    pub next_offset: Option<usize>,
+    /// Number of recorded provider attempts.
+    pub total_rounds: usize,
+    /// Digest of the entire ordered summary and rounds.
+    pub sha256: String,
+    /// Validated aggregate and persistence provenance.
+    pub summary: claw_protocol::native_accounting::ProviderAccounting,
+    /// At most sixteen reports, with missing responses preserved.
+    pub rounds: Vec<claw_protocol::native_accounting::AccountingRound>,
+}
+
+fn parse_accounting_page(
+    value: &Value,
+    request: AccountingPageRequest,
+) -> Result<AccountingPage, WorkerError> {
+    let invalid = || {
+        WorkerError("Accounting page changed identity, counters, provenance or snapshot".to_owned())
+    };
+    claw_protocol::native_accounting::validate_page(&value.to_string(), &request.parameters()?)
+        .map_err(|_| invalid())?;
+    if value["sessionId"].as_str() != Some(&request.session_id)
+        || value["turn"].as_u64() != Some(request.turn)
+        || RunState::parse(value["status"].as_str().ok_or_else(invalid)?) != request.state
+    {
+        return Err(invalid());
+    }
+    let page = &value["accounting"];
+    if page["available"] != true {
+        return Err(WorkerError(
+            "No provider accounting snapshot is available for this run".to_owned(),
+        ));
+    }
+    let total_rounds = usize::try_from(page["totalRounds"].as_u64().ok_or_else(invalid)?)
+        .map_err(|_| invalid())?;
+    let summary = claw_protocol::native_accounting::ProviderAccounting::parse(&page["summary"])
+        .map_err(|_| invalid())?
+        .ok_or_else(invalid)?;
+    if request
+        .total_rounds
+        .is_some_and(|expected| expected != total_rounds)
+        || request
+            .summary
+            .as_ref()
+            .is_some_and(|expected| *expected != summary)
+    {
+        return Err(invalid());
+    }
+    Ok(AccountingPage {
+        end_offset: usize::try_from(page["endOffset"].as_u64().ok_or_else(invalid)?)
+            .map_err(|_| invalid())?,
+        next_offset: page["nextOffset"]
+            .as_u64()
+            .map(usize::try_from)
+            .transpose()
+            .map_err(|_| invalid())?,
+        total_rounds,
+        sha256: page["sha256"].as_str().ok_or_else(invalid)?.to_owned(),
+        summary,
+        rounds: serde_json::from_value(page["rounds"].clone()).map_err(|_| invalid())?,
+        request,
+    })
+}
+
+/// An explicit model catalogue operation, distinct from chat or model selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModelCatalogueAction {
+    /// Reads the first cached page with explicit lifecycle availability details.
+    Availability,
+    /// Reads a cached page without contacting the provider.
+    Read {
+        /// Zero-based descriptor offset.
+        offset: usize,
+        /// Required whole-snapshot digest for continuations.
+        sha256: Option<String>,
+    },
+    /// Fetches the current provider's directory without inference or selection changes.
+    Refresh {
+        /// Previously observed instance-bound snapshot digest.
+        sha256: String,
+    },
+}
+
+/// A catalogue request tied to the connection and UI request actually observed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelCatalogueRequest {
+    /// Worker-owned connection identity.
+    pub connection_id: u64,
+    /// Monotonic UI request sequence, not a peer request identifier.
+    pub sequence: u64,
+    /// Explicit read or refresh.
+    pub action: ModelCatalogueAction,
+}
+
+impl ModelCatalogueRequest {
+    fn parameters(&self) -> Result<Value, WorkerError> {
+        let invalid =
+            || WorkerError("Invalid model catalogue request; nothing was sent".to_owned());
+        if self.connection_id == 0 || self.sequence == 0 {
+            return Err(invalid());
+        }
+        match &self.action {
+            ModelCatalogueAction::Availability => {
+                Ok(json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true}}))
+            }
+            ModelCatalogueAction::Read { offset, sha256 } => {
+                if *offset > 1024
+                    || *offset > 0 && sha256.is_none()
+                    || sha256
+                        .as_deref()
+                        .is_some_and(|digest| !valid_run_id(digest))
+                {
+                    return Err(invalid());
+                }
+                let mut params = json!({"nativeCatalogPage":{"offset":offset}});
+                if let Some(digest) = sha256 {
+                    params["nativeCatalogPage"]["sha256"] = json!(digest);
+                }
+                Ok(params)
+            }
+            ModelCatalogueAction::Refresh { sha256 } => {
+                if !valid_run_id(sha256) {
+                    return Err(invalid());
+                }
+                Ok(json!({"nativeCatalogRefresh":{"sha256":sha256}}))
+            }
+        }
+    }
+
+    fn check_response(&self, value: &Value) -> Result<(), WorkerError> {
+        let encoded = value.to_string();
+        match &self.action {
+            ModelCatalogueAction::Availability => {
+                claw_protocol::native_models::validate_page(&encoded, 0, None)
+            }
+            ModelCatalogueAction::Read { offset, sha256 } => {
+                claw_protocol::native_models::validate_page(&encoded, *offset, sha256.as_deref())
+            }
+            ModelCatalogueAction::Refresh { sha256 } => {
+                claw_protocol::native_models::validate_refresh(&encoded, sha256)
+            }
+        }
+        .map_err(|_| {
+            WorkerError(
+                "Model catalogue response was invalid or changed; the previous view was preserved"
+                    .to_owned(),
+            )
+        })
+    }
+}
+
 /// Commands sent from the render loop to background Gateway work.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UiCommand {
@@ -565,6 +785,10 @@ pub enum UiCommand {
     },
     /// Reads one explicitly requested page without acknowledging or replaying the run.
     ReadPartial(PartialPageRequest),
+    /// Reads stored provider rounds without inference, acknowledgement or replay.
+    ReadAccounting(AccountingPageRequest),
+    /// Explicit cached model inspection or directory refresh.
+    ModelCatalogue(ModelCatalogueRequest),
     /// Cancels only the observed run.
     AbortRun {
         /// Session expected to own the running turn.
@@ -627,6 +851,8 @@ impl UiCommand {
             Self::SendMessage { .. }
                 | Self::InvokeMemory { .. }
                 | Self::ReadPartial(_)
+                | Self::ReadAccounting(_)
+                | Self::ModelCatalogue(_)
                 | Self::AbortRun { .. }
                 | Self::AcknowledgeRun { .. }
                 | Self::ResolveApproval { .. }
@@ -639,6 +865,15 @@ impl UiCommand {
 /// Data emitted by the background worker for synchronous model updates.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkerEvent {
+    /// A validated catalogue result or a bounded, content-free failure for one UI request.
+    ModelCatalogue {
+        /// Connection and sequence that initiated the operation.
+        request: ModelCatalogueRequest,
+        /// Strictly checked page/receipt, never a chat result.
+        result: Result<Value, String>,
+    },
+    /// Stored provider metadata, never a complete assistant result.
+    AccountingPage(AccountingPage),
     /// One verified page, separate from complete run results and their ACK eligibility.
     PartialPage(PartialPage),
     /// Durable receipt for an explicitly keyed user message.
@@ -1457,6 +1692,35 @@ async fn handle_command(
         }
         UiCommand::QueryRun { session_id, run_id } => {
             send_native_run(client, sender, sequence, &session_id, &run_id, endpoint).await
+        }
+        UiCommand::ReadAccounting(request) => {
+            let parameters = request.parameters()?;
+            let value = request_json(client, sequence, "agent.wait", &parameters, endpoint).await?;
+            let page = parse_accounting_page(&value, request)?;
+            sender
+                .send(WorkerEvent::AccountingPage(page))
+                .await
+                .map_err(|_| WorkerError("render loop stopped".to_owned()))
+        }
+        UiCommand::ModelCatalogue(request) => {
+            let result = async {
+                if request.connection_id != client.connection_id {
+                    return Err(WorkerError(
+                        "Model request belongs to an old connection; nothing was sent".to_owned(),
+                    ));
+                }
+                let params = request.parameters()?;
+                let value =
+                    request_json(client, sequence, "models.list", &params, endpoint).await?;
+                request.check_response(&value)?;
+                Ok(value)
+            }
+            .await
+            .map_err(|error: WorkerError| error.to_string());
+            sender
+                .send(WorkerEvent::ModelCatalogue { request, result })
+                .await
+                .map_err(|_| WorkerError("render loop stopped".to_owned()))
         }
         UiCommand::ReadPartial(request) => {
             let parameters = request.parameters()?;
@@ -2398,6 +2662,115 @@ const fn connection_label(state: &ConnectionState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_catalogue_requests_keep_read_refresh_and_unavailable_responses_separate() {
+        use super::{ModelCatalogueAction, ModelCatalogueRequest};
+        use serde_json::json;
+        let mut request = ModelCatalogueRequest {
+            connection_id: 1,
+            sequence: 1,
+            action: ModelCatalogueAction::Read {
+                offset: 0,
+                sha256: None,
+            },
+        };
+        assert_eq!(
+            request.parameters().expect("read"),
+            json!({"nativeCatalogPage":{"offset":0}})
+        );
+        let unavailable = json!({"schemaVersion":1,"available":false,"selectionChanged":false,"networkContacted":false});
+        assert!(request.check_response(&unavailable).is_ok());
+        request.action = ModelCatalogueAction::Availability;
+        assert_eq!(
+            request.parameters().expect("availability read"),
+            json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true}})
+        );
+        assert!(request.check_response(&unavailable).is_ok());
+        let mut detailed = unavailable.clone();
+        detailed["unavailableReason"] = json!("authentication_pending");
+        assert!(request.check_response(&detailed).is_ok());
+        detailed["unavailableReason"] = json!("untrusted-private-secret");
+        assert!(request.check_response(&detailed).is_err());
+        request.action = ModelCatalogueAction::Read {
+            offset: 8,
+            sha256: None,
+        };
+        assert!(request.parameters().is_err());
+        request.action = ModelCatalogueAction::Read {
+            offset: 8,
+            sha256: Some("a".repeat(64)),
+        };
+        assert!(request.parameters().is_ok());
+        assert!(request.check_response(&unavailable).is_err());
+        request.action = ModelCatalogueAction::Refresh {
+            sha256: "a".repeat(64),
+        };
+        assert!(request.check_response(&unavailable).is_err());
+        let mut receipt = json!({"schemaVersion":1,"refreshed":true,"provider":"fixture","providerGeneration":1,"requestedSha256":"a".repeat(64),
+            "selectedModel":"fixture-model","totalModels":1,"selectionChanged":false,"networkContacted":true,"inferenceInvoked":false});
+        assert!(request.check_response(&receipt).is_ok());
+        receipt["requestedSha256"] = json!("b".repeat(64));
+        assert!(request.check_response(&receipt).is_err());
+        request.connection_id = 0;
+        assert!(request.parameters().is_err());
+    }
+
+    #[test]
+    fn accounting_page_identity_summary_and_full_digest_are_checked_before_display() {
+        use super::{AccountingPageRequest, RunState, parse_accounting_page, partial_sha256};
+        use serde_json::json;
+        let request = AccountingPageRequest {
+            connection_id: 1,
+            session_id: "owned".to_owned(),
+            run_id: "a".repeat(64),
+            revision: 3,
+            turn: 0,
+            state: RunState::OutcomeUnknown,
+            offset: 0,
+            total_rounds: None,
+            sha256: None,
+            summary: None,
+        };
+        let tokens = json!({"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0});
+        let snapshot = json!({"summary":{"available":true,"recordedRounds":1,"completeCounterRounds":0,"partialCounterRounds":0,"unreportedRounds":1,
+            "allPrimaryCountersReported":false,"observedTokens":tokens,"aggregationOverflow":false,"costCalculated":false,"billingReconciled":false,
+            "recordSource":"provider_journal","journalRevision":2,"journalClosed":false,"attemptsMayBeUnsent":true},"rounds":[{"round":0,"response":null}]});
+        let value = json!({"runId":request.run_id,"sessionId":"owned","revision":3,"turn":0,"status":"outcome_unknown","durable":true,"acknowledged":false,"automaticReplay":false,
+            "accounting":{"available":true,"offset":0,"endOffset":1,"nextOffset":null,"totalRounds":1,
+                "sha256":partial_sha256(&serde_json::to_vec(&snapshot).expect("snapshot")),"summary":snapshot["summary"],"rounds":snapshot["rounds"]}});
+        let page = parse_accounting_page(&value, request.clone()).expect("valid page");
+        assert_eq!(page.total_rounds, 1);
+        assert!(page.rounds[0].response.is_none());
+        for (pointer, replacement) in [
+            ("/runId", json!("b".repeat(64))),
+            ("/sessionId", json!("other")),
+            ("/revision", json!(4)),
+            ("/turn", json!(1)),
+            ("/status", json!("failed")),
+            ("/acknowledged", json!(true)),
+            ("/automaticReplay", json!(true)),
+            ("/accounting/sha256", json!("0".repeat(64))),
+            ("/accounting/summary/journalRevision", json!(3)),
+            ("/accounting/rounds/0/round", json!(1)),
+            ("/accounting/endOffset", json!(2)),
+        ] {
+            let mut changed = value.clone();
+            *changed.pointer_mut(pointer).expect("field") = replacement;
+            assert!(
+                parse_accounting_page(&changed, request.clone()).is_err(),
+                "{pointer}"
+            );
+        }
+        let mut expected = request.clone();
+        expected.total_rounds = Some(2);
+        assert!(parse_accounting_page(&value, expected).is_err());
+        let mut expected = request;
+        let mut summary = page.summary;
+        summary.attempts_may_be_unsent = Some(false);
+        expected.summary = Some(summary);
+        assert!(parse_accounting_page(&value, expected).is_err());
+    }
+
     #[test]
     fn partial_page_identity_bounds_and_content_are_checked_before_display() {
         use super::{PartialPageRequest, RunState, parse_partial_page, partial_sha256};

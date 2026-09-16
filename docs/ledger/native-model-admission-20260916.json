@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-model-capability-and-known-output-limit-admission",
+  "capturedOn": "2026-09-16",
+  "baseCommit": "c360c2b36d3df1bf998b83ac7d171f78a39aade8",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "taskIds": ["M3-07.03", "M3-08"],
+  "platform": "windows-x86_64",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "cargoLockSha256": "03ae0a54ee93bb13ccaf84f53747742ef5fd48103ef6032b07e4793baeae7834",
+  "sourceFiles": [
+    { "path": "apps/gta-claw-daemon/src/adapters/http_api.rs", "sha256": "e3543e844b965c035d130eee948bbef20690cec32c23fd020215053a26cb332d" },
+    { "path": "apps/gta-claw-daemon/tests/production_composition.rs", "sha256": "a8f7c41a905b3185e69f21fb062779b612ba007d703a96e5efa40617148b411b" }
+  ],
+  "checks": [
+    {
+      "command": "cargo +stable test -p gta-claw-daemon -p claw-http-api -p claw-providers --all-targets --no-fail-fast --locked --offline -j 1",
+      "result": "passed", "exitCode": 0, "passed": 617, "failed": 0, "ignored": 5, "testBinaries": 24,
+      "log": "target/native-model-admission-final-tests-20260916.log",
+      "sha256": "27bbce610a0393805c0e5e3ae990ed01b7e270caf29ed19372e05fd7152277e5",
+      "scopeNote": "Five ignored daemon helper/explicit integration entries remain identified. The earlier provider-application ledger owns its separately executed CLI integration; it is not falsely counted as executed in this batch"
+    },
+    {
+      "command": "cargo +stable clippy -p gta-claw-daemon -p claw-http-api -p claw-providers --all-targets --locked --offline -j 1 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-model-admission-final-clippy-20260916.log",
+      "sha256": "45168239c36eb380b41e021af061437f4d2d070f8768c177866bfb0a7e744d20"
+    },
+    {
+      "command": "cargo +stable check --workspace --all-targets --locked --offline -j 1",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-model-admission-final-check-20260916.log",
+      "sha256": "043a092c01e2bb81b19bccff4eb12a1fba631a06b515a3ffdde8211dd8476b1e"
+    }
+  ],
+  "artifact": {
+    "path": "target/debug/gta-claw-daemon.exe",
+    "sha256": "0729e8104f583713fa66031cc62a60a48b1e6e70ac987bc01da2fb8355724595"
+  },
+  "behaviorEvidence": [
+    "provider_model_declared_limits_reject_incompatible_requests_before_generation",
+    "model_capability_admission_covers_streams_embeddings_runtime_and_unknown_declarations",
+    "model_admission_uses_known_bounds_without_inventing_unknown_limits_or_fallbacks",
+    "bound_text_model_rejects_explicit_incompatible_inputs_without_external_reads",
+    "bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection",
+    "provider_adapter_holds_tools_until_complete_and_does_not_remember_failed_turns"
+  ],
+  "retainedFailures": [
+    {
+      "reason": "Initial deterministic model test showed a tool request reaching a model whose nonempty declaration contained only completion. Added admission before complete/stream provider calls and subsequently embeddings. Counted provider fixtures now establish zero calls on rejection"
+    },
+    {
+      "reason": "First admission attempt treated empty per-model capability sets as explicit unsupported, breaking real OpenAI/Anthropic fixtures. Their provider SDK directory deliberately uses EMPTY for absent per-model declarations. Corrected unknown semantics: provider support is mandatory and nonempty model declarations additionally restrict it; metadata continues to say live capabilities unverified"
+    },
+    {
+      "reason": "An older terminal/barrier test directly constructed an uninitialized adapter and timed out after the new gate correctly rejected its absent model. Added list_models and initialize to that fixture so it follows the production lifecycle. Existing terminal/partial/tool assertions remain unchanged"
+    },
+    {
+      "reason": "Initial daemon full-target run exposed four smoke runtime failures because optional goal-tool declarations were injected into text-only models. Request assembly now omits only optional runtime/host declarations when tool calling is unsupported. Explicit HTTP client tools, required/function choices and typed tool history still reject. All four existing process flows pass with no new smoke capability claims",
+      "log": "target/native-model-admission-daemon-tests-20260916.log",
+      "sha256": "e8e7ae5e0df386b21b98eacf5a1626447197f91c2dedd102225813d9bfc3be82"
+    },
+    {
+      "reason": "New fixture initially used the wrong SDK operation/type paths and a successful text assertion omitted the existing user role prefix. Corrected fixture references/expectation. Strict lint required earlier catalogue lock release and statement semicolons; no allowances or policy changes were added"
+    }
+  ],
+  "notes": [
+    "Each actual completion, stream and embedding call checks the precise current cached model ID before touching the provider. Missing/uninitialized models are rejected, not rerouted. Provider-level support is always required; nonempty per-model declarations constrain it further",
+    "Tool definitions, required/function tool choice, explicit parallel calls and typed assistant/tool-result history require tool_calling. User or assistant image parts require vision. Non-text response format requires json_mode. Stream calls require both completion and streaming; embeddings require embeddings",
+    "Explicit output caps must be nonzero and fit any published output/context upper bound. Absent bounds are unknown; no tokenizer estimate, full input token count, price, reservation or live model capability guarantee is invented",
+    "Ten direct negative scenarios cover tools, user/assistant images, result/call history, parallel calls, zero/excess output, JSON mode and absent model. Provider call counters stay zero before normal text succeeds exactly once",
+    "Four model/provider declaration combinations verify accepted and rejected stream/embedding calls and zero events for rejected streams. Runtime generate_context shares the same admission; explicit tools cannot be silently dropped while optional injected goal-tool declarations are withheld from a known text-only model. Six known/unknown output-bound cases verify default model and readiness remain unchanged",
+    "A real isolated daemon exposes HTTP and SSE for ten tools/image/JSON/output/unknown-model refusals. Requests return the existing typed error contract without smoke text; an independent image listener receives no connection. A request at the 4096-token advertised bound succeeds, with provider generation and default model unchanged",
+    "Existing nine source/dialect combinations, persistent context restart, legacy reload, real Gateway tool/approval/memory, stream terminal and channel/MCP tests pass. No optional tools are represented as executed, and existing histories are not rewritten to force compatibility",
+    "Catalogue locks cover only the captured descriptor; checks do not hold a lock throughout a network call or retroactively cancel in-flight operations after an external catalogue refresh. Directory metadata is not a cryptographic permission grant or live per-account capability proof",
+    "No dependency/lock, frozen protocol, UI, credential backend, execution retry, price or release change in this increment. Previous provider-application ledger remains a historical snapshot; its production_composition source is extended here rather than its old hash rewritten",
+    "No real model/cloud account, paid request, third-party channel, mobile device, deployment, Git write, production proxy action or user state mutation was performed. All runtime probes used owned synthetic/local fixtures. Earlier native credential/OAuth anomalies remain unresolved"
+  ],
+  "recovery": [
+    "A local invalid-request rejection means this adapter did not invoke the provider. Review the exact selected model, optional metadata and explicit input requirements; do not silently remove user data or switch to another model",
+    "Use explicit catalogue refresh to review new metadata, or create a reviewed model configuration candidate and restart through the separate offline workflow. Refresh is not proof of live tool/vision support",
+    "Unknown external execution outcomes retain the existing no-automatic-replay rule. Admission is not an external side-effect rollback or billing reconciliation mechanism"
+  ],
+  "unverified": [
+    "Live per-account capabilities, alias collisions, complete model deprecation and cross-account selection lifecycle",
+    "Exact input/context token budgets, pricing and monetary reservations or invoice settlement",
+    "Retroactive cancellation when a catalogue changes during an already admitted provider request",
+    "Original OAuth/credential intermittency, all-platform runtime qualification and whole-project completion"
+  ]
+}

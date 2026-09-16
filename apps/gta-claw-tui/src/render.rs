@@ -160,7 +160,11 @@ pub fn render(model: &AppModel, width: u16, height: u16, no_color: bool) -> Grid
         })
         .collect::<Vec<_>>()
         .join("  ");
-    grid.write(1, 2, &tabs, accent);
+    if tabs.len() > usize::from(width.saturating_sub(2)) {
+        grid.write(1, 2, &format!("[{}]", model.screen.title()), accent);
+    } else {
+        grid.write(1, 2, &tabs, accent);
+    }
     draw_rule(&mut grid, 3);
 
     match model.screen {
@@ -170,6 +174,7 @@ pub fn render(model: &AppModel, width: u16, height: u16, no_color: bool) -> Grid
         Screen::Diff => draw_diff(&mut grid, model, no_color),
         Screen::Artifacts => draw_artifacts(&mut grid, model),
         Screen::Help => draw_help(&mut grid),
+        Screen::Models => draw_model_catalogue(&mut grid, model),
     }
     draw_footer(&mut grid, model, no_color);
     if model.composer_open && model.prompt.is_none() {
@@ -598,6 +603,54 @@ fn accounting_lines(model: &AppModel) -> Vec<String> {
     }
     lines.push("Cost: uncalculated".to_owned());
     lines.push("Billing: unreconciled".to_owned());
+    if let Some(page) = &model.accounting_page {
+        lines.push(format!(
+            "Provider rounds {}..{} of {}",
+            page.request.offset, page.end_offset, page.total_rounds
+        ));
+        lines.push(format!(
+            "Snapshot: {}",
+            if page.request.offset == 0 && page.end_offset == page.total_rounds {
+                "verified complete page"
+            } else {
+                "pinned page; full digest not independently verified"
+            }
+        ));
+        for round in &page.rounds {
+            let Some(response) = &round.response else {
+                lines.push(format!(
+                    "Round {}: report unavailable; delivery unknown",
+                    round.round
+                ));
+                continue;
+            };
+            lines.push(format!(
+                "Round {}: {} / {}",
+                round.round, response.provider, response.model
+            ));
+            lines.push(format!(
+                "Response: {}",
+                response.response_id.as_deref().unwrap_or("not reported")
+            ));
+            lines.push(format!("Finish: {}", response.finish_reason));
+            if response.usage_reporting == "unreported" {
+                lines.push("Tokens: unknown (unreported)".to_owned());
+            } else {
+                let tokens = &response.observed_tokens;
+                lines.push(format!(
+                    "Tokens ({}): {} [input {}, output {}]",
+                    response.usage_reporting,
+                    tokens.total_tokens,
+                    tokens.input_tokens,
+                    tokens.output_tokens
+                ));
+                lines.push(format!(
+                    "Included subsets: cached {}, reasoning {}",
+                    tokens.cached_input_tokens, tokens.reasoning_tokens
+                ));
+            }
+        }
+    }
     lines
 }
 
@@ -703,6 +756,122 @@ fn draw_artifacts(grid: &mut Grid, model: &AppModel) {
     }
 }
 
+fn model_catalogue_rows(model: &AppModel, columns: usize) -> Vec<String> {
+    let mut lines = model.local_configuration.lines();
+    if model.pending_catalogue.is_some() {
+        lines.push("Catalogue request in progress".to_owned());
+    }
+    if let Some(page) = &model.model_catalogue {
+        if page["available"] == true {
+            lines.push(format!(
+                "Provider: {} [generation {}]",
+                page["provider"].as_str().unwrap_or("unknown"),
+                page["providerGeneration"]
+            ));
+            lines.push(format!(
+                "Selected: {}{}",
+                page["selectedModel"].as_str().unwrap_or("unknown"),
+                if page["selectionPinned"] == true {
+                    " (pinned)"
+                } else {
+                    ""
+                }
+            ));
+            lines.push(format!(
+                "Models: {}..{} of {}",
+                page["offset"], page["endOffset"], page["totalModels"]
+            ));
+            lines.push(format!("Observed: {} (Unix ms)", page["observedAtMs"]));
+            lines.push("Source: provider SDK catalogue".to_owned());
+            lines.push("Live capabilities: unverified".to_owned());
+            if let Some(models) = page["models"].as_array() {
+                for descriptor in models {
+                    lines.push(String::new());
+                    lines.push(descriptor["id"].as_str().unwrap_or("unknown").to_owned());
+                    if let Some(aliases) = descriptor["aliases"].as_array() {
+                        for alias in aliases.iter().filter_map(serde_json::Value::as_str) {
+                            lines.push(format!("Alias (config): {alias}"));
+                        }
+                    }
+                    if let Some(name) = descriptor["displayName"].as_str() {
+                        lines.push(name.to_owned());
+                    }
+                    lines.push(format!(
+                        "Context: {}",
+                        descriptor["contextWindow"]
+                            .as_u64()
+                            .map_or_else(|| "not reported".to_owned(), |limit| limit.to_string())
+                    ));
+                    lines.push(format!(
+                        "Output: {}",
+                        descriptor["maxOutputTokens"]
+                            .as_u64()
+                            .map_or_else(|| "not reported".to_owned(), |limit| limit.to_string())
+                    ));
+                    let capabilities = descriptor["advertisedCapabilities"]
+                        .as_array()
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    lines.push(format!(
+                        "Advertised: {}",
+                        if capabilities.is_empty() {
+                            "none reported"
+                        } else {
+                            &capabilities
+                        }
+                    ));
+                }
+            }
+        } else {
+            lines.push(
+                serde_json::from_value::<claw_protocol::native_models::CatalogueUnavailableReason>(
+                    page["unavailableReason"].clone(),
+                )
+                .map_or_else(
+                    |_| "Provider catalogue unavailable".to_owned(),
+                    |reason| reason.to_string(),
+                ),
+            );
+        }
+    } else if model.pending_catalogue.is_none() {
+        lines.push("No cached catalogue loaded".to_owned());
+    }
+    lines
+        .iter()
+        .flat_map(|line| wrap_columns(line, columns))
+        .collect()
+}
+
+pub(crate) fn model_catalogue_row_count(model: &AppModel) -> usize {
+    model_catalogue_rows(
+        model,
+        usize::from(model.viewport.0.min(MAX_GRID_WIDTH).saturating_sub(4)).max(1),
+    )
+    .len()
+}
+
+fn draw_model_catalogue(grid: &mut Grid, model: &AppModel) {
+    grid.write(2, 4, "Model catalogue", CellStyle::default());
+    let rows = model_catalogue_rows(model, usize::from(grid.width().saturating_sub(4)).max(1));
+    for (ordinal, text) in rows
+        .iter()
+        .skip(model.scroll.min(rows.len().saturating_sub(1)))
+        .enumerate()
+    {
+        let row = 6_u16.saturating_add(u16::try_from(ordinal).unwrap_or(u16::MAX));
+        if row >= grid.height().saturating_sub(2) {
+            break;
+        }
+        grid.write(2, row, text, CellStyle::default());
+    }
+}
+
 fn draw_help(grid: &mut Grid) {
     const HELP: [&str; 10] = [
         "Tab / Shift-Tab  cycle screens",
@@ -711,7 +880,7 @@ fn draw_help(grid: &mut Grid) {
         "y / n             approve / deny",
         "r                 refresh from Gateway",
         "Ctrl-P or :       command palette",
-        "1..6              jump to a screen",
+        "1..7              jump to a screen",
         "Esc               close palette",
         "?                 keyboard help",
         "q / Ctrl-C        quit safely",

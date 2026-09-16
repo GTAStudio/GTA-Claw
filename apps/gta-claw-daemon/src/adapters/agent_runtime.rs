@@ -56,7 +56,8 @@ use super::native_skills::NativeSkills;
 use super::native_tools::WorkspaceTools;
 use super::persistent_context::PersistentContextEngine;
 use super::runtime_gateway::{
-    GatewayApprovalPort, RuntimeApprovalHandler, RuntimeHealthHandler, RuntimeSessionHandler,
+    GatewayApprovalPort, RuntimeApprovalHandler, RuntimeHealthHandler, RuntimeModelHandler,
+    RuntimeSessionHandler,
 };
 use super::signed_plugins::PluginToolSurface;
 
@@ -2634,9 +2635,12 @@ impl AgentRuntime {
         gateway: claw_gateway::GatewayServer,
     ) -> Result<claw_gateway::GatewayServer, String> {
         let health = RuntimeHealthHandler::new(self, gateway.registry().clone());
+        let models =
+            RuntimeModelHandler::new(Arc::clone(&self.provider), gateway.registry().clone());
         let handler = RuntimeApprovalHandler::new(self.runtime.approvals().clone());
         let mut gateway = gateway
             .with_method("health", health)
+            .and_then(|gateway| gateway.with_method("models.list", models))
             .and_then(|gateway| gateway.with_method("approval.resolve", handler.clone()))
             .and_then(|gateway| gateway.with_method("exec.approval.resolve", handler.clone()))
             .and_then(|gateway| gateway.with_method("approval.get", handler.clone()))

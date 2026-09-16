@@ -33,6 +33,268 @@ const VALID: &str = r#"
 "#;
 
 #[test]
+fn explicit_provider_selection_is_typed_and_does_not_require_unused_github_auth() {
+    for kind in ["openai", "anthropic", "disabled"] {
+        let mut document: serde_json::Value = json5::from_str(VALID).expect("base document");
+        document["core"]["auth"]["github"]["pat"] = serde_json::Value::Null;
+        document["core"]["provider"] = if kind == "disabled" {
+            serde_json::json!({"kind":"disabled"})
+        } else {
+            serde_json::json!({"kind":kind,"model":"fixture-model","api_key":"env:NATIVE_TEST_KEY",
+                "base_url":"http://127.0.0.1:23456/v1/","credential_origin":"http://127.0.0.1:23456",
+                "request_timeout_ms":5000,"max_observed_turn_tokens":0})
+        };
+        let configured = parse_json5(&document.to_string(), "provider.json5")
+            .unwrap_or_else(|error| panic!("explicit {kind}: {error}"));
+        let persisted = to_json5(&configured).expect("provider serialization");
+        assert_eq!(
+            parse_json5(&persisted, "roundtrip.json5").expect("provider roundtrip"),
+            configured
+        );
+        assert!(persisted.contains(kind));
+    }
+    parse_json5(VALID, "legacy.json5").expect("existing configuration unchanged");
+}
+
+#[test]
+fn explicit_provider_configuration_rejects_invalid_or_inapplicable_settings_and_requires_restart() {
+    let mut document: serde_json::Value = json5::from_str(VALID).expect("base document");
+    document["core"]["provider"] = serde_json::json!({"kind":"openai","model":"fixture-model","api_key":"env:NATIVE_TEST_KEY","completion_api":"responses"});
+    let configured =
+        parse_json5(&document.to_string(), "valid-provider.json5").expect("valid native provider");
+    let provider = configured.core().provider().expect("explicit selection");
+    assert_eq!(provider.kind(), claw_config::ProviderKind::Openai);
+    assert_eq!(
+        provider.completion_api(),
+        Some(claw_config::ProviderCompletionApi::Responses)
+    );
+    assert_eq!(provider.base_url(), Some("https://api.openai.com/v1/"));
+    assert_eq!(provider.credential_origin(), Some("https://api.openai.com"));
+    assert!(!format!("{configured:?}").contains("NATIVE_TEST_KEY"));
+    for (field, invalid) in [
+        ("kind", serde_json::json!("unknown")),
+        ("kind", serde_json::json!("disabled")),
+        ("kind", serde_json::json!("copilot")),
+        ("kind", serde_json::json!("anthropic")),
+        ("api_key", serde_json::json!("literal-private-token")),
+        ("api_key", serde_json::Value::Null),
+        (
+            "api_key",
+            serde_json::json!(format!("env:{}", "X".repeat(1024))),
+        ),
+        (
+            "base_url",
+            serde_json::json!(format!("https://example.test/{}", "x".repeat(2048))),
+        ),
+        ("model", serde_json::json!(" ")),
+        ("model", serde_json::json!("model name")),
+        ("model", serde_json::json!("x".repeat(257))),
+        ("request_timeout_ms", serde_json::json!(999)),
+        ("request_timeout_ms", serde_json::json!(120_001)),
+        ("base_url", serde_json::json!("http://example.test/v1/")),
+        (
+            "base_url",
+            serde_json::json!("https://user:private@example.test/v1/"),
+        ),
+        (
+            "base_url",
+            serde_json::json!("https://example.test/v1/?token=private"),
+        ),
+        ("base_url", serde_json::json!("https://example.test/../v1/")),
+        (
+            "credential_origin",
+            serde_json::json!("https://another.test"),
+        ),
+        (
+            "credential_origin",
+            serde_json::json!("https://api.openai.com/v1/"),
+        ),
+        ("fallback", serde_json::json!([])),
+        ("max_observed_turn_tokens", serde_json::json!(-1)),
+    ] {
+        let mut changed = document.clone();
+        changed["core"]["provider"][field] = invalid;
+        let error = parse_json5(&changed.to_string(), "invalid-provider.json5").expect_err(field);
+        assert!(
+            error.to_string().contains("core.provider"),
+            "{field}: {error}"
+        );
+        assert!(!error.to_string().contains("literal-private-token"));
+    }
+    let mut manager = ReloadManager::new(parse_json5(VALID, "legacy.json5").expect("legacy"));
+    let outcome = manager
+        .reload_json5(&document.to_string(), "provider.json5")
+        .expect("typed candidate");
+    assert_eq!(outcome.changed_domains, [ConfigDomain::Provider]);
+    assert_eq!(outcome.restart_required_domains, [ConfigDomain::Provider]);
+    let before = manager.snapshot();
+    document["core"]["provider"]["api_key"] = serde_json::json!("rejected-secret");
+    assert!(
+        manager
+            .reload_json5(&document.to_string(), "invalid.json5")
+            .is_err()
+    );
+    assert_eq!(manager.snapshot(), before);
+}
+
+#[test]
+fn provider_edit_revalidates_the_whole_snapshot_and_rejects_ambiguous_input() {
+    let original = parse_json5(VALID, "original.json5").expect("source snapshot");
+    let before = to_json5(&original).expect("original serialization");
+    let selection = r#"{"kind":"openai","model":"fixture-model","api_key":"env:NATIVE_TEST_KEY","completion_api":"responses"}"#;
+    let candidate = claw_config::with_provider_json(&original, selection).expect("validated edit");
+    assert_eq!(
+        candidate.core().provider().expect("new provider").model(),
+        Some("fixture-model")
+    );
+    assert_eq!(
+        to_json5(&original).expect("unchanged serialization"),
+        before
+    );
+    assert!(original.core().provider().is_none());
+    for invalid in [
+        r#"{"kind":"openai","kind":"disabled"}"#,
+        r#"{"kind":"openai","model":"one","model":"two","api_key":"env:KEY"}"#,
+        r#"{"kind":"disabled","unexpected":"private-secret"}"#,
+        r#"{"kind":"openai","model":"model","api_key":"private-secret"}"#,
+        r#"{kind:"disabled"}"#,
+    ] {
+        let error = claw_config::with_provider_json(&original, invalid).expect_err("invalid edit");
+        assert!(!error.to_string().contains("private-secret"));
+    }
+    assert!(claw_config::with_provider_json(&original, &" ".repeat(16 * 1024 + 1)).is_err());
+    let mut document: serde_json::Value = json5::from_str(VALID).expect("source");
+    document["core"]["auth"]["github"]["pat"] = serde_json::Value::Null;
+    document["core"]["provider"] = serde_json::json!({"kind":"disabled"});
+    let disabled =
+        parse_json5(&document.to_string(), "disabled.json5").expect("no credential required");
+    assert!(
+        claw_config::with_provider_json(&disabled, r#"{"kind":"copilot","model":"fixture-model"}"#)
+            .is_err()
+    );
+}
+
+#[test]
+fn provider_model_edit_keeps_identity_credentials_limits_and_original_snapshot() {
+    let original = parse_json5(VALID, "source").expect("base snapshot");
+    assert!(claw_config::with_provider_model(&original, "next").is_err());
+    let disabled =
+        claw_config::with_provider_json(&original, r#"{"kind":"disabled"}"#).expect("disabled");
+    assert!(claw_config::with_provider_model(&disabled, "next").is_err());
+    for kind in ["openai", "anthropic", "copilot"] {
+        let mut selection = if kind == "copilot" {
+            serde_json::json!({"kind":kind,"model":"before","request_timeout_ms":5000,"max_observed_turn_tokens":0})
+        } else {
+            serde_json::json!({"kind":kind,"model":"before","api_key":"env:MODEL_EDIT_KEY","base_url":"http://127.0.0.1:23456/v1/",
+                "credential_origin":"http://127.0.0.1:23456","request_timeout_ms":5000,"max_observed_turn_tokens":0})
+        };
+        selection["model_aliases"] = serde_json::json!([
+            {"alias":"work","model":"before"},
+            {"alias":"next","model":"Exact-Model:2026-09"}
+        ]);
+        let configured = claw_config::with_provider_json(&original, &selection.to_string())
+            .expect("explicit source");
+        assert_eq!(
+            configured
+                .core()
+                .provider()
+                .expect("provider")
+                .catalogue_provider_id(),
+            Some(if kind == "copilot" {
+                "github-copilot"
+            } else {
+                kind
+            })
+        );
+        let before = configured.clone();
+        let candidate = claw_config::with_provider_model(&configured, "Exact-Model:2026-09")
+            .expect("model candidate");
+        assert_eq!(configured, before);
+        assert_eq!(
+            candidate.core().provider().expect("provider").model(),
+            Some("Exact-Model:2026-09")
+        );
+        assert_eq!(
+            claw_config::with_provider_model(&candidate, "before").expect("restore model"),
+            before
+        );
+        let mut manager = ReloadManager::new(configured.clone());
+        let changes = manager
+            .reload_json5(
+                &to_json5(&candidate).expect("encoded candidate"),
+                "model edit",
+            )
+            .expect("validated change");
+        assert_eq!(changes.changed_domains, [ConfigDomain::Provider]);
+        assert_eq!(changes.restart_required_domains, [ConfigDomain::Provider]);
+        for model in [
+            "",
+            " spaces ",
+            "two models",
+            "line\nmodel",
+            &"m".repeat(257),
+        ] {
+            assert!(
+                claw_config::with_provider_model(&configured, model).is_err(),
+                "invalid exact ID"
+            );
+            assert_eq!(configured, before);
+        }
+    }
+}
+
+#[test]
+fn provider_model_aliases_are_explicit_bounded_and_preserved_without_changing_identity() {
+    let original = parse_json5(VALID, "source").expect("base snapshot");
+    let base = serde_json::json!({"kind":"openai","model":"exact", "api_key":"env:ALIAS_KEY"});
+    let mut valid = base.clone();
+    valid["model_aliases"] = serde_json::json!([{"alias":"work","model":"exact"},{"alias":"Work","model":"other/exact@2026"}]);
+    let configured =
+        claw_config::with_provider_json(&original, &valid.to_string()).expect("explicit aliases");
+    let provider = configured.core().provider().expect("provider");
+    assert_eq!(provider.model(), Some("exact"));
+    assert_eq!(provider.model_aliases().len(), 2);
+    assert_eq!(provider.model_aliases()[0].alias(), "work");
+    assert_eq!(provider.model_aliases()[1].model(), "other/exact@2026");
+    assert_eq!(
+        parse_json5(&to_json5(&configured).expect("serialize"), "roundtrip").expect("valid"),
+        configured
+    );
+    assert!(
+        claw_config::with_provider_model(&configured, "work").is_err(),
+        "exact-model editing cannot silently treat an alias as a real ID"
+    );
+    for aliases in [
+        serde_json::json!([{"alias":"work","model":"exact"},{"alias":"work","model":"exact"}]),
+        serde_json::json!([{"alias":"exact","model":"other"}]),
+        serde_json::json!([{"alias":"work","model":"next"},{"alias":"next","model":"exact"}]),
+        serde_json::json!([{"alias":"work","model":"work"}]),
+        serde_json::json!([{"alias":"openclaw/default","model":"exact"}]),
+        serde_json::json!([{"alias":"space alias","model":"exact"}]),
+        serde_json::json!([{"alias":"work","model":"bad model"}]),
+        serde_json::json!([{"alias":"work","model":"exact","endpoint":"https://unrelated.invalid"}]),
+        serde_json::json!((0..129).map(|index| serde_json::json!({"alias":format!("alias-{index}"),"model":"exact"})).collect::<Vec<_>>()),
+        serde_json::json!((0..20).map(|index| serde_json::json!({"alias":format!("{}{index}", "a".repeat(240)),"model":"exact"})).collect::<Vec<_>>()),
+    ] {
+        let mut invalid = base.clone();
+        invalid["model_aliases"] = aliases;
+        assert!(claw_config::with_provider_json(&original, &invalid.to_string()).is_err());
+    }
+    assert!(
+        claw_config::with_provider_json(&original, r#"{"kind":"disabled","model_aliases":[]}"#)
+            .is_err()
+    );
+    let mut manager = ReloadManager::new(
+        claw_config::with_provider_json(&original, &base.to_string()).expect("no aliases"),
+    );
+    let changes = manager
+        .reload_json5(&to_json5(&configured).expect("encoded"), "aliases")
+        .expect("reload");
+    assert_eq!(changes.changed_domains, [ConfigDomain::Provider]);
+    assert_eq!(changes.restart_required_domains, [ConfigDomain::Provider]);
+}
+
+#[test]
 fn accepts_comments_and_trailing_commas() {
     let config = parse_json5(VALID, "test.json5").expect("valid JSON5");
 

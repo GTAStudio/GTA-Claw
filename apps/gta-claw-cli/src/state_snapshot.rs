@@ -98,7 +98,7 @@ pub(super) fn local_absolute(path: &Path) -> bool {
     true
 }
 
-fn pinned_parent(path: &Path) -> Result<(Sandbox, RelativePath), &'static str> {
+pub(super) fn pinned_parent(path: &Path) -> Result<(Sandbox, RelativePath), &'static str> {
     if !local_absolute(path) {
         return Err("snapshot paths must be explicit local absolute files");
     }
@@ -194,20 +194,20 @@ fn perform(
     Ok(receipt)
 }
 
-pub(super) fn write_partial_export(destination: &Path, bytes: &[u8]) -> Result<(), &'static str> {
+pub(super) fn write_run_export(destination: &Path, bytes: &[u8]) -> Result<(), &'static str> {
     if bytes.len() > 4 * 1024 * 1024 || std::str::from_utf8(bytes).is_err() {
-        return Err("partial export exceeds its UTF-8 byte limit");
+        return Err("run export exceeds its UTF-8 byte limit");
     }
     let (root, path) = pinned_parent(destination)?;
     let mut file = root
         .create_new_file(&path)
-        .map_err(|_| "partial export destination exists or cannot be created safely")?;
+        .map_err(|_| "run export destination exists or cannot be created safely")?;
     file.write_all(bytes)
-        .map_err(|_| "partial export write is unconfirmed; preserve any output file")?;
+        .map_err(|_| "run export write is unconfirmed; preserve any output file")?;
     file.sync_all()
-        .map_err(|_| "partial export synchronization is unconfirmed; preserve the output file")?;
+        .map_err(|_| "run export synchronization is unconfirmed; preserve the output file")?;
     root.validate_root()
-        .map_err(|_| "partial export directory identity changed; inspect the output file")
+        .map_err(|_| "run export directory identity changed; inspect the output file")
 }
 
 pub(super) fn seal_memory_archive(

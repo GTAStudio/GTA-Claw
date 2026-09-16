@@ -50,12 +50,56 @@ pub(super) struct NativeProviderPolicy {
 }
 
 impl NativeProviderPolicy {
-    pub(super) fn from_environment() -> Result<Option<Self>, String> {
-        match std::env::var("GTA_CLAW_PROVIDER_POLICY") {
-            Ok(value) => Self::parse(&value).map(Some),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(_) => Err("native provider policy must be UTF-8".to_owned()),
+    pub(super) fn from_configuration(
+        config: Option<&claw_config::ProviderConfig>,
+    ) -> Result<Option<Self>, String> {
+        let environment = match std::env::var("GTA_CLAW_PROVIDER_POLICY") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(_) => return Err("native provider policy must be UTF-8".to_owned()),
+        };
+        Self::select(config, environment.as_deref())
+    }
+
+    fn select(
+        config: Option<&claw_config::ProviderConfig>,
+        environment: Option<&str>,
+    ) -> Result<Option<Self>, String> {
+        if config.is_some() && environment.is_some() {
+            return Err("core.provider and GTA_CLAW_PROVIDER_POLICY cannot be combined; choose one explicit configuration source".to_owned());
         }
+        let Some(config) = config else {
+            return environment.map(Self::parse).transpose();
+        };
+        let provider = match config.kind() {
+            claw_config::ProviderKind::Openai => ProviderKind::Openai,
+            claw_config::ProviderKind::Anthropic => ProviderKind::Anthropic,
+            claw_config::ProviderKind::Copilot | claw_config::ProviderKind::Disabled => {
+                return Ok(None);
+            }
+        };
+        Ok(Some(Self {
+            provider,
+            model: config.model().expect("validated active model").to_owned(),
+            api_key: config
+                .api_key()
+                .expect("validated native credential reference")
+                .as_str()
+                .to_owned(),
+            base_url: config.base_url().map(str::to_owned),
+            request_timeout_ms: config.request_timeout_ms(),
+            completion_api: config.completion_api().map(|dialect| match dialect {
+                claw_config::ProviderCompletionApi::ChatCompletions => {
+                    CompletionDialect::ChatCompletions
+                }
+                claw_config::ProviderCompletionApi::Responses => CompletionDialect::Responses,
+            }),
+            max_observed_turn_tokens: config.max_observed_turn_tokens(),
+        }))
+    }
+
+    pub(super) const fn provider_id(&self) -> &'static str {
+        self.provider.id()
     }
 
     fn parse(value: &str) -> Result<Self, String> {
@@ -260,6 +304,81 @@ pub(super) fn enrolled_origins_from_environment() -> Result<BTreeMap<String, Vec
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn typed_provider_selection_preserves_bindings_and_rejects_legacy_policy_conflicts() {
+        for kind in ["openai", "anthropic", "copilot", "disabled"] {
+            let mut selection = json!({"kind":kind});
+            if kind != "disabled" {
+                selection["model"] = json!("fixture-model");
+                selection["request_timeout_ms"] = json!(5000);
+                selection["max_observed_turn_tokens"] = json!(0);
+            }
+            if matches!(kind, "openai" | "anthropic") {
+                selection["api_key"] = json!("env:NATIVE_TEST_KEY");
+                selection["base_url"] = json!("http://127.0.0.1:23456/v1/");
+                selection["credential_origin"] = json!("http://127.0.0.1:23456");
+            }
+            if kind == "openai" {
+                selection["completion_api"] = json!("responses");
+            }
+            let snapshot = claw_config::ConfigLayers::new().with_workspace_json5(json!({"core":{
+                "auth":{"github":{"pat":"env:GITHUB_TEST_KEY"}},"role":{"source_url":"http://127.0.0.1:23456/role"},
+                "channels":{"teams":{"enabled":false}},"provider":selection}}).to_string()).resolve().expect("typed selection").config;
+            for encoded in [
+                "",
+                "{}",
+                "not-json",
+                r#"{"provider":"openai","model":"other","apiKey":"env:OTHER"}"#,
+            ] {
+                assert!(
+                    NativeProviderPolicy::select(snapshot.core().provider(), Some(encoded))
+                        .is_err(),
+                    "{kind}"
+                );
+            }
+            let policy =
+                NativeProviderPolicy::select(snapshot.core().provider(), None).expect("one source");
+            if matches!(kind, "openai" | "anthropic") {
+                let policy = policy.expect("native client selection");
+                assert_eq!(policy.provider_id(), kind);
+                assert_eq!(policy.model, "fixture-model");
+                assert_eq!(policy.request_timeout_ms, Some(5000));
+                assert_eq!(policy.max_observed_turn_tokens, Some(0));
+                assert!(
+                    policy
+                        .build(ProxyPolicy::Disabled, &BTreeMap::new(), |_| panic!(
+                            "declaration cannot authorize an origin"
+                        ))
+                        .is_err()
+                );
+                let enrolled =
+                    BTreeMap::from([(kind.to_owned(), vec!["http://127.0.0.1:23456".to_owned()])]);
+                let client = policy
+                    .build(ProxyPolicy::Disabled, &enrolled, |reference| {
+                        assert_eq!(reference.as_str(), "env:NATIVE_TEST_KEY");
+                        Ok(SecretString::new("synthetic-native-key"))
+                    })
+                    .expect("independently enrolled client");
+                assert_eq!(client.id().as_str(), kind);
+            } else {
+                assert!(policy.is_none());
+            }
+        }
+        assert!(
+            NativeProviderPolicy::select(None, None)
+                .expect("legacy default")
+                .is_none()
+        );
+        assert!(
+            NativeProviderPolicy::select(
+                None,
+                Some(r#"{"provider":"openai","model":"legacy-model","apiKey":"env:LEGACY_KEY"}"#)
+            )
+            .expect("legacy policy")
+            .is_some()
+        );
+    }
 
     #[test]
     fn native_provider_observed_budget_is_optional_typed_and_allows_explicit_zero() {

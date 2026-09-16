@@ -7,6 +7,79 @@ use claw_config::{
 use serde_json::Value;
 
 #[test]
+fn provider_layers_replace_changed_kinds_without_inheriting_credentials_or_endpoints() {
+    use claw_config::ProviderKind;
+    let base = ConfigLayers::new().with_system_json5(system_layer(None)).with_user_json5(r#"{core:{provider:{
+        kind:"openai",model:"first-model",api_key:"env:FIRST_PROVIDER_KEY",base_url:"https://first.example.test/v1/",
+        credential_origin:"https://first.example.test",completion_api:"responses",request_timeout_ms:5000
+    }}}"#);
+    let disabled = base
+        .clone()
+        .with_workspace_json5(r#"{core:{provider:{kind:"disabled"}}}"#)
+        .resolve()
+        .expect("explicit disabled replacement");
+    let provider = disabled
+        .config
+        .core()
+        .provider()
+        .expect("disabled selection");
+    assert_eq!(provider.kind(), ProviderKind::Disabled);
+    assert!(provider.api_key().is_none() && provider.base_url().is_none());
+    assert!(
+        !to_json5(&disabled.config)
+            .expect("disabled serialization")
+            .contains("FIRST_PROVIDER_KEY")
+    );
+    let incomplete = base
+        .clone()
+        .with_workspace_json5(r#"{core:{provider:{kind:"anthropic",model:"next-model"}}}"#)
+        .resolve();
+    assert!(
+        incomplete.is_err(),
+        "another provider cannot inherit the first credential"
+    );
+    let changed = base.clone().with_workspace_json5(r#"{core:{provider:{kind:"anthropic",model:"next-model",api_key:"env:SECOND_PROVIDER_KEY"}}}"#).resolve().expect("complete replacement");
+    let provider = changed.config.core().provider().expect("new provider");
+    assert_eq!(provider.kind(), ProviderKind::Anthropic);
+    assert_eq!(provider.base_url(), Some("https://api.anthropic.com/"));
+    assert_eq!(provider.request_timeout_ms(), Some(120_000));
+    assert!(provider.completion_api().is_none());
+    assert_eq!(
+        provider.api_key().expect("new reference").as_str(),
+        "env:SECOND_PROVIDER_KEY"
+    );
+    let same = base
+        .with_workspace_json5(r#"{core:{provider:{model:"new-exact-model"}}}"#)
+        .resolve()
+        .expect("same provider partial update");
+    let provider = same.config.core().provider().expect("same provider");
+    assert_eq!(provider.kind(), ProviderKind::Openai);
+    assert_eq!(provider.model(), Some("new-exact-model"));
+    assert_eq!(
+        provider.api_key().expect("same reference").as_str(),
+        "env:FIRST_PROVIDER_KEY"
+    );
+}
+
+#[test]
+fn provider_layers_reject_duplicate_selection_fields_before_merging() {
+    for provider in [
+        r#"{kind:"openai",kind:"anthropic",model:"model",api_key:"env:KEY"}"#,
+        r#"{kind:"openai",model:"reviewed",model:"substituted",api_key:"env:KEY"}"#,
+        r#"{kind:"openai",model:"model",api_key:"env:FIRST_KEY",api_key:"env:OTHER_KEY"}"#,
+    ] {
+        let result = ConfigLayers::new()
+            .with_system_json5(system_layer(None))
+            .with_workspace_json5(format!("{{core:{{provider:{provider}}}}}"))
+            .resolve();
+        assert!(
+            result.is_err(),
+            "duplicate provider selection must not become a last-value-wins configuration"
+        );
+    }
+}
+
+#[test]
 fn every_precedence_combination_selects_the_highest_present_source() {
     for mask in 0_u8..32 {
         let system_port = (mask & 1 != 0).then_some(10_001);

@@ -144,6 +144,22 @@ fn apply_product_state(window: &AppWindow, models: &ProductModels, state: &Produ
     window.set_can_retry_memory(state.retry_native_memory().is_some());
     window.set_memory_result(state.memory_result().into());
     window.set_provider_accounting(state.accounting_summary().into());
+    window.set_can_read_accounting(state.native_accounting(false).is_some());
+    window.set_can_next_accounting(state.native_accounting(true).is_some());
+    window.set_model_catalogue(state.model_catalogue_text().into());
+    window.set_can_read_models(state.native_model_catalogue(0).is_some());
+    window.set_can_next_models(state.native_model_catalogue(1).is_some());
+    window.set_can_refresh_models(state.native_model_catalogue(2).is_some());
+    window.set_model_choices(slint::ModelRc::new(slint::VecModel::from(
+        state
+            .model_choices()
+            .into_iter()
+            .map(slint::SharedString::from)
+            .collect::<Vec<_>>(),
+    )));
+    window.set_model_choice_binding(state.model_choice_binding().into());
+    window.set_local_configuration(state.local_configuration_text().into());
+    window.set_local_configuration_busy(state.local_configuration_busy());
     window.set_can_answer(selected_run.state == RunState::WaitingForAnswer);
     window.set_approval_prompt(state.approval_prompt().into());
     window.set_approval_scope(state.approval_scope().into());
@@ -865,6 +881,69 @@ fn wire_native_callbacks(window: &AppWindow, sender: ControllerSender, view: &Rc
     let product = Rc::clone(view);
     let commands = sender.clone();
     let weak = window.as_weak();
+    window.on_model_catalogue_requested(move |action| {
+        let state = product.state.borrow();
+        let request = state
+            .native_connection()
+            .zip(state.native_model_catalogue(action));
+        drop(state);
+        if let Some((connection, params)) = request {
+            let result = commands.product_request(connection, "models.list", params.clone());
+            if result.is_ok() {
+                product
+                    .state
+                    .borrow_mut()
+                    .native_model_catalogue_enqueued(&params);
+            }
+            apply_command_result(&weak, result);
+        }
+        if let Some(window) = weak.upgrade() {
+            product.apply(&window);
+        }
+    });
+    let product = Rc::clone(view);
+    let commands = sender.clone();
+    let weak = window.as_weak();
+    window.on_accounting_requested(move |next| {
+        let state = product.state.borrow();
+        let request = state.native_connection().zip(state.native_accounting(next));
+        drop(state);
+        if let Some((connection, params)) = request {
+            let result = commands.product_request(connection, "agent.wait", params.clone());
+            if result.is_ok() {
+                product
+                    .state
+                    .borrow_mut()
+                    .native_accounting_enqueued(&params);
+            }
+            apply_command_result(&weak, result);
+        }
+        if let Some(window) = weak.upgrade() {
+            product.apply(&window);
+        }
+    });
+    let product = Rc::clone(view);
+    let commands = sender.clone();
+    let weak = window.as_weak();
+    window.on_local_configuration_requested(move |action,source,destination,binding,selected| {
+        let request = product.state.borrow_mut().begin_local_configuration(action,source.as_str(),destination.as_str(),binding.as_str(),selected);
+        match request {
+            Ok(request) => {
+                let result = commands.local_configuration(request.clone());
+                if result.is_err() {product.state.borrow_mut().reject_local_configuration(request);}
+                apply_command_result(&weak,result);
+            }
+            Err(message) => {
+                if let Some(window)=weak.upgrade() {
+                    apply_error(&window,&UserError::input("configuration.invalid-selection",message,"Review the explicit local source, destination and current model selection."));
+                }
+            }
+        }
+        if let Some(window)=weak.upgrade() {product.apply(&window);}
+    });
+    let product = Rc::clone(view);
+    let commands = sender.clone();
+    let weak = window.as_weak();
     window.on_abort_requested(move || {
         let state = product.state.borrow();
         if let (Some(connection), Some(params)) = (state.native_connection(), state.native_abort())
@@ -1005,7 +1084,7 @@ fn main() -> Result<(), DesktopError> {
             let Some(window) = weak.upgrade() else { return };
             if overflow.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 let _ = commands.disconnect();
-                view.state.borrow_mut().native_unavailable();
+                view.state.borrow_mut().product_updates_lost();
                 apply_error(
                     &window,
                     &UserError::input(

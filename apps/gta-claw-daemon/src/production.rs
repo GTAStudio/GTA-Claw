@@ -649,6 +649,18 @@ impl ProductionService {
             return Err(startup_cancelled());
         }
         validate_exposure(options)?;
+        let configured_provider = loaded.snapshot.core().provider();
+        let native_provider =
+            native_provider::NativeProviderPolicy::from_configuration(configured_provider)
+                .map_err(|error| ProductionError::message("native-provider-policy", error))?;
+        if (configured_provider.is_some() || native_provider.is_some()) && options.smoke {
+            return Err(ProductionError::message(
+                "native-provider-policy",
+                "explicit provider selection cannot be replaced by smoke mode",
+            ));
+        }
+        let provider_disabled = configured_provider
+            .is_some_and(|provider| provider.kind() == claw_config::ProviderKind::Disabled);
         let diagnostics = Arc::new(Diagnostics::new(256));
         diagnostics.record(format!("configuration loaded from {}", loaded.source));
         diagnostics.record(format!("configuration layers: {:?}", loaded.applied_layers));
@@ -708,6 +720,16 @@ impl ProductionService {
         }
         let config_resolution = json!({
             "source": loaded.source,
+            "providerSelection": {
+                "source":if configured_provider.is_some() {"core.provider"} else if native_provider.is_some() {"GTA_CLAW_PROVIDER_POLICY"} else if options.smoke {"smoke"} else {"legacy-copilot"},
+                "kind":configured_provider.map(|provider| match provider.kind() {
+                    claw_config::ProviderKind::Openai => "openai",claw_config::ProviderKind::Anthropic => "anthropic",
+                    claw_config::ProviderKind::Copilot => "copilot",claw_config::ProviderKind::Disabled => "disabled",
+                }).or_else(|| native_provider.as_ref().map(native_provider::NativeProviderPolicy::provider_id)).unwrap_or(if options.smoke {"smoke"} else {"copilot"}),
+                "credentialOrigin":configured_provider.and_then(claw_config::ProviderConfig::credential_origin),
+                "requestTimeoutMs":configured_provider.and_then(claw_config::ProviderConfig::request_timeout_ms),
+                "disabled":provider_disabled,
+            },
             "layers": loaded
                 .applied_layers
                 .iter()
@@ -878,32 +900,29 @@ impl ProductionService {
         let mut legacy_settings = legacy_settings(&loaded.snapshot)?;
         let channels = channel_statuses(&legacy_settings)?;
 
-        let native_provider = native_provider::NativeProviderPolicy::from_environment()
-            .map_err(|error| ProductionError::message("native-provider-policy", error))?;
-        if native_provider.is_some() && options.smoke {
-            return Err(ProductionError::message(
-                "native-provider-policy",
-                "explicit native provider cannot be replaced by smoke mode",
-            ));
-        }
-        let configured_model = if let Some(policy) = &native_provider {
+        let explicit_model = configured_provider
+            .and_then(claw_config::ProviderConfig::model)
+            .or_else(|| native_provider.as_ref().map(|policy| policy.model.as_str()));
+        let configured_model = if let Some(model) = explicit_model {
             if role
                 .model
                 .as_ref()
-                .is_some_and(|model| model != &policy.model)
+                .is_some_and(|role_model| role_model != model)
             {
                 return Err(ProductionError::message(
                     "native-provider-policy",
                     "role model conflicts with the explicitly selected native provider model",
                 ));
             }
-            legacy_settings.device_flow_enabled = false;
-            policy.model.clone()
+            model.to_owned()
         } else {
             role.model
                 .clone()
                 .unwrap_or_else(|| loaded.snapshot.core().copilot().default_model().to_owned())
         };
+        if native_provider.is_some() || provider_disabled {
+            legacy_settings.device_flow_enabled = false;
+        }
         let provider = Arc::new(SwappableProvider::new(
             configured_model.clone(),
             role.prompt,
@@ -914,10 +933,30 @@ impl ProductionService {
             Arc::clone(&model_tools) as Arc<dyn ModelToolCatalog>,
             Arc::clone(&readiness),
         ));
-        let native_model = native_provider.as_ref().map(|policy| policy.model.clone());
-        let max_observed_provider_tokens = native_provider
-            .as_ref()
-            .and_then(|policy| policy.max_observed_turn_tokens);
+        if let Some(configuration) = configured_provider {
+            let aliases = configuration
+                .model_aliases()
+                .iter()
+                .map(|entry| {
+                    Ok((
+                        claw_provider_sdk::ModelId::new(entry.alias())?,
+                        claw_provider_sdk::ModelId::new(entry.model())?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, claw_provider_sdk::ModelError>>()
+                .map_err(|error| ProductionError::new("native-model-aliases", error))?;
+            provider
+                .configure_model_aliases(aliases)
+                .map_err(|error| ProductionError::message("native-model-aliases", error))?;
+        }
+        let native_model = explicit_model.map(str::to_owned);
+        let max_observed_provider_tokens = configured_provider
+            .and_then(claw_config::ProviderConfig::max_observed_turn_tokens)
+            .or_else(|| {
+                native_provider
+                    .as_ref()
+                    .and_then(|policy| policy.max_observed_turn_tokens)
+            });
         if native_model.is_some() {
             provider
                 .pin_default_model()
@@ -936,6 +975,8 @@ impl ProductionService {
                     })
                     .map_err(|error| ProductionError::message("native-provider", error))?,
             )
+        } else if provider_disabled {
+            None
         } else if options.smoke {
             warn!(stage = "provider", "explicit smoke provider enabled");
             Some(Arc::new(
@@ -969,7 +1010,19 @@ impl ProductionService {
                 model = provider.default_model(),
                 "provider is live"
             );
+        } else if provider_disabled {
+            provider
+                .configure_initial_unavailability(
+                    claw_protocol::native_models::CatalogueUnavailableReason::Disabled,
+                )
+                .map_err(|error| ProductionError::message("provider-availability", error))?;
+            diagnostics.record("provider is explicitly disabled; no credential resolution or device flow was started");
         } else {
+            provider
+                .configure_initial_unavailability(
+                    claw_protocol::native_models::CatalogueUnavailableReason::AuthenticationPending,
+                )
+                .map_err(|error| ProductionError::message("provider-availability", error))?;
             diagnostics.record("provider authentication is pending GitHub Device Flow");
             warn!(
                 stage = "provider",
@@ -2545,6 +2598,18 @@ pub fn check_configuration(
     loaded: &LoadedConfig,
 ) -> Result<(), ProductionError> {
     validate_exposure(options)?;
+    let configured_provider = loaded.snapshot.core().provider();
+    let native_provider =
+        native_provider::NativeProviderPolicy::from_configuration(configured_provider)
+            .map_err(|error| ProductionError::message("native-provider-policy", error))?;
+    if (configured_provider.is_some() || native_provider.is_some()) && options.smoke {
+        return Err(ProductionError::message(
+            "native-provider-policy",
+            "explicit provider selection cannot be replaced by smoke mode",
+        ));
+    }
+    let provider_disabled = configured_provider
+        .is_some_and(|provider| provider.kind() == claw_config::ProviderKind::Disabled);
     let _ = options.state_dir()?;
     let proxy = proxy_policy(&loaded.snapshot)?;
     let _ = admin_token(&loaded.snapshot)?;
@@ -2552,15 +2617,7 @@ pub fn check_configuration(
         .map_err(|error| ProductionError::message("updates", error))?;
     let legacy_settings = legacy_settings(&loaded.snapshot)?;
     let _ = channel_statuses(&legacy_settings)?;
-    if let Some(policy) = native_provider::NativeProviderPolicy::from_environment()
-        .map_err(|error| ProductionError::message("native-provider-policy", error))?
-    {
-        if options.smoke {
-            return Err(ProductionError::message(
-                "native-provider-policy",
-                "explicit native provider cannot be replaced by smoke mode",
-            ));
-        }
+    if let Some(policy) = native_provider {
         let origins = native_provider::enrolled_origins_from_environment()
             .map_err(|error| ProductionError::message("native-provider-origins", error))?;
         policy
@@ -2569,7 +2626,7 @@ pub fn check_configuration(
                     .map_err(|_| "native provider credential could not be resolved".to_owned())
             })
             .map_err(|error| ProductionError::message("native-provider", error))?;
-    } else if !options.smoke {
+    } else if !options.smoke && !provider_disabled {
         let auth = loaded.snapshot.core().auth();
         if let Some(reference) = auth.github_pat() {
             let _ = resolve_secret(reference)?;

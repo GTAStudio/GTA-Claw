@@ -10,11 +10,12 @@ repository.workspace = true
 [dependencies]
 age = { version = "=0.12.1", default-features = false }
 claw-application = { workspace = true, features = ["runtime-ports"] }
+claw-config.workspace = true
 claw-gateway-client.workspace = true
 claw-mcp.workspace = true
 claw-migrate.workspace = true
 claw-observability.workspace = true
-claw-platform = { workspace = true, features = ["native-identity"] }
+claw-platform = { workspace = true, features = ["native-identity", "native-config"] }
 claw-protocol.workspace = true
 claw-provider-sdk.workspace = true
 claw-security.workspace = true

@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -46,7 +47,35 @@ pub(crate) struct ProductConnection {
     pub(crate) epoch: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LocalConfigurationAction {
+    Inspect,
+    PrepareModel {
+        destination: PathBuf,
+        expected_sha256: String,
+        model: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalConfigurationRequest {
+    pub(crate) sequence: u64,
+    pub(crate) source: PathBuf,
+    pub(crate) action: LocalConfigurationAction,
+}
+
+#[derive(Debug)]
+pub(crate) enum LocalConfigurationResult {
+    Inspected(Box<claw_platform::configuration::ProviderConfiguration>),
+    Prepared(Box<claw_platform::configuration::PreparedProviderConfiguration>),
+}
+
 pub(crate) enum ProductUpdate {
+    LocalConfiguration {
+        request: LocalConfigurationRequest,
+        result:
+            Result<LocalConfigurationResult, claw_platform::configuration::ConfigurationFileError>,
+    },
     Reset {
         generation: u64,
     },
@@ -106,6 +135,7 @@ enum ControllerCommand {
     },
     RejectSubmission(SubmissionRejection),
     Product(ProductCommand),
+    LocalConfiguration(LocalConfigurationRequest),
     Cancel,
     Disconnect,
 }
@@ -124,6 +154,29 @@ pub(crate) struct ControllerSender {
 }
 
 impl ControllerSender {
+    pub(crate) fn local_configuration(
+        &self,
+        request: LocalConfigurationRequest,
+    ) -> Result<(), CommandRejection> {
+        if request.sequence == 0 || request.source.as_os_str().len() > 4096 {
+            return Err(CommandRejection::Busy);
+        }
+        if let LocalConfigurationAction::PrepareModel {
+            destination,
+            expected_sha256,
+            model,
+        } = &request.action
+            && (destination.as_os_str().len() > 4096
+                || expected_sha256.len() != 64
+                || model.len() > 256)
+        {
+            return Err(CommandRejection::Busy);
+        }
+        self.commands
+            .try_send(ControllerCommand::LocalConfiguration(request))
+            .map_err(|error| CommandRejection::from_send(&error))
+    }
+
     pub(crate) fn product_request(
         &self,
         connection: ProductConnection,
@@ -158,6 +211,7 @@ impl ControllerSender {
             method,
             "sessions.list"
                 | "sessions.get"
+                | "models.list"
                 | "agent.wait"
                 | "chat.send"
                 | "chat.history"
@@ -476,6 +530,7 @@ async fn controller_loop(
     let (attempt_events, mut events) = mpsc::channel(ATTEMPT_EVENT_CAPACITY);
     let mut active: Option<ActiveAttempt> = None;
     let mut session_identity: Option<Arc<DeviceIdentity>> = None;
+    let mut local_configuration_tasks = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -484,6 +539,7 @@ async fn controller_loop(
                 let generation = model.start_disconnect();
                 publish(&sink, &model);
                 stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
+                drain_local_configuration_tasks(&mut local_configuration_tasks,observers.product.as_ref()).await;
                 drop(session_identity.take());
                 model.finish_disconnect(generation);
                 publish(&sink, &model);
@@ -494,12 +550,29 @@ async fn controller_loop(
                     let generation = model.start_disconnect();
                     publish(&sink, &model);
                     stop_attempt(active.take(), attempt_stop_observer.as_ref()).await;
+                    drain_local_configuration_tasks(&mut local_configuration_tasks,observers.product.as_ref()).await;
                     drop(session_identity.take());
                     model.finish_disconnect(generation);
                     publish(&sink, &model);
                     break;
                 };
                 match command {
+                    ControllerCommand::LocalConfiguration(request) => {
+                        if local_configuration_tasks.is_empty() {
+                            local_configuration_tasks.spawn(async move {
+                                let target = request.clone();
+                                let result = tokio::task::spawn_blocking(move || perform_local_configuration(&target)).await
+                                    .unwrap_or(Err(claw_platform::configuration::ConfigurationFileError {
+                                        message:"Local configuration worker ended without confirmation; preserve any candidate file",output_may_exist:true,
+                                    }));
+                                ProductUpdate::LocalConfiguration {request,result}
+                            });
+                        } else if let Some(product) = &observers.product {
+                            product(ProductUpdate::LocalConfiguration {request,result:Err(claw_platform::configuration::ConfigurationFileError {
+                                message:"Local configuration work is already in progress",output_may_exist:false,
+                            })});
+                        }
+                    }
                     ControllerCommand::Connect {
                         request,
                         completion,
@@ -578,7 +651,51 @@ async fn controller_loop(
                     publish(&sink, &model);
                 }
             }
+            result = local_configuration_tasks.join_next(), if !local_configuration_tasks.is_empty() => {
+                if let Some(result) = result { publish_local_configuration_result(result,observers.product.as_ref()); }
+            }
         }
+    }
+}
+
+fn perform_local_configuration(
+    request: &LocalConfigurationRequest,
+) -> Result<LocalConfigurationResult, claw_platform::configuration::ConfigurationFileError> {
+    use claw_platform::configuration::{ProviderEdit, inspect_provider, prepare_provider};
+    match &request.action {
+        LocalConfigurationAction::Inspect => inspect_provider(&request.source)
+            .map(Box::new)
+            .map(LocalConfigurationResult::Inspected),
+        LocalConfigurationAction::PrepareModel {
+            destination,
+            expected_sha256,
+            model,
+        } => prepare_provider(
+            &request.source,
+            destination,
+            expected_sha256,
+            ProviderEdit::ExactModel(model),
+        )
+        .map(Box::new)
+        .map(LocalConfigurationResult::Prepared),
+    }
+}
+
+fn publish_local_configuration_result(
+    result: Result<ProductUpdate, tokio::task::JoinError>,
+    product: Option<&ProductSink>,
+) {
+    if let (Ok(update), Some(product)) = (result, product) {
+        product(update);
+    }
+}
+
+async fn drain_local_configuration_tasks(
+    tasks: &mut JoinSet<ProductUpdate>,
+    product: Option<&ProductSink>,
+) {
+    while let Some(result) = tasks.join_next().await {
+        publish_local_configuration_result(result, product);
     }
 }
 
@@ -1761,6 +1878,636 @@ mod tests {
                 "{scenario}"
             );
             drop(cleanup);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn product_model_catalogue_uses_real_transport_and_preserves_read_refresh_boundaries() {
+        const DIGEST: &str = "5aca7507e51d7b59883eab0c7b8b449ec54d626a0c89bf39a00adfc763e1dfc3";
+        for scenario in [
+            "full",
+            "pages",
+            "unavailable",
+            "bad-page",
+            "refresh",
+            "refresh-refused",
+            "wrong-receipt",
+            "availability-disabled",
+            "availability-authentication_pending",
+            "availability-not_initialized",
+            "availability-retired",
+            "availability-private-remote-error",
+            "availability-refused",
+            "availability-ready",
+        ] {
+            let availability = scenario.strip_prefix("availability-");
+            let paged = scenario == "pages";
+            let refresh = matches!(scenario, "refresh" | "refresh-refused" | "wrong-receipt");
+            let digest = if paged {
+                "a".repeat(64)
+            } else {
+                DIGEST.to_owned()
+            };
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let captured = Arc::clone(&calls);
+            let expected_digest = digest.clone();
+            let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+                let calls = Arc::clone(&captured);
+                let digest = expected_digest.clone();
+                async move {
+                    send_challenge(&mut socket).await;
+                    let (connect, params) = receive_connect(&mut socket).await;
+                    send_hello(&mut socket, &connect, &params, 4, "models-gateway", false).await;
+                    let health = receive_request(&mut socket).await;
+                    send_health(&mut socket, &health).await;
+                    let model = json!({"id":"fixture-model","displayName":"Fixture model","contextWindow":null,"maxOutputTokens":null,"advertisedCapabilities":["completion"]});
+                    let mut page = json!({"schemaVersion":1,"available":true,"offset":0,"endOffset":if paged {8} else {1},"nextOffset":if paged {Some(8)} else {None},
+                        "totalModels":if paged {9} else {1},"sha256":digest,"provider":"fixture","providerGeneration":1,"selectedModel":"fixture-model",
+                        "selectionPinned":true,"observedAtMs":12345,"source":"provider_sdk_catalogue","liveCapabilitiesVerified":false,
+                        "selectionChanged":false,"networkContacted":false,"models":[model.clone()]});
+                    if paged {
+                        let models: Vec<_> = (0..8).map(|ordinal| {
+                            let mut entry = model.clone();
+                            if ordinal > 0 {entry["id"] = json!(format!("fixture-model-{ordinal}"));}
+                            entry
+                        }).collect();
+                        page["models"] = json!(models);
+                    }
+                    if scenario == "unavailable" {page = json!({"schemaVersion":1,"available":false,"selectionChanged":false,"networkContacted":false});}
+                    if scenario == "bad-page" {page["models"][0]["displayName"] = json!("private-substituted-label");}
+                    if let Some(reason) = availability.filter(|reason| *reason != "ready") {
+                        page = json!({"schemaVersion":1,"available":false,"unavailableReason":reason,"selectionChanged":false,"networkContacted":false});
+                    }
+                    for ordinal in 0..if paged || refresh {2} else {1} {
+                        let request = receive_request(&mut socket).await;
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        assert_eq!(request.method().as_str(), "models.list");
+                        let actual: Value = serde_json::from_str(request.params().value().expect("params").as_json()).expect("request JSON");
+                        if ordinal == 0 {
+                            let mut expected = json!({"nativeCatalogPage":{"offset":0}});
+                            if availability.is_some() {expected["nativeCatalogPage"]["includeAvailability"] = json!(true);}
+                            assert_eq!(actual, expected);
+                        } else if paged {
+                            assert_eq!(actual, json!({"nativeCatalogPage":{"offset":8,"sha256":digest}}));
+                            page["offset"] = json!(8); page["endOffset"] = json!(9); page["nextOffset"] = Value::Null;
+                            let mut last = model.clone(); last["id"] = json!("fixture-model-8");
+                            page["models"] = json!([last]);
+                        } else {
+                            assert_eq!(actual, json!({"nativeCatalogRefresh":{"sha256":digest}}));
+                            page = json!({"schemaVersion":1,"refreshed":true,"provider":"fixture","providerGeneration":1,"requestedSha256":digest,
+                                "selectedModel":"fixture-model","totalModels":1,"selectionChanged":false,"networkContacted":true,"inferenceInvoked":false});
+                            if scenario == "wrong-receipt" {page["requestedSha256"] = json!("b".repeat(64));}
+                        }
+                        if ordinal == 1 && scenario == "refresh-refused" || scenario == "availability-refused" {
+                            send_json(&mut socket, json!({"type":"res","id":request.id().as_str(),"ok":false,"error":{"code":"INVALID_REQUEST","message":"private-remote-error"}})).await;
+                        } else {send_json(&mut socket, json!({"type":"res","id":request.id().as_str(),"ok":true,"payload":page})).await;}
+                    }
+                    loop {match socket.read_frame().await {
+                        Ok(frame) if frame.opcode == fastwebsockets::OpCode::Text => {calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);}
+                        Ok(frame) if frame.opcode == fastwebsockets::OpCode::Close => break,
+                        Ok(_) => {}, Err(_) => break,
+                    }}
+                }
+            })).await;
+            let (updates, mut observed) = mpsc::channel(16);
+            let controller = DesktopController::spawn_product(
+                |_| {},
+                move |update| {
+                    updates.try_send(update).expect("bounded updates");
+                },
+            )
+            .expect("controller");
+            controller
+                .sender()
+                .connect(request(&gateway.url))
+                .expect("connect");
+            let mut state = crate::product_state::ProductState::native();
+            let connection = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let update = observed.recv().await.expect("ready update");
+                    if let ProductUpdate::Ready { connection } = update {
+                        state.apply_native(ProductUpdate::Ready { connection });
+                        break connection;
+                    }
+                    state.apply_native(update);
+                }
+            })
+            .await
+            .expect("ready deadline");
+            while state.next_native_query().is_some() {}
+            for action in if availability.is_some() {
+                vec![3]
+            } else if paged {
+                vec![0, 1]
+            } else if refresh {
+                vec![0, 2]
+            } else {
+                vec![0]
+            } {
+                let params = state
+                    .native_model_catalogue(action)
+                    .expect("valid model command");
+                controller
+                    .sender()
+                    .product_request(connection, "models.list", params.clone())
+                    .expect("catalogue queued");
+                state.native_model_catalogue_enqueued(&params);
+                assert!(
+                    state.native_model_catalogue(0).is_none(),
+                    "single pending request"
+                );
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let update = observed.recv().await.expect("model outcome");
+                        let complete = matches!(
+                            update,
+                            ProductUpdate::Response {
+                                method: "models.list",
+                                ..
+                            } | ProductUpdate::Failed {
+                                method: "models.list",
+                                ..
+                            }
+                        );
+                        state.apply_native(update);
+                        if complete {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("model response deadline");
+                if action == 0 && scenario != "unavailable" && scenario != "bad-page" {
+                    assert!(
+                        state
+                            .model_catalogue_text()
+                            .contains("Selected: fixture-model (pinned)")
+                    );
+                    assert!(
+                        state
+                            .model_catalogue_text()
+                            .contains("Context: not reported")
+                    );
+                }
+            }
+            let text = state.model_catalogue_text();
+            match scenario {
+                "availability-disabled" => {
+                    assert!(text.contains("Provider is explicitly disabled"));
+                }
+                "availability-authentication_pending" => {
+                    assert!(text.contains("Provider authentication is pending"));
+                }
+                "availability-not_initialized" => {
+                    assert!(text.contains("Provider catalogue is not initialized"));
+                }
+                "availability-retired" => assert!(text.contains("Provider has been shut down")),
+                "availability-private-remote-error" | "availability-refused" => {
+                    assert!(text.contains("could not be verified"));
+                }
+                "pages" => assert!(
+                    text.contains("fixture-model-8") && state.native_model_catalogue(1).is_none()
+                ),
+                "unavailable" => assert!(
+                    text.contains("unavailable") && state.native_model_catalogue(2).is_none()
+                ),
+                "bad-page" => assert!(
+                    text.contains("could not be verified") && !text.contains("substituted-label")
+                ),
+                "refresh" => assert!(
+                    text.contains("Catalogue refreshed")
+                        && !text.contains("fixture-model")
+                        && state.native_model_catalogue(2).is_none()
+                ),
+                "refresh-refused" | "wrong-receipt" => assert!(
+                    text.contains("could not be verified")
+                        && text.contains("Selected: fixture-model")
+                ),
+                _ => assert!(text.contains("Source: provider SDK catalogue")),
+            }
+            assert!(!text.contains("private-remote-error"));
+            assert!(state.native_model_catalogue(0).is_some());
+            assert!(state.transcript().is_empty() && state.next_native_query().is_none());
+            assert_eq!(
+                state.selected_run().state,
+                crate::product_state::RunState::Draft
+            );
+            controller.shutdown().expect("controller shutdown");
+            gateway.shutdown().await;
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                if paged || refresh { 2 } else { 1 },
+                "{scenario}: no inference or ACK"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_configuration_shutdown_waits_for_started_work_and_reports_once() {
+        let (release, held) = tokio::sync::oneshot::channel();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (finished, observed) = tokio::sync::oneshot::channel();
+        let deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = Arc::clone(&deliveries);
+        let sink: ProductSink = Arc::new(move |update| {
+            assert!(matches!(
+                update,
+                ProductUpdate::LocalConfiguration {
+                    request: LocalConfigurationRequest { sequence: 9, .. },
+                    ..
+                }
+            ));
+            captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            entered.send(()).expect("entered task");
+            held.await.expect("explicit release");
+            ProductUpdate::LocalConfiguration {
+                request: LocalConfigurationRequest {
+                    sequence: 9,
+                    source: PathBuf::from("owned-fixture"),
+                    action: LocalConfigurationAction::Inspect,
+                },
+                result: Err(claw_platform::configuration::ConfigurationFileError {
+                    message: "synthetic completion",
+                    output_may_exist: false,
+                }),
+            }
+        });
+        started.await.expect("task started");
+        let mut observed = observed;
+        let draining = tokio::spawn(async move {
+            drain_local_configuration_tasks(&mut tasks, Some(&sink)).await;
+            finished.send(()).expect("drained");
+        });
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            observed.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(deliveries.load(std::sync::atomic::Ordering::SeqCst), 0);
+        release.send(()).expect("finish held operation");
+        tokio::time::timeout(Duration::from_secs(3), observed)
+            .await
+            .expect("bounded drain")
+            .expect("drain confirmed");
+        draining.await.expect("drain joined");
+        assert_eq!(deliveries.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_configuration_controller_creates_candidates_without_gateway() {
+        struct OwnedRoot(PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = OwnedRoot(std::env::temp_dir().join(format!(
+                "claw-controller-config-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            )));
+        std::fs::create_dir(&root.0).expect("owned test root");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("no network witness");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let origin = format!("http://{}", listener.local_addr().expect("origin"));
+        let original=json!({"schema_version":1,"core":{"role":{"source_url":format!("{origin}/role")},"channels":{"teams":{"enabled":false}},
+            "auth":{},"server":{},"logging":{},"sessions":{},"copilot":{},"legacy":{},"updates":{},"admin":{},"network":{},
+            "provider":{"kind":"openai","model":"before-model","api_key":"env:UNRESOLVED_LOCAL_CONFIG_KEY","base_url":format!("{origin}/v1/")}}}).to_string();
+        for scenario in [
+            "valid",
+            "source-drift",
+            "existing-target",
+            "invalid-model",
+            "close-after-accept",
+        ] {
+            let directory = root.0.join(scenario);
+            std::fs::create_dir(&directory).expect("case directory");
+            let source = directory.join("source.json5");
+            let target = directory.join("candidate.json5");
+            std::fs::write(&source, &original).expect("source");
+            if scenario == "existing-target" {
+                std::fs::write(&target, b"preserve-original-target").expect("existing");
+            }
+            let (updates, mut observed) = mpsc::channel(8);
+            let controller = DesktopController::spawn_product(
+                |_| {},
+                move |update| {
+                    assert!(updates.try_send(update).is_ok());
+                },
+            )
+            .expect("controller");
+            let inspected = LocalConfigurationRequest {
+                sequence: 1,
+                source: source.clone(),
+                action: LocalConfigurationAction::Inspect,
+            };
+            controller
+                .sender()
+                .local_configuration(inspected.clone())
+                .expect("inspect queued");
+            let update = tokio::time::timeout(Duration::from_secs(3), observed.recv())
+                .await
+                .expect("bounded inspection")
+                .expect("inspection update");
+            let ProductUpdate::LocalConfiguration {
+                request,
+                result: Ok(LocalConfigurationResult::Inspected(configuration)),
+            } = update
+            else {
+                panic!("expected actual local inspection")
+            };
+            assert_eq!(request, inspected);
+            assert_eq!(
+                configuration
+                    .snapshot
+                    .core()
+                    .provider()
+                    .expect("provider")
+                    .model(),
+                Some("before-model")
+            );
+            let changed = original.replace("before-model", "external-model");
+            if scenario == "source-drift" {
+                std::fs::write(&source, &changed).expect("owned source edit");
+            }
+            let request = LocalConfigurationRequest {
+                sequence: 2,
+                source: source.clone(),
+                action: LocalConfigurationAction::PrepareModel {
+                    destination: target.clone(),
+                    expected_sha256: configuration.source_sha256,
+                    model: if scenario == "invalid-model" {
+                        "bad model"
+                    } else {
+                        "selected-model"
+                    }
+                    .to_owned(),
+                },
+            };
+            controller
+                .sender()
+                .local_configuration(request.clone())
+                .expect("prepare queued");
+            let update = tokio::time::timeout(Duration::from_secs(3), observed.recv())
+                .await
+                .expect("bounded candidate")
+                .expect("candidate update");
+            let ProductUpdate::LocalConfiguration {
+                request: returned,
+                result,
+            } = update
+            else {
+                panic!("unexpected gateway event for local task")
+            };
+            assert_eq!(returned, request);
+            if matches!(scenario, "valid" | "close-after-accept") {
+                let Ok(LocalConfigurationResult::Prepared(prepared)) = result else {
+                    panic!("expected created candidate");
+                };
+                let reread = claw_platform::configuration::inspect_provider(&target)
+                    .expect("verified candidate file");
+                assert_eq!(prepared.candidate_sha256, reread.source_sha256);
+                assert_eq!(
+                    reread
+                        .snapshot
+                        .core()
+                        .provider()
+                        .expect("selected provider")
+                        .model(),
+                    Some("selected-model")
+                );
+                assert_eq!(
+                    reread
+                        .snapshot
+                        .core()
+                        .provider()
+                        .expect("provider")
+                        .api_key(),
+                    configuration
+                        .snapshot
+                        .core()
+                        .provider()
+                        .expect("original provider")
+                        .api_key()
+                );
+            } else {
+                assert!(result.is_err());
+                if scenario == "existing-target" {
+                    assert_eq!(
+                        std::fs::read(&target).expect("preserved target"),
+                        b"preserve-original-target"
+                    );
+                } else {
+                    assert!(!target.exists());
+                }
+            }
+            assert_eq!(
+                std::fs::read_to_string(&source).expect("source preserved"),
+                if scenario == "source-drift" {
+                    changed.as_str()
+                } else {
+                    original.as_str()
+                }
+            );
+            if scenario == "close-after-accept" {
+                let waiting = LocalConfigurationRequest {
+                    sequence: 3,
+                    source: target.clone(),
+                    action: LocalConfigurationAction::Inspect,
+                };
+                controller
+                    .sender()
+                    .local_configuration(waiting.clone())
+                    .expect("last inspect queued");
+                let result = tokio::time::timeout(Duration::from_secs(3), observed.recv())
+                    .await
+                    .expect("last inspection")
+                    .expect("last update");
+                let ProductUpdate::LocalConfiguration {
+                    request,
+                    result: Ok(LocalConfigurationResult::Inspected(_)),
+                } = result
+                else {
+                    panic!("inspection result")
+                };
+                assert_eq!(request, waiting);
+            }
+            controller.shutdown().expect("tracked local work shutdown");
+            assert!(
+                matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock)
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn product_accounting_pages_use_real_transport_and_existing_digest_without_ack() {
+        for scenario in ["valid", "corrupt", "session", "refused"] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let captured = Arc::clone(&calls);
+            let gateway = TestGateway::spawn(handler(move |mut socket, _| {
+                let calls = Arc::clone(&captured);
+                async move {
+                    send_challenge(&mut socket).await;
+                    let (connect, params) = receive_connect(&mut socket).await;
+                    send_hello(&mut socket, &connect, &params, 4, "accounting-gateway", false).await;
+                    let health = receive_request(&mut socket).await;
+                    send_health(&mut socket, &health).await;
+                    let tokens = json!({"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0});
+                    let summary = json!({"available":true,"recordedRounds":1,"completeCounterRounds":1,"partialCounterRounds":0,"unreportedRounds":0,
+                        "allPrimaryCountersReported":true,"observedTokens":tokens,"aggregationOverflow":false,"costCalculated":false,"billingReconciled":false,
+                        "recordSource":"terminal_turn","attemptsMayBeUnsent":true});
+                    let terminal = receive_request(&mut socket).await;
+                    calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!(terminal.method().as_str(),"agent.wait");
+                    let params:Value = serde_json::from_str(terminal.params().value().expect("params").as_json()).expect("JSON");
+                    assert_eq!(params,json!({"runId":"a".repeat(64)}));
+                    send_json(&mut socket,json!({"type":"res","id":terminal.id().as_str(),"ok":true,"payload":{
+                        "runId":"a".repeat(64),"sessionId":"native-session","phase":"outcome_unknown","status":"outcome_unknown","turn":0,"revision":4,"durable":true,
+                        "result":{"status":"outcome_unknown","text":"retained result"},"providerAccounting":summary}})).await;
+                    let page_request = receive_request(&mut socket).await;
+                    calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!(page_request.method().as_str(),"agent.wait");
+                    let params:Value = serde_json::from_str(page_request.params().value().expect("params").as_json()).expect("JSON");
+                    assert_eq!(params,json!({"runId":"a".repeat(64),"accountingPage":{"revision":4,"offset":0}}));
+                    let mut page = json!({"runId":"a".repeat(64),"sessionId":"native-session","revision":4,"turn":0,"status":"outcome_unknown",
+                        "durable":true,"acknowledged":false,"automaticReplay":false,"accounting":{"available":true,"offset":0,"endOffset":1,"nextOffset":null,"totalRounds":1,
+                            "sha256":"72f1a001eed81051e5e48f6d0e7c3a08e188144fb539af4e5908f51820c571a3","summary":summary,
+                            "rounds":[{"round":0,"response":{"provider":"fixture","model":"fixture-model","responseId":"response-123","usageReporting":"complete","finishReason":"stop","observedTokens":tokens}}]}});
+                    if scenario == "corrupt" {page["accounting"]["rounds"][0]["response"]["model"] = json!("substituted-private-model");}
+                    if scenario == "session" {page["sessionId"] = json!("another-session");}
+                    if scenario == "refused" {
+                        send_json(&mut socket,json!({"type":"res","id":page_request.id().as_str(),"ok":false,"error":{"code":"UNAVAILABLE","message":"fixture refusal"}})).await;
+                    } else {
+                        send_json(&mut socket,json!({"type":"res","id":page_request.id().as_str(),"ok":true,"payload":page})).await;
+                    }
+                    loop {
+                        match socket.read_frame().await {
+                            Ok(frame) if frame.opcode == fastwebsockets::OpCode::Text => {calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);}
+                            Ok(frame) if frame.opcode == fastwebsockets::OpCode::Close => break,
+                            Ok(_) => {}, Err(_) => break,
+                        }
+                    }
+                }
+            })).await;
+            let (updates, mut observed) = mpsc::channel(16);
+            let controller = DesktopController::spawn_product(
+                |_| {},
+                move |update| {
+                    updates.try_send(update).expect("bounded product queue");
+                },
+            )
+            .expect("controller");
+            controller
+                .sender()
+                .connect(request(&gateway.url))
+                .expect("connect");
+            let mut state = crate::product_state::ProductState::native();
+            let connection = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let update = observed.recv().await.expect("ready update");
+                    if let ProductUpdate::Ready { connection } = update {
+                        state.apply_native(ProductUpdate::Ready { connection });
+                        break connection;
+                    }
+                    state.apply_native(update);
+                }
+            })
+            .await
+            .expect("ready deadline");
+            controller
+                .sender()
+                .product_request(connection, "agent.wait", json!({"runId":"a".repeat(64)}))
+                .expect("read terminal");
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let update = observed.recv().await.expect("terminal update");
+                    let finished = matches!(
+                        update,
+                        ProductUpdate::Response {
+                            method: "agent.wait",
+                            ..
+                        }
+                    );
+                    state.apply_native(update);
+                    if finished {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("terminal deadline");
+            while state.next_native_query().is_some() {}
+            let transcript = state.transcript().to_vec();
+            let params = state.native_accounting(false).expect("owned page request");
+            controller
+                .sender()
+                .product_request(connection, "agent.wait", params.clone())
+                .expect("page queued");
+            state.native_accounting_enqueued(&params);
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let update = observed.recv().await.expect("page update");
+                    let finished = matches!(
+                        update,
+                        ProductUpdate::Response {
+                            method: "agent.wait",
+                            ..
+                        } | ProductUpdate::Failed {
+                            method: "agent.wait",
+                            ..
+                        }
+                    );
+                    state.apply_native(update);
+                    if finished {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("page deadline");
+            let display = state.accounting_summary();
+            assert_eq!(
+                state.selected_run().state,
+                crate::product_state::RunState::OutcomeUnknown
+            );
+            assert_eq!(state.transcript(), transcript.as_slice());
+            assert!(
+                state.next_native_query().is_none(),
+                "no accounting ACK or replay"
+            );
+            assert!(
+                state.native_accounting(false).is_some(),
+                "explicit reread remains available"
+            );
+            assert!(state.native_accounting(true).is_none());
+            if scenario == "valid" {
+                assert!(display.contains("verified complete page"), "{display}");
+                assert!(display.contains("Round 0: fixture / fixture-model"));
+                assert!(display.contains("Response: response-123"));
+                assert!(display.contains("Tokens (complete): 0"));
+            } else {
+                assert!(
+                    display.contains("could not be verified"),
+                    "{scenario}: {display}"
+                );
+                assert!(
+                    !display.contains("response-123")
+                        && !display.contains("substituted-private-model")
+                );
+            }
+            controller.shutdown().expect("controller shutdown");
+            gateway.shutdown().await;
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "{scenario}"
+            );
         }
     }
 

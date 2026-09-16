@@ -1,0 +1,262 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-bounded-model-catalogue-and-explicit-refresh",
+  "capturedOn": "2026-09-16",
+  "baseCommit": "c360c2b36d3df1bf998b83ac7d171f78a39aade8",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "taskIds": ["M3-06.02", "M3-07", "M5-01"],
+  "acceptedParentTasksAdded": 0,
+  "acceptedSubtasksAdded": [],
+  "wholeProjectAccepted": false,
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "platform": "windows-x86_64",
+  "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01), stable",
+  "cargoLockSha256": "3cec96347169fcba527beac7b577ee05579c291f2e960902270da60efcd1e277",
+  "precedingIncrement": "docs/ledger/native-provider-config-20260916.json",
+  "sourceFiles": [
+    { "path": "crates/claw-protocol/src/lib.rs", "sha256": "0c74f02b0fd6ef5209860e756991243a9d869266e2f482b4002a6cb4bd5a7db7" },
+    { "path": "crates/claw-protocol/src/native_models.rs", "sha256": "4b0e5d974ce14fef8b8182c4dec475a038662849983010efe61bfd227ac3f967" },
+    { "path": "apps/gta-claw-daemon/src/adapters/http_api.rs", "sha256": "dc795705ffccfba448283e8278a52e046f61c8d4ccde9b272c262c657bdc6b79" },
+    { "path": "apps/gta-claw-daemon/src/adapters/runtime_gateway.rs", "sha256": "0124d3b85dc275b2069fcabdd8a9303fd698c382bb7ecf312edc10f67b3cbcd9" },
+    { "path": "apps/gta-claw-daemon/src/adapters/agent_runtime.rs", "sha256": "423f524616b784d366000e7fe2b17b6ffbdfb7d5d4daeebe3d404f5b18ce9028" },
+    { "path": "apps/gta-claw-daemon/tests/production_composition.rs", "sha256": "240f1bd748ec509b37dade0b0c8733558a5ec33b7cbdb1867dbd8b0c5531ee90" },
+    { "path": "apps/gta-claw-cli/src/lib.rs", "sha256": "8558219e9156dbf4934a54061df411ef083bf1e4a6817530aa2b1652bf9000f1" },
+    { "path": "apps/gta-claw-cli/src/native_gateway.rs", "sha256": "49fe8fb070bbb811b5e478f72e1a9aca5616183bcc1a4ed2c51e2c2f170cf2a9" },
+    { "path": "apps/gta-claw-cli/tests/gateway_health.rs", "sha256": "11e60066084ab4e4b3acaf4e9da9428051245580008a77a533edc288999356d5" },
+    { "path": "apps/gta-claw-cli/tests/foundation.rs", "sha256": "619fa6f323be15aa819456a4ba4c735729404ccdaef58c85fa7383854111a0b1" }
+  ],
+  "checks": [
+    {
+      "command": "cargo +stable test -p claw-protocol -p claw-config -p gta-claw-daemon -p gta-claw-cli --all-targets --no-fail-fast --locked --offline -j 2",
+      "result": "passed", "exitCode": 0, "passed": 533, "failed": 0, "ignored": 5, "testBinaries": 33,
+      "packageCounts": { "claw-config": 109, "claw-protocol": 70, "gta-claw-cli": 107, "gta-claw-daemon": 247 },
+      "log": "target/native-model-catalogue-final-tests-20260916.log",
+      "sha256": "22d219c6815b3b0b0c4df2f188f41b09ae0e4a85f4a9dfb4e2f6e4fb3c65e35e"
+    },
+    {
+      "command": "cargo +stable clippy -p claw-protocol -p claw-config -p gta-claw-daemon -p gta-claw-cli --all-targets --locked --offline -j 2 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-model-catalogue-final-clippy-20260916.log",
+      "sha256": "9fe6031719f2a8db64c6486f2e4418c0fef631f6ccd061278501baf64e358bd5"
+    },
+    {
+      "command": "cargo +stable check --workspace --all-targets --locked --offline -j 2",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-model-catalogue-final-check-20260916.log",
+      "sha256": "2a011e4e9f14164c42b185993de1993843f70ac5fc2b0a14f42c1798e17b4b42"
+    }
+  ],
+  "artifacts": [
+    { "path": "target/debug/gta-claw-cli.exe", "sha256": "d3e17977a235f65eab64a67bf24a9ef77be5a96d30acf5a3eb24574f25794859" },
+    { "path": "target/debug/gta-claw-daemon.exe", "sha256": "f1ea625b076cbed61dd7fd2d376025cfc55ec414beb01fd0ea6118a4e18e04b0" }
+  ],
+  "behaviorEvidence": [
+    "provider_catalogue_rejects_ambiguous_or_unbounded_descriptors_before_publication",
+    "native_model_catalogue_pages_preserve_metadata_and_pin_selection_without_network",
+    "model_catalogue_refresh_is_bounded_cancel_safe_and_preserves_selected_provider",
+    "model_catalogue_commands_separate_read_and_explicit_snapshot_refresh",
+    "model_catalogue_cli_validates_metadata_without_selection_refresh_or_replay",
+    "model_catalogue_refresh_cli_requests_write_scope_and_validates_only_a_refresh_receipt",
+    "bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection"
+  ],
+  "retainedFailures": [
+    "The first candidate-publication regression failed because duplicate model IDs were accepted and published. Added catalogue validation before installation; the identical regression then rejected all six malformed cases without replacing the original provider or advancing publication generation",
+    "The first real Gateway negative test reused a completed request ID and hit client DuplicateRequest protection. Fixed fixture request identities, then reran the same real six-provider/source scenarios",
+    "The first refresh fixture omitted startup/ping and was correctly rejected as metadata-only before initialization. Forwarded those lifecycle methods to the existing smoke provider; the same refresh regression then passed",
+    "Strict lint required earlier read-lock release after copying the immutable page snapshot, scoped imports and test semicolons. Corrected without weakening validators or blanket allowances",
+    {
+      "reason": "First combined regression failed in mcp_oauth_login_uses_reviewed_metadata_real_callback_and_native_pending_recovery after the CLI reported nativeRecordVerified:true but the parent observed a nonmatching NativeTokenStatus. Added only test mode and non-secret status diagnostics. Focused and final combined passes do not establish a root-cause repair; original credential/OAuth/stdio anomalies remain open",
+      "log": "target/native-model-catalogue-tests-20260916.log",
+      "sha256": "4dfad4b988410190a5e8fbd046ec4afdf3b99aa6d2604dd7399aa21785d2484a"
+    }
+  ],
+  "notes": [
+    "Provider catalogue initialization and refresh reject more than 1024 entries, duplicate exact IDs, invalid display names, zero published limits and output limits exceeding published context. A missing configured model refuses publication; failed candidates retain the previous provider and generation",
+    "models.list accepts explicit nativeCatalogPage through actual Gateway and administrator routes. Legacy/default Gateway dispatch and the existing administrator ID list are retained. Native pages contain at most eight models and snapshot provider/selected model/pin state/observation timestamp/source together under the provider state boundary",
+    "The full ordered JSON snapshot digest fixes all descriptors and selection metadata. Catalogue reads are cache-only. Unknown context/output limits remain null. advertisedCapabilities come from SDK descriptors and may be adapter/provider defaults; source=provider_sdk_catalogue and liveCapabilitiesVerified=false avoid claiming per-account verification",
+    "CLI gateway models requests only operator.read and validates a closed bounded response before output. Nine actual CLI/WebSocket scenarios include full page, continuation, unavailable, digest mismatch, duplicate, unsupported capability, bad numeric limit, extra credential field and absent selected model. One RPC per invocation, no implicit refresh or inference",
+    "CLI gateway refresh-models explicitly requests read/write and the previously observed SHA. Gateway requires write/admin in addition to the base read method authorization, and rejects mixed operations. One catalogue refresh can be in flight; ten-second total wait and drop/cancel/shutdown guards bound uncooperative model-list futures",
+    "Refresh invokes list_models once and never completes/streams/embeds or changes the configured model. Before cache publication it revalidates descriptors, the actual adapter identity, configuration generation, pinned/default selection and cancellation. Old cache survives failure, removed selection, concurrent switch or timeout",
+    "Eight controlled refresh lifecycle cases cover success, caller cancellation, dropped future, missing default model, concurrent configuration change, provider replacement, shutdown and actual ten-second timeout. Simultaneous second refresh performs no list request; original provider generation and selection remain unchanged except the deliberate replacement/shutdown test actions",
+    "Five real CLI refresh scenarios verify scopes, pinned request, refusal and invalid inference/selection/extra-field receipts, with no second RPC or replay. Six actual daemon provider/source runs validate shared page/receipt schemas, one extra model-list call for explicit refresh and zero extra inference; a separate paired read-only device can list but cannot refresh",
+    "Full single pages independently verify the digest. Individual continuation pages only pin the complete snapshot and do not cryptographically prove omitted models. No alias resolution, account verification, pricing or graphical selection workflow is claimed",
+    "The preceding configuration ledger describes an earlier validated local snapshot. Files subsequently extended for catalogue work have current hashes here; earlier ledger bytes are not rewritten. M3-06.01 acceptance remains the narrow typed-config scope, while M3-07 remains open",
+    "No external downloads/version upgrades, real provider/cloud accounts, paid generation, production proxy/server changes, migration, deployment, release or mobile hardware were used. Earlier accounting edits were retained. All owned commands completed synchronously; no branch, commit or push was performed"
+  ],
+  "recovery": [
+    "Read the first cached page again after a digest mismatch or successful refresh; never generate a completion merely to rebuild a catalogue",
+    "A refused/failed refresh retains the old cache and selected model. Review the error and current snapshot before an explicit retry; no automatic refresh or fallback model is used",
+    "Unavailable or disabled provider state must be resolved through the appropriate explicit configuration/authentication workflow; a catalogue page is not proof of readiness, capability or bill settlement"
+  ],
+  "followups": [
+    {
+      "stage": "instance-bound-catalogue-and-refresh-receipts",
+      "sourceFiles": [
+        { "path": "apps/gta-claw-daemon/src/adapters/http_api.rs", "sha256": "413113b9dfd7e975ca2076829caace4cd505a18cd6838a0baf2fe94d34ac34b2" },
+        { "path": "apps/gta-claw-daemon/tests/production_composition.rs", "sha256": "7b411e79700081290a275556f4368c236d71e91d1475c2b1fc62001355db892f" },
+        { "path": "crates/claw-protocol/src/native_models.rs", "sha256": "7544c6d0e7063bd4dd0a48af04f8113719d7f90698ca65380136454280ede5ef" },
+        { "path": "apps/gta-claw-cli/src/native_gateway.rs", "sha256": "ffc7b0ab5d91cbcf8000d5acf8bd07f90fdd4754952f87eee72180ef91993b2f" },
+        { "path": "apps/gta-claw-cli/tests/gateway_health.rs", "sha256": "7e8bf4705dedc5fd959122bba35e3eaafa6b75a511237c1e4c7cd9f54b634062" }
+      ],
+      "checks": [
+        {
+          "command": "cargo +stable test -p claw-protocol -p claw-config -p gta-claw-daemon -p gta-claw-cli --all-targets --no-fail-fast --locked --offline -j 2",
+          "result": "passed", "exitCode": 0, "passed": 534, "failed": 0, "ignored": 5,
+          "log": "target/native-model-instance-tests-20260916.log",
+          "sha256": "13eb466372eab42792366a89b2b43335cf368288562c12e6608ea333704f2543"
+        },
+        {
+          "command": "cargo +stable clippy -p claw-protocol -p claw-config -p gta-claw-daemon -p gta-claw-cli --all-targets --locked --offline -j 2 -- -D warnings",
+          "result": "passed", "exitCode": 0,
+          "log": "target/native-model-instance-clippy-20260916.log",
+          "sha256": "832d9be51ab9e1c068d35814e882c81f699e8a1b44422662b71650ab750c1824"
+        },
+        {
+          "command": "cargo +stable check --workspace --all-targets --locked --offline -j 2",
+          "result": "passed", "exitCode": 0,
+          "log": "target/native-model-instance-check-20260916.log",
+          "sha256": "f17e946187701eebb6535d94d0bc025563cd127cbec2b8a6d4423dae9bbf1d46"
+        }
+      ],
+      "behaviorEvidence": [
+        "model_catalogue_snapshot_does_not_alias_a_replaced_provider_at_the_same_time",
+        "model_catalogue_refresh_is_bounded_cancel_safe_and_preserves_selected_provider",
+        "model_catalogue_refresh_cli_requests_write_scope_and_validates_only_a_refresh_receipt",
+        "bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection"
+      ],
+      "retainedFailures": [
+        "The new same-catalogue/same-millisecond replacement test reproduced identical digests for different provider instances. Added providerGeneration to the ordered snapshot and validated positive generations. The same regression then passed and rejected an old instance's digest before refreshing the new one",
+        "Code inspection found target capture and digest verification in separate state-lock acquisitions. Both now use one shared snapshot helper under the same publication lock; receipt includes requestedSha256 and CLI verifies it against the actual request",
+        "An erroneous parallel Add of this ledger concatenated two JSON objects. Parsing failed explicitly. Removed the duplicate object using apply_patch and verified the single record with terminating-error parsing and all then-current 15 fingerprints; no product code or test outcome was changed"
+      ],
+      "notes": [
+        "This follow-up is the latest catalogue wire shape in this unpublished increment. Pages carry providerGeneration; refresh receipts also carry requestedSha256. Root provider publication holds the same host state guard until its generation is stored, so instance and generation are captured consistently",
+        "CLI cases now cover ten page scenarios and seven refresh scenarios, including zero generation and a valid receipt for the wrong request digest. Complete page hashes and actual six-dialect/source daemon responses pass the shared validator",
+        "Prior top-level source/artifact hashes are historical snapshots, not hashes of later builds. Latest changed-source witnesses and final checks are in this follow-up. No original accounting v1 digest or sealed compatibility contract was changed",
+        "Provider generations remain process-local, not cross-restart durable identities. Reconnect requires rereading the current catalogue. Wall-clock observation timestamps do not establish monotonic freshness or real capability proof; these limits remain open"
+      ]
+    },
+    {
+      "stage": "tui-independent-model-catalogue-view",
+      "sourceFiles": [
+        { "path": "apps/gta-claw-tui/src/gateway.rs", "sha256": "284f8d642dcca684eceaf28acc9d576facf537930b8d437a59df219c29cd89bd" },
+        { "path": "apps/gta-claw-tui/src/lib.rs", "sha256": "75167ccc67a7df61124f5a88a5820119d1feda3e66d1a58ad805f838fde00c21" },
+        { "path": "apps/gta-claw-tui/src/model.rs", "sha256": "418888231adf08052888248bd598c3ee4af6dcab4f71ed8416edc6c331a985fa" },
+        { "path": "apps/gta-claw-tui/src/render.rs", "sha256": "721d19231a5c2809dda14ed114f1a8b83a036a86cbc2ab7ec2fc735a80de2b00" },
+        { "path": "apps/gta-claw-tui/tests/gateway_double.rs", "sha256": "63c2f63932ba02f74fa91f648e5e37c262aefdb821ac630665e41506dc48d293" },
+        { "path": "apps/gta-claw-tui/tests/rendering.rs", "sha256": "04dc2dd04e1521858557b8d2cd86fe0f18049abbf5ecbf84d4cce64fc09894ea" }
+      ],
+      "checks": [
+        {
+          "command": "cargo +stable test -p gta-claw-tui --all-targets --no-fail-fast --locked --offline -j 2",
+          "result": "passed", "exitCode": 0, "passed": 77, "failed": 0, "ignored": 0,
+          "log": "target/native-tui-models-tests-20260916.log",
+          "sha256": "54ebb3d931ad1c5a3b47038761d76a25bf59b7347a0bca91bd3b841c45a7616a"
+        },
+        {
+          "command": "cargo +stable clippy -p gta-claw-tui --all-targets --locked --offline -j 2 -- -D warnings",
+          "result": "passed", "exitCode": 0,
+          "log": "target/native-tui-models-clippy-20260916.log",
+          "sha256": "346ad84315f7d9dbfba3ce255534c7c9ea56a1d38f70c10d3ac32563e7fe1582"
+        },
+        {
+          "command": "cargo +stable check --workspace --all-targets --locked --offline -j 2",
+          "result": "passed", "exitCode": 0,
+          "log": "target/native-tui-models-check-20260916.log",
+          "sha256": "f53de8bdd3a4d521060b116140b2344c65492602a890de9b188d2e515c7ba004"
+        }
+      ],
+      "behaviorEvidence": [
+        "model_catalogue_requests_keep_read_refresh_and_unavailable_responses_separate",
+        "model_catalogue_view_pins_requests_preserves_failures_and_never_acknowledges_chat",
+        "native_tui_model_catalogue_reads_and_refreshes_without_chat_ack_or_selection",
+        "model_catalogue_rows_wrap_and_keep_unknown_metadata_distinct"
+      ],
+      "notes": [
+        "Adds Models as screen seven without reassigning existing navigation. Entering the view or models reads a cache page; models-next requests a digest-bound continuation; refresh-models explicitly refreshes the provider directory. No model selection/configuration mutation or inference is sent",
+        "ModelCatalogueRequest binds worker connection and monotonic UI request sequence with one pending request. Worker validates through claw-protocol before emitting a result. Late or mismatched events are ignored, failure preserves the old page, and successful refresh invalidates the old cursor until an explicit cache read",
+        "Six real WebSocket worker scenarios cover pages, refresh, refused refresh, malformed page, unavailable provider and previous connection refusal. Exact RPC counts and a refused local chat ACK prove catalogue results are not chat results",
+        "Rendering tests cover widths20/40/80/120 and heights10/24, long wide-character labels, active tab visibility and unknown limits. First test mistakenly searched a wrapped multi-line label as a single line; corrected the assertion to reconstruct ordered display content without weakening layout checks",
+        "Strict lint initially requested branch ordering and semicolons; local fixes passed. All TUI targets plus root compile completed; interactive terminal-user acceptance and Slint model UI are not claimed"
+      ]
+    },
+    {
+      "stage": "slint-model-catalogue-and-final-native-workflow",
+      "sourceFiles": [
+        { "path": "desktop/apps/gta-claw-desktop/src/product_state.rs", "sha256": "aae2b58249346bc9454ed9d2655cfcbc3bd65e8d5b8c9168de0243e7911c9f16" },
+        { "path": "desktop/apps/gta-claw-desktop/src/controller.rs", "sha256": "1e0c212d07413a0c6358de90b749daa9b1d4541dd4f54e7a297f6b02b77de4b0" },
+        { "path": "desktop/apps/gta-claw-desktop/src/main.rs", "sha256": "37f65581d9f44d770c18c63bb02a9c81e07849b9f8e6d9b390307d2bb0634e8d" },
+        { "path": "desktop/apps/gta-claw-desktop/src/software_renderer_smoke.rs", "sha256": "5458bbbabdfde96b7ac6c674b5d2948aeaf897501431e72074020bc2db366833" },
+        { "path": "desktop/apps/gta-claw-desktop/ui/app-window.slint", "sha256": "82ec259d1ef6841e7c9e79425c7cce23092018788d5a43f69f780a7c5ea65248" },
+        { "path": "desktop/apps/gta-claw-desktop/ui/modules/product-shell.slint", "sha256": "965201f3adc2afd42a1413934abb8fcc94262ace547de3176823817b4cfbe42d" },
+        { "path": "crates/claw-provider-sdk/src/secret/windows.rs", "sha256": "60186015695c03319783eb3e6b0208220671def468b68ce75fdbe9efc28e47e4" }
+      ],
+      "checks": [
+        {
+          "command": "cargo +stable test --manifest-path desktop/Cargo.toml -p gta-claw-desktop --all-targets --no-fail-fast --locked --offline -j 1 --config profile.test.package.gta-claw-desktop.debug=0 --config profile.test.package.gta-claw-desktop.codegen-units=16",
+          "result": "passed", "exitCode": 0, "passed": 91, "failed": 0, "ignored": 0,
+          "log": "target/native-desktop-models-tests-20260916.log",
+          "sha256": "21176288897ff03d6f04509414aaeb9c50bf1591d965b7bb8bb25c9ecddda8d4"
+        },
+        {
+          "command": "cargo +stable clippy --manifest-path desktop/Cargo.toml -p gta-claw-desktop --all-targets --locked --offline -j 1 -- -D warnings",
+          "result": "passed", "exitCode": 0,
+          "log": "target/native-desktop-models-clippy-20260916.log",
+          "sha256": "a5dd79e88989c0f1cedbc9b4e19fc55476dbe514458d42c3a0d6937789f5ecd1"
+        },
+        {
+          "command": "cargo +stable test -p claw-provider-sdk -p claw-protocol -p claw-config -p gta-claw-daemon -p gta-claw-cli -p gta-claw-tui --all-targets --no-fail-fast --locked --offline -j 2",
+          "result": "passed", "exitCode": 0, "passed": 869, "failed": 0, "ignored": 7, "testBinaries": 41,
+          "packageCounts": { "claw-provider-sdk": 258, "claw-config": 109, "claw-protocol": 70, "gta-claw-cli": 107, "gta-claw-daemon": 248, "gta-claw-tui": 77 },
+          "log": "target/native-provider-workflow-tests-20260916.log",
+          "sha256": "c23ae5c7be985e149d9ea2bbe926c73647d3efa76e1d47d35c9f62ab9ed3ecde"
+        },
+        {
+          "command": "cargo +stable clippy -p claw-provider-sdk -p claw-protocol -p claw-config -p gta-claw-daemon -p gta-claw-cli -p gta-claw-tui --all-targets --locked --offline -j 2 -- -D warnings",
+          "result": "passed", "exitCode": 0,
+          "log": "target/native-provider-workflow-clippy-20260916.log",
+          "sha256": "515dbd65ff07d8cc098b72de50de61fcd2768dc71711fb6ff088de8f31ef1889"
+        },
+        {
+          "command": "cargo +stable check --workspace --all-targets --locked --offline -j 2",
+          "result": "passed", "exitCode": 0,
+          "log": "target/native-provider-workflow-check-20260916.log",
+          "sha256": "e9eb3fec51d6a873cc36f4d987372e753cc8f707c0614632cc3f1000b069db4b"
+        },
+        {
+          "command": "cargo +stable test -p claw-provider-sdk --lib secret::windows::tests --locked --offline -j 2",
+          "result": "passed", "exitCode": 0, "passed": 5, "failed": 0, "ignored": 1,
+          "log": "target/native-credential-process-tests-20260916.log",
+          "sha256": "0bfad4335b9ae07896c660ae81e172cf72f7282b1da96fe045019f96b380d44b"
+        }
+      ],
+      "artifacts": [
+        { "path": "desktop/target/debug/deps/gta_claw_desktop-96d6ad81213bf148.exe", "sha256": "703781d66aa4dab9dd258f86272c6bb1f8b721e6f0773affcf7bc73819cc3fb1" }
+      ],
+      "behaviorEvidence": [
+        "native_model_catalogue_state_pins_pages_and_does_not_mutate_chat_or_selection",
+        "native_model_catalogue_renders_cached_metadata_and_control_states_at_two_sizes",
+        "product_model_catalogue_uses_real_transport_and_preserves_read_refresh_boundaries",
+        "independent_processes_read_the_same_native_credential"
+      ],
+      "notes": [
+        "Slint Settings/Models no longer displays Automatic routing as a placeholder. Its three existing-style icon controls read the cache, request a digest-bound next page or explicitly refresh. The view is read-only, shows actual selected model/instance/source/unknown metadata and disables controls while one request is pending",
+        "Desktop catalogue responses pass shared validation and match the current connection/epoch and pending parameters; continuation also pins all selection/provenance fields. Failed or invalid results keep the prior page without appending chat errors, changing run state or queuing ACKs. Successful refresh clears the old page; disconnect clears all catalogue state",
+        "Seven actual desktop controller/WebSocket scenarios cover a full independently hashed page, two pages, unavailable, corrupt page, refresh success, remote refusal and a well-formed refresh receipt for a different request. Exact one/two request counters prove no extra inference, selection or ACK",
+        "Independent desktop complete-page SHA is 5aca7507e51d7b59883eab0c7b8b449ec54d626a0c89bf39a00adfc763e1dfc3. Slint software tests at1080x720 and720x520 verify long wide-character metadata, unknown limits, visible control-state pixels, in-flight disable and disconnect clearing; not interactive platform-user acceptance",
+        "A fresh direct Windows-store subprocess probe reads four successive synthetic generations and verifies deletion from a fifth process. It bypasses CLI/OAuth/network and accesses only a uniquely owned gta-claw.test.process-native fixture. The helper is normally ignored but explicitly run and checked by the parent test. All owned fixture data is cleaned afterward",
+        "The direct process probe passed and did not reproduce the existing intermittent native credential/OAuth failures. This is additional discriminating coverage, not a root-cause repair. No native backend, Windows service, retry or persistence policy was changed; old failures remain open",
+        "Initial desktop renderer fixture used a nonexistent navigate method; switched to the existing select_destination API and reran the same test. Strict lint required local branch rewrites, without new allowances. Desktop uses invocation-local low-peak debug/codegen options, not a repository profile change",
+        "Newest combined results are869 native passing tests/7ignored plus91 desktop tests. The ignored total includes the new subprocess helper and existing SDK/CLI/daemon helper boundaries; no tests were disabled to hide failures. Root compile and both workspace strict lints passed. All owned sync commands completed, no running service remains",
+        "Only M3-06.01 was closed. Actual GUI model selection, live configuration application, real provider accounts, graph-wide retirement, migration/mobile/release remain incomplete. No paid or production external operations, Git publication or modifications to user credentials were performed"
+      ]
+    }
+  ],
+  "unverified": [
+    "Alias/account/endpoint catalogue UX, true per-model capability provenance and accuracy against real accounts",
+    "TUI/Slint model-selection editors, complete provider online retirement and cross-device refresh UX",
+    "Durable catalogue snapshots, full multi-page export, monotonic observation across system clock changes and remote provider freshness guarantees",
+    "Native credential/OAuth/stdio intermittent failures, cross-platform/device testing, migration and release gates"
+  ]
+}

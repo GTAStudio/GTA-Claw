@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "stage": "published-dependency-only-ci-and-client-webbrowser-security-patch",
+  "capturedOn": "2026-09-16",
+  "repository": "GTAStudio/GTA-Claw",
+  "branch": "main",
+  "ciCommit": "30f97d0f53c1973a9e55a3bcef9469bd5ade8037",
+  "securityCommit": "8c3abffc3299db1fa5add5c7d705fe39b1236a6d",
+  "applicationDevelopmentPublished": false,
+  "wholeProjectAccepted": false,
+  "allDependencyChecksPassed": false,
+  "workflow": {
+    "path": ".github/workflows/dependencies.yml",
+    "sha256": "efcdaa2e0bbe92a64965ceab773ac95671896906c1bb872064256b3571fb0d4d",
+    "jobs": ["rust-advisories", "rust-dependency-policy", "npm-advisories"],
+    "triggers": ["main dependency changes", "pull request dependency changes", "daily schedule", "manual dispatch"],
+    "permissions": { "contents": "read" },
+    "validation": "actionlint 1.7.7 passed; Windows archive SHA256 7f12f1801bca3d480d67aaf7774f4c2a6359a3ca8eebe382c95c10c9704aa731 checked against the official release checksum"
+  },
+  "remoteConfiguration": {
+    "removedLiveYamlFiles": 10,
+    "disabledObsoleteWorkflowRegistrations": 12,
+    "dependencyGraphRetained": true,
+    "dependabotVulnerabilityAlertsEnabled": true,
+    "codeqlDefaultSetup": "not-configured",
+    "obsoleteRequiredWorkflowRuleset": 19086280,
+    "obsoleteRequiredWorkflowRulesetEnforcement": "disabled",
+    "obsoleteRequiredWorkflowRulesRemoved": true,
+    "preservedBranchProtections": ["deletion", "non_fast_forward"],
+    "preservedBranchRuleset": 18967348,
+    "actionsGloballyDisabled": false,
+    "historicalRunsDeleted": false,
+    "sealedFixturesModified": false,
+    "note": "GitHub still lists its historical dynamic CodeQL registration as active. Its default-setup configuration is disabled, and the generic disable endpoint refuses dynamic CodeQL with HTTP 422. No code-scanning YAML remains. Dependency Graph stays active; secret scanning and existing alert data are untouched"
+  },
+  "runs": [
+    {
+      "id": 35053527342,
+      "headSha": "30f97d0f53c1973a9e55a3bcef9469bd5ade8037",
+      "status": "completed", "conclusion": "failure",
+      "url": "https://github.com/GTAStudio/GTA-Claw/actions/runs/35053527342",
+      "jobs": { "rust-advisories": "failure", "rust-dependency-policy": "failure", "npm-advisories": "success" },
+      "reason": "The real audit detected RUSTSEC-2026-0257 in webbrowser 1.2.1 in desktop/android/ios locks. Root/npm had no reported vulnerability. Dependency policy also reported existing MIT-0 licensing, duplicate versions and an unversioned local TUI dependency"
+    },
+    {
+      "id": 35055380122,
+      "headSha": "8c3abffc3299db1fa5add5c7d705fe39b1236a6d",
+      "status": "completed", "conclusion": "failure",
+      "url": "https://github.com/GTAStudio/GTA-Claw/actions/runs/35055380122",
+      "jobs": { "rust-advisories": "success", "rust-dependency-policy": "failure", "npm-advisories": "success" },
+      "reason": "All four Rust lockfile vulnerability audits and npm audit passed after the patch. Existing dependency-policy debt remains failing; no policy exceptions, warning downgrades or ignored vulnerabilities were added"
+    }
+  ],
+  "localChecks": [
+    { "path": "target/dependency-webbrowser-desktop-final-audit-20260916.json", "sha256": "99d7179a77605ff2ab495797814531be1ecb9a247850bbd44121de7f624e1b64", "vulnerabilities": 0 },
+    { "path": "target/dependency-webbrowser-android-final-audit-20260916.json", "sha256": "152c6b113b75b2bbab5d51b98077aa77060818afa56408d764f3669d4eefa3da", "vulnerabilities": 0 },
+    { "path": "target/dependency-webbrowser-ios-final-audit-20260916.json", "sha256": "e2ed6a0acdd9e2194fb5517599b823640bb86c82eea3285e70624f1d2e756637", "vulnerabilities": 0 },
+    { "path": "target/dependency-webbrowser-published-desktop-audit-20260916.json", "sha256": "351e8a6ba3638504e0b1a65f325861b652d91e55e6232a6bd7894424b59687ab", "vulnerabilities": 0, "note": "Audits the actual committed-baseline desktop lock candidate, excluding unrelated uncommitted configuration dependencies" },
+    { "path": "target/dependency-webbrowser-desktop-tests-20260916.log", "sha256": "245eb6930505089142aef85b9853ec51f3f3a8cdd869d62c8cee3c491ddec858", "passed": 97, "failed": 0, "ignored": 0, "note": "Local Windows desktop workspace with its existing uncommitted application changes; not a pristine published-product qualification" }
+  ],
+  "receipts": [
+    { "path": "target/dependency-only-ci-before-20260916.json", "sha256": "3cee9c79ae2997096c6317e1d5f85340b1a0435e0041fb73102561b9b993094e" },
+    { "path": "target/dependency-only-ci-after-20260916.json", "sha256": "378f279666e05d16dc75502dd70b3f3acd4fd713a7f6a81f6e9f8ab934b18a16" },
+    { "path": "target/dependency-only-ci-audit-35053527342.log", "sha256": "907983a0babec5288d8357839cd52403b7bf5ec3a92948c864668ae954f42cf0" },
+    { "path": "target/dependency-only-ci-policy-35053527342.log", "sha256": "de08a2c867ff5631eee3b75ea9f2f6c4726c8a3e84fdb2316c71dca61e35c738" }
+  ],
+  "notes": [
+    "Only ten top-level live workflow files were deleted. Historical nested .github/workflows copies inside trusted policy fixtures, validators, manual test/package scripts, release artifacts and Git history were preserved",
+    "The CI commit contains exactly eleven workflow paths. The subsequent security commit contains only webbrowser package records in three client lockfiles, including its required macOS dependency edge change. Slint stays 1.17.1",
+    "Cargo update also reselected unrelated windows-sys edges and simd_cesu8. Those changes were removed after confirming the original versions/edges still satisfy locked dependency resolution; no unrelated dependency upgrade was published",
+    "The desktop worktree already contained configuration-service dependencies. Its committed baseline was separately extracted, patched, audited and staged as one blob without overwriting the working file. Android/iOS patches were staged normally. No application source, root lock or ongoing product documentation was included in either publication",
+    "Locked target-tree checks passed for desktop and iOS; Android's selected target did not reach webbrowser, but the complete Android lock remained subject to the real vulnerability audit. No Android/iOS executable or device test was claimed",
+    "The first ruleset update rejected malformed piped JSON before mutation; retried once with explicit UTF-8 JSON. The exact old single required-workflow rule was removed, while unrelated repository branch protections remain active",
+    "GitHub and dependency downloads used the existing 127.0.0.1:2080 proxy. No proxy node, service, production process, cloud model account or deployed application was changed"
+  ],
+  "unverified": [
+    "Resolution of existing license/duplicate/wildcard dependency-policy debt",
+    "Unmaintained upstream transitive dependencies and cross-platform runtime qualification",
+    "Whole-project release acceptance and original native credential intermittency"
+  ]
+}

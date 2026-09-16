@@ -29,6 +29,8 @@ pub(super) struct NativeCommand {
     preview_fingerprint: Option<String>,
     memory: Option<Box<MemoryRequest>>,
     partial_export: Option<std::path::PathBuf>,
+    accounting_export: Option<std::path::PathBuf>,
+    model_export: Option<std::path::PathBuf>,
 }
 
 struct MemoryRequest {
@@ -148,209 +150,207 @@ fn check_partial_page(
     Ok(reply)
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AccountingRunReply {
-    run_id: String,
-    session_id: String,
-    revision: u64,
-    turn: Option<u64>,
-    status: String,
-    accounting: AccountingPageReply,
-    durable: bool,
-    acknowledged: bool,
-    automatic_replay: bool,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AccountingPageReply {
-    available: bool,
-    offset: Option<usize>,
-    end_offset: Option<usize>,
-    next_offset: Option<usize>,
-    total_rounds: Option<usize>,
-    sha256: Option<String>,
-    summary: Option<Value>,
-    rounds: Option<Vec<AccountingRoundReply>>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AccountingRoundReply {
-    round: usize,
-    response: Option<AccountingResponseReply>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AccountingResponseReply {
-    provider: String,
-    model: String,
-    response_id: Option<String>,
-    usage_reporting: String,
-    finish_reason: String,
-    observed_tokens: claw_protocol::native_accounting::ObservedTokens,
-}
-
 fn check_accounting_page(encoded: &str, parameters: &Value) -> Result<(), DiagnosticFailure> {
-    use claw_protocol::native_accounting::ProviderAccounting;
-    let invalid = || {
-        DiagnosticFailure::protocol(
-            "invalid_accounting_page",
-            "Gateway accounting page changed identity, counters, provenance or snapshot",
-        )
-    };
-    if encoded.len() > 64 * 1024 {
-        return Err(invalid());
-    }
-    let reply: AccountingRunReply = serde_json::from_str(encoded).map_err(|_| invalid())?;
-    if parameters["runId"].as_str() != Some(&reply.run_id)
-        || parameters["accountingPage"]["revision"].as_u64() != Some(reply.revision)
-        || reply.revision == 0
-        || reply.session_id.is_empty()
-        || reply.session_id.len() > 128
-        || reply.session_id.chars().any(char::is_control)
-        || !reply.durable
-        || reply.acknowledged
-        || reply.automatic_replay
-        || !matches!(
-            reply.status.as_str(),
-            "completed" | "completed_with_changes" | "cancelled" | "failed" | "outcome_unknown"
-        )
-    {
-        return Err(invalid());
-    }
-    let page = reply.accounting;
-    if !page.available {
-        if parameters["accountingPage"]["offset"].as_u64() != Some(0)
-            || parameters["accountingPage"].get("sha256").is_some()
-            || page.offset.is_some()
-            || page.end_offset.is_some()
-            || page.next_offset.is_some()
-            || page.total_rounds.is_some()
-            || page.sha256.is_some()
-            || page.summary.is_some()
-            || page.rounds.is_some()
-        {
-            return Err(invalid());
+    claw_protocol::native_accounting::validate_page(encoded, parameters)
+        .map_err(|_| invalid_accounting_page())
+}
+
+const fn invalid_accounting_page() -> DiagnosticFailure {
+    DiagnosticFailure::protocol(
+        "invalid_accounting_page",
+        "Gateway accounting page changed identity, counters, provenance or snapshot",
+    )
+}
+
+#[derive(Default)]
+struct ModelExportPages {
+    first: Option<Value>,
+    models: Vec<Value>,
+    complete: bool,
+    pages: usize,
+}
+
+impl ModelExportPages {
+    fn parameters(&self) -> Value {
+        let mut parameters = json!({"nativeCatalogPage":{"offset":self.models.len()}});
+        if let Some(first) = &self.first {
+            parameters["nativeCatalogPage"]["sha256"] = first["sha256"].clone();
         }
-        return Ok(());
+        parameters
     }
-    let offset = page.offset.ok_or_else(invalid)?;
-    let end = page.end_offset.ok_or_else(invalid)?;
-    let total = page.total_rounds.ok_or_else(invalid)?;
-    let rounds = page.rounds.ok_or_else(invalid)?;
-    let digest = page.sha256.ok_or_else(invalid)?;
-    let summary = ProviderAccounting::parse(&page.summary.ok_or_else(invalid)?)
-        .map_err(|_| invalid())?
-        .ok_or_else(invalid)?;
-    if reply.turn.is_none()
-        || parameters["accountingPage"]["offset"].as_u64() != u64::try_from(offset).ok()
-        || rounds.len() > 16
-        || offset.checked_add(rounds.len()) != Some(end)
-        || end > total
-        || total != usize::from(summary.recorded_rounds)
-        || (offset > 0
-            && (rounds.is_empty() || parameters["accountingPage"]["sha256"].as_str().is_none()))
-        || page.next_offset.map_or(end != total, |next| {
-            next != end || next >= total || rounds.is_empty()
-        })
-        || digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || parameters["accountingPage"]["sha256"]
-            .as_str()
-            .is_some_and(|expected| expected != digest)
-    {
-        return Err(invalid());
-    }
-    let mut counts = [0_u16; 3];
-    let mut totals = [0_u128; 4];
-    for (index, round) in rounds.iter().enumerate() {
-        if round.round != offset + index {
-            return Err(invalid());
-        }
-        let Some(response) = &round.response else {
-            counts[2] += 1;
-            continue;
-        };
-        let identity_valid = |value: &str| {
-            !value.is_empty()
-                && value.len() <= 512
-                && !value
-                    .chars()
-                    .any(|character| character.is_control() || character.is_whitespace())
-        };
-        if !identity_valid(&response.provider)
-            || !identity_valid(&response.model)
-            || response
-                .response_id
-                .as_deref()
-                .is_some_and(|identity| !identity_valid(identity))
-            || !matches!(
-                response.finish_reason.as_str(),
-                "stop" | "tool_calls" | "length" | "content_filter"
+
+    fn push(&mut self, encoded: &str) -> Result<bool, DiagnosticFailure> {
+        let invalid = || {
+            DiagnosticFailure::protocol(
+                "invalid_model_export",
+                "Model export changed identity or exceeded its bounded snapshot",
             )
-        {
+        };
+        if self.complete || self.pages >= 1024 {
             return Err(invalid());
         }
-        let tokens = &response.observed_tokens;
-        if tokens.input_tokens.checked_add(tokens.output_tokens) != Some(tokens.total_tokens)
-            || tokens.cached_input_tokens > tokens.input_tokens
-            || tokens.reasoning_tokens > tokens.output_tokens
-        {
-            return Err(invalid());
+        claw_protocol::native_models::validate_page(
+            encoded,
+            self.models.len(),
+            self.first
+                .as_ref()
+                .and_then(|first| first["sha256"].as_str()),
+        )
+        .map_err(|_| invalid())?;
+        let page: Value = serde_json::from_str(encoded).map_err(|_| invalid())?;
+        if page["available"] != true {
+            return Err(DiagnosticFailure::protocol(
+                "model_catalogue_unavailable",
+                "The provider has no available cached model catalogue",
+            ));
         }
-        match response.usage_reporting.as_str() {
-            "complete" => counts[0] += 1,
-            "partial" => counts[1] += 1,
-            "unreported" if tokens.total_tokens == 0 => counts[2] += 1,
-            _ => return Err(invalid()),
-        }
-        for (accumulated, count) in totals.iter_mut().zip([
-            tokens.input_tokens,
-            tokens.output_tokens,
-            tokens.cached_input_tokens,
-            tokens.reasoning_tokens,
-        ]) {
-            *accumulated += u128::from(count);
-        }
-    }
-    let complete_page = offset == 0 && end == total;
-    for (count, expected) in counts.into_iter().zip([
-        summary.complete_counter_rounds,
-        summary.partial_counter_rounds,
-        summary.unreported_rounds,
-    ]) {
-        if count > expected || (complete_page && count != expected) {
-            return Err(invalid());
-        }
-    }
-    if let Some(observed) = summary.observed_tokens {
-        for (count, expected) in totals.into_iter().zip([
-            observed.input_tokens,
-            observed.output_tokens,
-            observed.cached_input_tokens,
-            observed.reasoning_tokens,
-        ]) {
-            if count > u128::from(expected) || (complete_page && count != u128::from(expected)) {
+        if let Some(first) = &self.first {
+            if [
+                "totalModels",
+                "sha256",
+                "provider",
+                "providerGeneration",
+                "selectedModel",
+                "selectionPinned",
+                "observedAtMs",
+                "source",
+                "liveCapabilitiesVerified",
+            ]
+            .iter()
+            .any(|field| first[field] != page[field])
+            {
                 return Err(invalid());
             }
+        } else {
+            self.first = Some(page.clone());
         }
-    } else if complete_page && total > 0 && totals[0] + totals[1] <= u128::from(u64::MAX) {
-        return Err(invalid());
+        self.models.extend(
+            page["models"]
+                .as_array()
+                .ok_or_else(invalid)?
+                .iter()
+                .cloned(),
+        );
+        self.pages += 1;
+        self.complete = page["nextOffset"].is_null();
+        Ok(self.complete)
     }
-    if complete_page {
-        let raw: Value = serde_json::from_str(encoded).map_err(|_| invalid())?;
-        let snapshot =
-            json!({"summary":raw["accounting"]["summary"],"rounds":raw["accounting"]["rounds"]});
-        if memory_sha256(&serde_json::to_vec(&snapshot).map_err(|_| invalid())?) != digest {
+
+    fn finish(self) -> Result<Value, DiagnosticFailure> {
+        let invalid = || {
+            DiagnosticFailure::protocol(
+                "invalid_model_export",
+                "Model export is incomplete or its full catalogue digest is invalid",
+            )
+        };
+        if !self.complete {
             return Err(invalid());
         }
+        let mut snapshot = self.first.ok_or_else(invalid)?;
+        snapshot["endOffset"] = json!(self.models.len());
+        snapshot["nextOffset"] = Value::Null;
+        snapshot["models"] = json!(self.models);
+        claw_protocol::native_models::validate_snapshot(
+            &snapshot.to_string(),
+            snapshot["sha256"].as_str().ok_or_else(invalid)?,
+        )
+        .map_err(|_| invalid())?;
+        Ok(snapshot)
     }
-    Ok(())
+}
+
+struct AccountingExportPages {
+    run_id: String,
+    revision: u64,
+    first: Option<Value>,
+    rounds: Vec<Value>,
+    complete: bool,
+    pages: usize,
+}
+
+impl AccountingExportPages {
+    const fn new(run_id: String, revision: u64) -> Self {
+        Self {
+            run_id,
+            revision,
+            first: None,
+            rounds: Vec::new(),
+            complete: false,
+            pages: 0,
+        }
+    }
+
+    fn parameters(&self) -> Value {
+        let mut parameters = json!({"runId":self.run_id,"accountingPage":{"revision":self.revision,"offset":self.rounds.len()}});
+        if let Some(first) = &self.first {
+            parameters["accountingPage"]["sha256"] = first["accounting"]["sha256"].clone();
+        }
+        parameters
+    }
+
+    fn push(&mut self, encoded: &str) -> Result<bool, DiagnosticFailure> {
+        let invalid = || {
+            DiagnosticFailure::protocol(
+                "invalid_accounting_export",
+                "Accounting export changed identity or continued beyond its bounded snapshot",
+            )
+        };
+        if self.complete || self.pages >= 1024 {
+            return Err(invalid());
+        }
+        check_accounting_page(encoded, &self.parameters())?;
+        let page: Value = serde_json::from_str(encoded).map_err(|_| invalid())?;
+        if page["accounting"]["available"] != true {
+            return Err(DiagnosticFailure::protocol(
+                "accounting_unavailable",
+                "The owned run has no retained provider accounting snapshot",
+            ));
+        }
+        if let Some(first) = &self.first {
+            if ["sessionId", "turn", "status"]
+                .iter()
+                .any(|field| first[field] != page[field])
+                || ["totalRounds", "sha256", "summary"]
+                    .iter()
+                    .any(|field| first["accounting"][field] != page["accounting"][field])
+            {
+                return Err(invalid());
+            }
+        } else {
+            self.first = Some(page.clone());
+        }
+        self.rounds.extend(
+            page["accounting"]["rounds"]
+                .as_array()
+                .expect("validated rounds")
+                .iter()
+                .cloned(),
+        );
+        self.pages += 1;
+        self.complete = page["accounting"]["nextOffset"].is_null();
+        Ok(self.complete)
+    }
+
+    fn finish(self) -> Result<Value, DiagnosticFailure> {
+        if !self.complete {
+            return Err(DiagnosticFailure::protocol(
+                "invalid_accounting_export",
+                "Accounting export is incomplete",
+            ));
+        }
+        let mut reply = self.first.expect("completed snapshot");
+        reply["accounting"]["offset"] = json!(0);
+        reply["accounting"]["endOffset"] = json!(self.rounds.len());
+        reply["accounting"]["nextOffset"] = Value::Null;
+        reply["accounting"]["rounds"] = json!(self.rounds);
+        claw_protocol::native_accounting::validate_snapshot(
+            &reply.to_string(),
+            &self.run_id,
+            self.revision,
+        )
+        .map_err(|_| invalid_accounting_page())?;
+        Ok(reply)
+    }
 }
 
 #[derive(Eq, PartialEq)]
@@ -581,6 +581,303 @@ mod explicit_tool_tests {
     use super::*;
 
     #[test]
+    fn model_export_command_requires_a_new_destination_and_a_complete_read() {
+        let target = std::env::temp_dir().join("gta-claw-models.json");
+        let base: Vec<OsString> = ["export-models", "--ephemeral-device", "--destination"]
+            .into_iter()
+            .map(OsString::from)
+            .chain([target.as_os_str().to_owned()])
+            .chain(
+                ["--endpoint", "ws://127.0.0.1:18789/"]
+                    .into_iter()
+                    .map(OsString::from),
+            )
+            .collect();
+        let parsed = parse(&base, 0).ok().expect("model export");
+        assert_eq!(parsed.model_export.as_deref(), Some(target.as_path()));
+        assert_eq!(parsed.method, "models.list");
+        assert_eq!(parsed.scope, Scope::OperatorRead);
+        assert_eq!(parsed.params, json!({"nativeCatalogPage":{"offset":0}}));
+        let mut missing = base.clone();
+        missing.drain(2..4);
+        assert!(parse(&missing, 0).is_err());
+        let mut relative = base.clone();
+        relative[3] = "relative.json".into();
+        assert!(parse(&relative, 0).is_err());
+        for extra in [
+            vec!["--destination", "another.json"],
+            vec!["--offset", "8"],
+            vec!["--sha256", &"a".repeat(64)],
+            vec!["--wait-ms", "0"],
+            vec!["--idempotency-key", "no-inference"],
+            vec!["--overwrite"],
+        ] {
+            let mut invalid = base.clone();
+            invalid.extend(extra.into_iter().map(OsString::from));
+            assert!(parse(&invalid, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn model_export_verifies_all_pages_without_inventing_a_directory_or_alias_target() {
+        for scenario in [
+            "valid",
+            "tampered",
+            "identity",
+            "cross-page-id",
+            "cross-page-alias",
+            "incomplete",
+            "missing",
+        ] {
+            let mut snapshot = json!({"provider":"fixture","providerGeneration":1,"selectedModel":"exact-0","selectionPinned":true,
+                "observedAtMs":123,"source":"provider_sdk_catalogue","liveCapabilitiesVerified":false,
+                "models":(0..17).map(|ordinal| json!({"id":format!("exact-{ordinal}"),"displayName":null,"contextWindow":null,"maxOutputTokens":null,"advertisedCapabilities":[]})).collect::<Vec<_>>()});
+            snapshot["models"][0]["aliases"] = json!(["work"]);
+            if scenario == "cross-page-id" {
+                snapshot["models"][16]["id"] = json!("exact-1");
+            } else if scenario == "cross-page-alias" {
+                snapshot["models"][16]["aliases"] = json!(["work"]);
+            }
+            let digest = memory_sha256(&serde_json::to_vec(&snapshot).expect("snapshot"));
+            let mut collector = ModelExportPages::default();
+            assert_eq!(
+                collector.parameters(),
+                json!({"nativeCatalogPage":{"offset":0}})
+            );
+            for offset in [0, 8, 16] {
+                let end = (offset + 8).min(17);
+                let mut page = snapshot.clone();
+                page["schemaVersion"] = json!(1);
+                page["available"] = json!(true);
+                page["selectionChanged"] = json!(false);
+                page["networkContacted"] = json!(false);
+                page["sha256"] = json!(digest);
+                page["offset"] = json!(offset);
+                page["endOffset"] = json!(end);
+                page["nextOffset"] = json!((end < 17).then_some(end));
+                page["totalModels"] = json!(17);
+                page["models"] =
+                    json!(&snapshot["models"].as_array().expect("models")[offset..end]);
+                if offset == 0 && scenario == "missing" {
+                    page = json!({"schemaVersion":1,"available":false,"selectionChanged":false,"networkContacted":false});
+                    assert!(collector.push(&page.to_string()).is_err());
+                    break;
+                }
+                if offset > 0 {
+                    assert_eq!(
+                        collector.parameters(),
+                        json!({"nativeCatalogPage":{"offset":offset,"sha256":digest}})
+                    );
+                }
+                if offset == 16 {
+                    if scenario == "incomplete" {
+                        break;
+                    }
+                    if scenario == "identity" {
+                        page["providerGeneration"] = json!(2);
+                        assert!(collector.push(&page.to_string()).is_err());
+                        break;
+                    }
+                    if scenario == "tampered" {
+                        page["models"][0]["displayName"] = json!("changed-after-first-page");
+                    }
+                }
+                assert_eq!(collector.push(&page.to_string()).ok(), Some(end == 17));
+                if end == 17 {
+                    assert!(collector.push(&page.to_string()).is_err());
+                }
+            }
+            let result = collector.finish();
+            assert_eq!(result.is_ok(), scenario == "valid", "{scenario}");
+            if let Ok(complete) = result {
+                assert_eq!(complete["models"], snapshot["models"]);
+                assert_eq!(complete["sha256"], digest);
+                assert_eq!(complete["nextOffset"], Value::Null);
+            }
+        }
+    }
+
+    #[test]
+    fn model_catalogue_commands_separate_read_and_explicit_snapshot_refresh() {
+        let base: Vec<OsString> = [
+            "models",
+            "--endpoint",
+            "ws://127.0.0.1:18789",
+            "--ephemeral-device",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let read = parse(&base, 0).ok().expect("catalogue read");
+        assert_eq!(read.scope, Scope::OperatorRead);
+        assert_eq!(read.params, json!({"nativeCatalogPage":{"offset":0}}));
+        let mut status = base.clone();
+        status.push("--availability".into());
+        let parsed = parse(&status, 0)
+            .ok()
+            .expect("explicit availability request");
+        assert_eq!(parsed.scope, Scope::OperatorRead);
+        assert_eq!(
+            parsed.params,
+            json!({"nativeCatalogPage":{"offset":0,"includeAvailability":true}})
+        );
+        status.push("--availability".into());
+        assert!(parse(&status, 0).is_err());
+        let mut continued = base.clone();
+        continued.extend(["--offset", "8"].into_iter().map(OsString::from));
+        assert!(
+            parse(&continued, 0).is_err(),
+            "continuation requires original digest"
+        );
+        continued.extend(
+            ["--sha256", &"a".repeat(64)]
+                .into_iter()
+                .map(OsString::from),
+        );
+        assert!(parse(&continued, 0).is_ok());
+        let mut refresh = base;
+        refresh[0] = "refresh-models".into();
+        assert!(parse(&refresh, 0).is_err());
+        refresh.extend(
+            ["--sha256", &"a".repeat(64)]
+                .into_iter()
+                .map(OsString::from),
+        );
+        let parsed = parse(&refresh, 0).ok().expect("explicit refresh");
+        assert_eq!(parsed.scope, Scope::OperatorWrite);
+        assert_eq!(
+            parsed.params,
+            json!({"nativeCatalogRefresh":{"sha256":"a".repeat(64)}})
+        );
+        for extra in [
+            vec!["--offset", "0"],
+            vec!["--sha256", &"b".repeat(64)],
+            vec!["--wait-ms", "0"],
+            vec!["--idempotency-key", "no-inference"],
+        ] {
+            let mut invalid = refresh.clone();
+            invalid.extend(extra.into_iter().map(OsString::from));
+            assert!(parse(&invalid, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn accounting_export_command_requires_a_new_local_target_and_a_complete_read() {
+        let target = std::env::temp_dir().join("gta-claw-accounting.json");
+        let base: Vec<OsString> = [
+            "export-accounting",
+            &"a".repeat(64),
+            "4",
+            "--device-profile",
+            "work",
+            "--destination",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .chain([target.as_os_str().to_owned()])
+        .chain(
+            ["--endpoint", "ws://127.0.0.1:18789/"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .collect();
+        let parsed = parse(&base, 0).unwrap_or_else(|_| panic!("valid export"));
+        assert_eq!(parsed.accounting_export.as_deref(), Some(target.as_path()));
+        assert_eq!(parsed.scope, Scope::OperatorRead);
+        assert_eq!(parsed.method, "agent.wait");
+        assert_eq!(
+            parsed.params,
+            json!({"runId":"a".repeat(64),"accountingPage":{"revision":4,"offset":0}})
+        );
+        assert!(parsed.partial_export.is_none() && parsed.memory.is_none());
+        let mut missing = base.clone();
+        missing.drain(5..7);
+        assert!(parse(&missing, 0).is_err());
+        let mut relative = base.clone();
+        relative[6] = "relative.json".into();
+        assert!(parse(&relative, 0).is_err());
+        for extra in [
+            vec!["--destination", "duplicate.json"],
+            vec!["--offset", "16"],
+            vec!["--sha256", &"b".repeat(64)],
+            vec!["--wait-ms", "10"],
+            vec!["--idempotency-key", "no-replay"],
+            vec!["--overwrite"],
+        ] {
+            let mut arguments = base.clone();
+            arguments.extend(extra.into_iter().map(OsString::from));
+            assert!(parse(&arguments, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn accounting_export_verifies_the_entire_snapshot_not_only_individual_pages() {
+        for scenario in [
+            "valid",
+            "corrupt",
+            "inflated-total",
+            "identity",
+            "summary",
+            "incomplete",
+        ] {
+            let tokens = json!({"inputTokens":1,"outputTokens":0,"totalTokens":1,"cachedInputTokens":0,"reasoningTokens":0});
+            let mut snapshot = json!({
+                "summary":{"available":true,"recordedRounds":17,"completeCounterRounds":17,
+                    "partialCounterRounds":0,"unreportedRounds":0,"allPrimaryCountersReported":true,
+                    "observedTokens":{"inputTokens":17,"outputTokens":0,"totalTokens":17,"cachedInputTokens":0,"reasoningTokens":0},
+                    "aggregationOverflow":false,"costCalculated":false,"billingReconciled":false,
+                    "recordSource":"terminal_turn","attemptsMayBeUnsent":true},
+                "rounds":(0..17).map(|round| json!({"round":round,"response":{"provider":"fixture","model":"fixture-model",
+                    "responseId":format!("response-{round}"),"usageReporting":"complete","finishReason":"stop","observedTokens":tokens}})).collect::<Vec<_>>()
+            });
+            if scenario == "inflated-total" {
+                snapshot["summary"]["observedTokens"]["inputTokens"] = json!(18);
+                snapshot["summary"]["observedTokens"]["totalTokens"] = json!(18);
+            }
+            let digest = memory_sha256(&serde_json::to_vec(&snapshot).expect("snapshot"));
+            let mut first = json!({"runId":"a".repeat(64),"sessionId":"owned","revision":4,"turn":0,"status":"outcome_unknown",
+                "durable":true,"acknowledged":false,"automaticReplay":false,
+                "accounting":{"available":true,"offset":0,"endOffset":16,"nextOffset":16,"totalRounds":17,"sha256":digest,
+                    "summary":snapshot["summary"],"rounds":&snapshot["rounds"].as_array().expect("rounds")[..16]}});
+            let mut collector = AccountingExportPages::new("a".repeat(64), 4);
+            assert!(matches!(collector.push(&first.to_string()), Ok(false)));
+            assert_eq!(collector.parameters()["accountingPage"]["offset"], 16);
+            assert_eq!(collector.parameters()["accountingPage"]["sha256"], digest);
+            if scenario == "incomplete" {
+                assert!(collector.finish().is_err());
+                continue;
+            }
+            first["accounting"]["offset"] = json!(16);
+            first["accounting"]["endOffset"] = json!(17);
+            first["accounting"]["nextOffset"] = Value::Null;
+            first["accounting"]["rounds"] = json!([snapshot["rounds"][16]]);
+            if scenario == "corrupt" {
+                first["accounting"]["rounds"][0]["response"]["model"] = json!("different-model");
+            } else if scenario == "identity" {
+                first["sessionId"] = json!("another-session");
+            } else if scenario == "summary" {
+                first["accounting"]["summary"]["attemptsMayBeUnsent"] = json!(false);
+            }
+            assert!(check_accounting_page(&first.to_string(), &collector.parameters()).is_ok());
+            if matches!(scenario, "identity" | "summary") {
+                assert!(collector.push(&first.to_string()).is_err(), "{scenario}");
+                continue;
+            }
+            assert!(matches!(collector.push(&first.to_string()), Ok(true)));
+            assert!(
+                collector.push(&first.to_string()).is_err(),
+                "no pages after completion"
+            );
+            let result = collector.finish();
+            assert_eq!(result.is_ok(), scenario == "valid", "{scenario}");
+            if let Ok(result) = result {
+                assert_eq!(result["accounting"]["rounds"], snapshot["rounds"]);
+                assert_eq!(result["accounting"]["summary"], snapshot["summary"]);
+            }
+        }
+    }
+
+    #[test]
     fn accounting_run_command_is_bounded_read_only_and_pins_continuations() {
         let base: Vec<OsString> = [
             "accounting-run",
@@ -638,11 +935,10 @@ mod explicit_tool_tests {
     }
 
     fn stamp_accounting_fixture(page: &mut Value) {
+        let snapshot =
+            json!({"summary":page["accounting"]["summary"],"rounds":page["accounting"]["rounds"]});
         page["accounting"]["sha256"] = json!(memory_sha256(
-            &serde_json::to_vec(&json!({
-                "summary":page["accounting"]["summary"],"rounds":page["accounting"]["rounds"],
-            }))
-            .expect("snapshot JSON")
+            &serde_json::to_vec(&snapshot).expect("snapshot JSON")
         ));
     }
 
@@ -1179,6 +1475,16 @@ pub(super) fn parse(
         "device" => ("device.profile", Scope::OperatorRead, json!({})),
         "forget-device" => ("device.forget", Scope::OperatorRead, json!({})),
         "sessions" => ("sessions.list", Scope::OperatorRead, json!({})),
+        "models" | "export-models" => (
+            "models.list",
+            Scope::OperatorRead,
+            json!({"nativeCatalogPage":{"offset":0}}),
+        ),
+        "refresh-models" => (
+            "models.list",
+            Scope::OperatorWrite,
+            json!({"nativeCatalogRefresh":{}}),
+        ),
         "describe" | "history" | "abort" | "send" | "results" => {
             let session = positional()?;
             if session.is_empty() || session.len() > 128 || session.chars().any(char::is_control) {
@@ -1205,7 +1511,8 @@ pub(super) fn parse(
             }
             (method, scope, params)
         }
-        "run" | "ack-run" | "partial-run" | "export-partial" | "accounting-run" => {
+        "run" | "ack-run" | "partial-run" | "export-partial" | "accounting-run"
+        | "export-accounting" => {
             let id = positional()?;
             if id.len() != 64
                 || !id
@@ -1217,14 +1524,18 @@ pub(super) fn parse(
             let mut params = json!({"runId": id});
             if matches!(
                 command,
-                "ack-run" | "partial-run" | "export-partial" | "accounting-run"
+                "ack-run"
+                    | "partial-run"
+                    | "export-partial"
+                    | "accounting-run"
+                    | "export-accounting"
             ) {
                 let revision = positional()?
                     .parse::<u64>()
                     .ok()
                     .filter(|revision| *revision > 0)
                     .ok_or_else(invalid)?;
-                if command == "accounting-run" {
+                if matches!(command, "accounting-run" | "export-accounting") {
                     params["accountingPage"] = json!({"revision":revision,"offset":0});
                 } else if matches!(command, "partial-run" | "export-partial") {
                     params["partialPage"] = json!({"revision":revision,"offset":0});
@@ -1274,21 +1585,44 @@ pub(super) fn parse(
     let mut run_seen = false;
     let mut preview_fingerprint = None;
     let mut partial_export = None;
+    let mut accounting_export = None;
+    let mut model_export = None;
     while index < arguments.len() {
-        if arguments[index] == "--destination" {
-            if command != "export-partial" || partial_export.is_some() {
+        if arguments[index] == "--availability" {
+            if command != "models"
+                || params["nativeCatalogPage"]
+                    .get("includeAvailability")
+                    .is_some()
+            {
+                return Err(invalid());
+            }
+            params["nativeCatalogPage"]["includeAvailability"] = json!(true);
+        } else if arguments[index] == "--destination" {
+            if !matches!(
+                command,
+                "export-partial" | "export-accounting" | "export-models"
+            ) || partial_export.is_some()
+                || accounting_export.is_some()
+                || model_export.is_some()
+            {
                 return Err(invalid());
             }
             index += 1;
             let destination = std::path::PathBuf::from(option_value(
                 arguments,
                 index,
-                "missing partial export destination",
+                "missing run export destination",
             )?);
             if !super::state_snapshot::local_absolute(&destination) {
                 return Err(invalid());
             }
-            partial_export = Some(destination);
+            if command == "export-models" {
+                model_export = Some(destination);
+            } else if command == "export-accounting" {
+                accounting_export = Some(destination);
+            } else {
+                partial_export = Some(destination);
+            }
         } else if arguments[index] == "--idempotency-key" {
             if method != "chat.send" || idempotency.is_some() {
                 return Err(invalid());
@@ -1348,7 +1682,9 @@ pub(super) fn parse(
                 .ok_or_else(invalid)?;
             params["limit"] = json!(limit);
         } else if arguments[index] == "--offset" {
-            if !matches!(command, "partial-run" | "accounting-run") || partial_offset_seen {
+            if !matches!(command, "partial-run" | "accounting-run" | "models")
+                || partial_offset_seen
+            {
                 return Err(invalid());
             }
             index += 1;
@@ -1359,27 +1695,30 @@ pub(super) fn parse(
                 .ok()
                 .filter(|offset| {
                     *offset
-                        <= if command == "accounting-run" {
+                        <= if matches!(command, "accounting-run" | "models") {
                             1024
                         } else {
                             4 * 1024 * 1024
                         }
                 })
                 .ok_or_else(invalid)?;
-            params[if command == "accounting-run" {
-                "accountingPage"
-            } else {
-                "partialPage"
+            params[match command {
+                "accounting-run" => "accountingPage",
+                "models" => "nativeCatalogPage",
+                _ => "partialPage",
             }]["offset"] = json!(offset);
             partial_offset_seen = true;
         } else if arguments[index] == "--sha256" {
-            let page = if command == "accounting-run" {
-                "accountingPage"
-            } else {
-                "partialPage"
+            let page = match command {
+                "accounting-run" => "accountingPage",
+                "models" => "nativeCatalogPage",
+                "refresh-models" => "nativeCatalogRefresh",
+                _ => "partialPage",
             };
-            if !matches!(command, "partial-run" | "accounting-run")
-                || params[page].get("sha256").is_some()
+            if !matches!(
+                command,
+                "partial-run" | "accounting-run" | "models" | "refresh-models"
+            ) || params[page].get("sha256").is_some()
             {
                 return Err(invalid());
             }
@@ -1436,12 +1775,20 @@ pub(super) fn parse(
             parse_failure("send requires an explicit --idempotency-key", arguments)
         })?);
     }
-    let page = if command == "accounting-run" {
-        "accountingPage"
-    } else {
-        "partialPage"
+    let page = match command {
+        "accounting-run" => "accountingPage",
+        "models" => "nativeCatalogPage",
+        _ => "partialPage",
     };
-    if matches!(command, "partial-run" | "accounting-run")
+    if params["nativeCatalogPage"]
+        .get("includeAvailability")
+        .is_some()
+        && (params["nativeCatalogPage"]["offset"] != 0
+            || params["nativeCatalogPage"].get("sha256").is_some())
+    {
+        return Err(invalid());
+    }
+    if matches!(command, "partial-run" | "accounting-run" | "models")
         && params[page]["offset"]
             .as_u64()
             .is_some_and(|offset| offset > 0)
@@ -1461,6 +1808,24 @@ pub(super) fn parse(
             arguments,
         ));
     }
+    if command == "refresh-models" && params["nativeCatalogRefresh"]["sha256"].as_str().is_none() {
+        return Err(parse_failure(
+            "refresh-models requires --sha256 from an observed native catalogue",
+            arguments,
+        ));
+    }
+    if command == "export-accounting" && accounting_export.is_none() {
+        return Err(parse_failure(
+            "export-accounting requires an explicit new local --destination",
+            arguments,
+        ));
+    }
+    if command == "export-models" && model_export.is_none() {
+        return Err(parse_failure(
+            "export-models requires an explicit new local --destination",
+            arguments,
+        ));
+    }
     let options = parse_gateway_options(&options, 0, true)?;
     if matches!(command, "device" | "forget-device") && options.device_profile.is_none() {
         return Err(parse_failure(
@@ -1476,6 +1841,8 @@ pub(super) fn parse(
         preview_fingerprint,
         memory: None,
         partial_export,
+        accounting_export,
+        model_export,
     })
 }
 
@@ -1717,6 +2084,8 @@ fn parse_memory(arguments: &[OsString], start: usize) -> Result<NativeCommand, P
             import_file,
         })),
         partial_export: None,
+        accounting_export: None,
+        model_export: None,
     })
 }
 
@@ -2079,6 +2448,132 @@ async fn collect_memory_archive(
     Ok((collector.finish().map_err(invalid)?, page_count))
 }
 
+async fn collect_model_export(
+    client: &GatewayClient,
+    epoch: ConnectionEpoch,
+) -> Result<(Zeroizing<Vec<u8>>, Value), DiagnosticFailure> {
+    let mut collector = ModelExportPages::default();
+    loop {
+        let response = client
+            .request_for_epoch(
+                epoch,
+                RequestId::new(
+                    format!("native-model-export-{}", collector.pages),
+                    AUTHENTICATED_MAX_FRAME_BYTES,
+                )
+                .expect("bounded request ID"),
+                GatewayMethodName::Core(resolve_core_method("models.list").expect("known method")),
+                &collector.parameters(),
+            )
+            .await
+            .map_err(|error| map_client_error(&error))?;
+        if !response.ok() {
+            return Err(DiagnosticFailure::protocol(
+                "model_export_refused",
+                "Gateway refused a model catalogue page; no file was created",
+            ));
+        }
+        let encoded = response.payload().value().ok_or_else(|| {
+            DiagnosticFailure::protocol(
+                "invalid_model_export",
+                "Gateway model catalogue page is missing",
+            )
+        })?;
+        if collector.push(encoded.as_json())? {
+            break;
+        }
+    }
+    let pages = collector.pages;
+    let snapshot = collector.finish()?;
+    let archive = json!({"schemaVersion":1,"kind":"gta-claw.provider-model-catalogue",
+        "snapshot":snapshot,"plaintext":true,"untrusted":true});
+    let bytes = Zeroizing::new(serde_json::to_vec(&archive).map_err(|_| {
+        DiagnosticFailure::internal(
+            "model_export_encoding",
+            "Model catalogue export could not be encoded",
+        )
+    })?);
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err(DiagnosticFailure::protocol(
+            "model_export_size_limit",
+            "Model catalogue export exceeds its bounded file size",
+        ));
+    }
+    let receipt = json!({"provider":snapshot["provider"],"providerGeneration":snapshot["providerGeneration"],
+        "selectedModel":snapshot["selectedModel"],"selectionPinned":snapshot["selectionPinned"],
+        "observedAtMs":snapshot["observedAtMs"],"totalModels":snapshot["totalModels"],"sha256":snapshot["sha256"],
+        "pages":pages,"fileSha256":memory_sha256(&bytes),"bytes":bytes.len(),"snapshotVerified":true,
+        "fileCreated":false,"plaintext":true,"untrusted":true,"selectionChanged":false,
+        "networkContacted":false,"inferenceInvoked":false,"liveCapabilitiesVerified":false,"directoryDurabilityVerified":false});
+    Ok((bytes, receipt))
+}
+
+async fn collect_accounting_export(
+    client: &GatewayClient,
+    epoch: ConnectionEpoch,
+    parameters: &Value,
+) -> Result<(Zeroizing<Vec<u8>>, Value), DiagnosticFailure> {
+    let mut collector = AccountingExportPages::new(
+        parameters["runId"].as_str().expect("parsed run").to_owned(),
+        parameters["accountingPage"]["revision"]
+            .as_u64()
+            .expect("parsed revision"),
+    );
+    loop {
+        let response = client
+            .request_for_epoch(
+                epoch,
+                RequestId::new(
+                    format!("native-accounting-export-{}", collector.pages),
+                    AUTHENTICATED_MAX_FRAME_BYTES,
+                )
+                .expect("bounded request ID"),
+                GatewayMethodName::Core(resolve_core_method("agent.wait").expect("known method")),
+                &collector.parameters(),
+            )
+            .await
+            .map_err(|error| map_client_error(&error))?;
+        if !response.ok() {
+            return Err(DiagnosticFailure::protocol(
+                "accounting_export_refused",
+                "Gateway refused an accounting export page; no file was created",
+            ));
+        }
+        let encoded = response.payload().value().ok_or_else(|| {
+            DiagnosticFailure::protocol(
+                "invalid_accounting_page",
+                "Gateway accounting export page is missing",
+            )
+        })?;
+        if collector.push(encoded.as_json())? {
+            break;
+        }
+    }
+    let pages = collector.pages;
+    let snapshot = collector.finish()?;
+    let archive = json!({"schemaVersion":1,"kind":"gta-claw.provider-accounting",
+        "snapshot":snapshot,"plaintext":true,"untrusted":true});
+    let bytes = Zeroizing::new(serde_json::to_vec(&archive).map_err(|_| {
+        DiagnosticFailure::internal(
+            "accounting_export_encoding",
+            "Accounting export could not be encoded",
+        )
+    })?);
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err(DiagnosticFailure::protocol(
+            "accounting_export_size_limit",
+            "Accounting export exceeds its bounded file size; no file was created",
+        ));
+    }
+    let receipt = json!({"runId":snapshot["runId"],"sessionId":snapshot["sessionId"],
+        "revision":snapshot["revision"],"turn":snapshot["turn"],"status":snapshot["status"],
+        "totalRounds":snapshot["accounting"]["totalRounds"],"sha256":snapshot["accounting"]["sha256"],
+        "pages":pages,"fileSha256":memory_sha256(&bytes),"bytes":bytes.len(),"snapshotVerified":true,
+        "fileCreated":false,"plaintext":true,"untrusted":true,"acknowledged":false,"automaticReplay":false,
+        "costCalculated":false,"billingReconciled":false,"directoryDurabilityVerified":false});
+    Ok((bytes, receipt))
+}
+
 async fn collect_partial_export(
     client: &GatewayClient,
     epoch: ConnectionEpoch,
@@ -2143,8 +2638,8 @@ pub(super) async fn run(command: NativeCommand) -> RenderedResult {
     let mut client = None;
     let mut submitted = false;
     let mut prepared_export = None;
-    let mut prepared_partial_export = None;
-    let mut partial_file_started = false;
+    let mut prepared_run_export = None;
+    let mut run_file_started = false;
     let mut import_task = None;
     let mut export_progress = Value::Null;
     let deadline = tokio::time::Instant::now() + command.options.timeout;
@@ -2283,7 +2778,9 @@ pub(super) async fn run(command: NativeCommand) -> RenderedResult {
             };
             let mut config = GatewayClientConfig::new(endpoint.url, identity);
             config.credential = credential;
-            config.scopes = if command.memory.is_some() {
+            config.scopes = if command.memory.is_some()
+                || command.params.get("nativeCatalogRefresh").is_some()
+            {
                 ScopeSet::from_scopes([Scope::OperatorRead, Scope::OperatorWrite])
             } else {
                 ScopeSet::from_scopes([command.scope])
@@ -2311,15 +2808,32 @@ pub(super) async fn run(command: NativeCommand) -> RenderedResult {
                 .wait_ready()
                 .await
                 .map_err(|error| map_client_error(&error))?;
-            if let Some(destination) = &command.partial_export {
+            if let Some(destination) = command
+                .partial_export
+                .as_ref()
+                .or(command.accounting_export.as_ref())
+                .or(command.model_export.as_ref())
+            {
                 submitted = true;
-                let (bytes, receipt) = collect_partial_export(
-                    client.as_ref().expect("started client"),
-                    ready.epoch,
-                    &parameters,
-                )
-                .await?;
-                prepared_partial_export = Some((destination.clone(), bytes));
+                let (bytes, receipt) = if command.model_export.is_some() {
+                    collect_model_export(client.as_ref().expect("started client"), ready.epoch)
+                        .await?
+                } else if command.accounting_export.is_some() {
+                    collect_accounting_export(
+                        client.as_ref().expect("started client"),
+                        ready.epoch,
+                        &parameters,
+                    )
+                    .await?
+                } else {
+                    collect_partial_export(
+                        client.as_ref().expect("started client"),
+                        ready.epoch,
+                        &parameters,
+                    )
+                    .await?
+                };
+                prepared_run_export = Some((destination.clone(), bytes));
                 return Ok(receipt);
             }
             if command.memory.is_some() {
@@ -2488,6 +3002,40 @@ pub(super) async fn run(command: NativeCommand) -> RenderedResult {
                 })?;
                 check_accounting_page(encoded.as_json(), &parameters)?;
             }
+            if let Some(page) = parameters.get("nativeCatalogPage") {
+                let invalid = || {
+                    DiagnosticFailure::protocol(
+                        "invalid_model_catalogue",
+                        "Gateway model catalogue changed identity, bounds, metadata or digest",
+                    )
+                };
+                let encoded = response.payload().value().ok_or_else(invalid)?;
+                claw_protocol::native_models::validate_page(
+                    encoded.as_json(),
+                    page["offset"]
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or_else(invalid)?,
+                    page["sha256"].as_str(),
+                )
+                .map_err(|_| invalid())?;
+            }
+            if parameters.get("nativeCatalogRefresh").is_some() {
+                let invalid = || {
+                    DiagnosticFailure::protocol(
+                        "invalid_model_refresh",
+                        "Gateway catalogue refresh receipt is invalid or claims an unrelated operation",
+                    )
+                };
+                let encoded = response.payload().value().ok_or_else(invalid)?;
+                claw_protocol::native_models::validate_refresh(
+                    encoded.as_json(),
+                    parameters["nativeCatalogRefresh"]["sha256"]
+                        .as_str()
+                        .ok_or_else(invalid)?,
+                )
+                .map_err(|_| invalid())?;
+            }
             let payload = response
                 .payload()
                 .value()
@@ -2518,11 +3066,11 @@ pub(super) async fn run(command: NativeCommand) -> RenderedResult {
         let _ = task.await;
     }
     if result.is_ok()
-        && let Some((destination, bytes)) = prepared_partial_export.take()
+        && let Some((destination, bytes)) = prepared_run_export.take()
     {
-        partial_file_started = true;
+        run_file_started = true;
         match tokio::task::spawn_blocking(move || {
-            super::state_snapshot::write_partial_export(&destination, &bytes)
+            super::state_snapshot::write_run_export(&destination, &bytes)
         })
         .await
         {
@@ -2533,14 +3081,26 @@ pub(super) async fn run(command: NativeCommand) -> RenderedResult {
             }
             Ok(Err(message)) => {
                 result = Err(DiagnosticFailure::internal(
-                    "partial_export_file_failed",
+                    if command.model_export.is_some() {
+                        "model_export_file_failed"
+                    } else if command.accounting_export.is_some() {
+                        "accounting_export_file_failed"
+                    } else {
+                        "partial_export_file_failed"
+                    },
                     message,
                 ));
             }
             Err(_) => {
                 result = Err(DiagnosticFailure::internal(
-                    "partial_export_file_unknown",
-                    "Partial export writer ended without confirmation; preserve any output file",
+                    if command.model_export.is_some() {
+                        "model_export_file_unknown"
+                    } else if command.accounting_export.is_some() {
+                        "accounting_export_file_unknown"
+                    } else {
+                        "partial_export_file_unknown"
+                    },
+                    "Local export writer ended without confirmation; preserve any output file",
                 ));
             }
         }
@@ -2620,9 +3180,18 @@ pub(super) async fn run(command: NativeCommand) -> RenderedResult {
             document["sourceModified"] = json!(false);
         }
     }
-    if command.partial_export.is_some() {
-        document["operation"] = json!("run.export_partial");
-        document["fileMayExist"] = json!(partial_file_started);
+    if command.partial_export.is_some()
+        || command.accounting_export.is_some()
+        || command.model_export.is_some()
+    {
+        document["operation"] = json!(if command.model_export.is_some() {
+            "models.export_catalogue"
+        } else if command.accounting_export.is_some() {
+            "run.export_accounting"
+        } else {
+            "run.export_partial"
+        });
+        document["fileMayExist"] = json!(run_file_started);
         document["sourceModified"] = json!(false);
         document["acknowledged"] = json!(false);
         document["automaticReplay"] = json!(false);

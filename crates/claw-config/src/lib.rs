@@ -50,9 +50,9 @@ pub use migration::{
 pub use model::{
     AdminConfig, AuthConfig, CONFIG_SCHEMA_VERSION, ChannelsConfig, ConfigDomain, ConfigSnapshot,
     CopilotConfig, CoreConfig, DiscordConfig, LegacySkillsConfig, LogLevel, LoggingConfig,
-    NetworkConfig, PlatformSecretStore, RoleConfig, SecretMaterial, SecretRef, SecretStoreError,
-    ServerConfig, SessionsConfig, TeamsConfig, TelegramConfig, UpdatesConfig, WhatsappConfig,
-    store_secret,
+    ModelAliasConfig, NetworkConfig, PlatformSecretStore, ProviderCompletionApi, ProviderConfig,
+    ProviderKind, RoleConfig, SecretMaterial, SecretRef, SecretStoreError, ServerConfig,
+    SessionsConfig, TeamsConfig, TelegramConfig, UpdatesConfig, WhatsappConfig, store_secret,
 };
 pub use reload::{
     ConfigChange, ConfigFileWatcher, ConfigHub, ConfigHubError, ConfigSubscription, ReloadManager,
@@ -128,6 +128,63 @@ fn envelope_rejection(source: &str, source_name: &str) -> ConfigError {
             message: "document is not well-formed JSON5".to_owned(),
         },
     }
+}
+
+/// Returns a new validated snapshot with one complete explicit provider selection.
+///
+/// The original snapshot is unchanged. This neither resolves credentials nor
+/// contacts a provider, and does not publish a runtime configuration.
+///
+/// # Errors
+/// Rejects more than 16 KiB of JSON, duplicate or unknown fields, invalid native
+/// settings and an incompatible full configuration such as unauthenticated Copilot.
+pub fn with_provider_json(
+    snapshot: &ConfigSnapshot,
+    selection: &str,
+) -> Result<ConfigSnapshot, ConfigError> {
+    if selection.len() > 16 * 1024 {
+        return Err(ConfigError::Validation {
+            path: "core.provider".to_owned(),
+            message: "provider selection exceeds 16 KiB".to_owned(),
+        });
+    }
+    let provider =
+        serde_json::from_str::<wire::ProviderWire>(selection).map_err(|_| ConfigError::Decode {
+            source_name: "<provider-selection>".to_owned(),
+            path: "core.provider".to_owned(),
+            message: "requires one strict JSON provider object without duplicate or unknown fields"
+                .to_owned(),
+        })?;
+    let mut envelope = EnvelopeWire::from(snapshot);
+    envelope.core.provider = Some(provider);
+    envelope.validate()
+}
+
+/// Returns a validated candidate changing only an explicitly configured model ID.
+///
+/// Provider identity, credential references, endpoint, timeout and budgets remain
+/// unchanged. This performs no discovery, authentication or runtime publication.
+///
+/// # Errors
+/// Rejects missing or disabled providers and invalid model identifiers. The full
+/// configuration is validated again without mutating the original snapshot.
+pub fn with_provider_model(
+    snapshot: &ConfigSnapshot,
+    model: &str,
+) -> Result<ConfigSnapshot, ConfigError> {
+    let mut candidate = snapshot.clone();
+    let provider = candidate
+        .core
+        .provider
+        .as_mut()
+        .filter(|provider| provider.kind != ProviderKind::Disabled)
+        .ok_or_else(|| ConfigError::Validation {
+            path: "core.provider".to_owned(),
+            message: "selecting a model requires an explicitly configured active provider"
+                .to_owned(),
+        })?;
+    provider.model = Some(model.to_owned());
+    EnvelopeWire::from(&candidate).validate()
 }
 
 /// Serializes a validated snapshot to deterministic JSON5.

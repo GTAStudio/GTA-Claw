@@ -23,6 +23,8 @@ pub enum ConfigDomain {
     Sessions,
     /// Copilot provider settings.
     Copilot,
+    /// Explicit native provider selection and its credential binding.
+    Provider,
     /// GTA legacy skill migration settings.
     LegacySkills,
     /// Signed-update policy switch.
@@ -281,6 +283,7 @@ pub struct CoreConfig {
     pub(crate) logging: LoggingConfig,
     pub(crate) sessions: SessionsConfig,
     pub(crate) copilot: CopilotConfig,
+    pub(crate) provider: Option<ProviderConfig>,
     pub(crate) legacy_skills: LegacySkillsConfig,
     pub(crate) updates: UpdatesConfig,
     pub(crate) admin: AdminConfig,
@@ -330,6 +333,12 @@ impl CoreConfig {
         &self.copilot
     }
 
+    /// Returns an explicit native selection, or the existing legacy selection path.
+    #[must_use]
+    pub const fn provider(&self) -> Option<&ProviderConfig> {
+        self.provider.as_ref()
+    }
+
     /// Returns GTA legacy skill migration configuration.
     #[must_use]
     pub const fn legacy_skills(&self) -> &LegacySkillsConfig {
@@ -352,6 +361,136 @@ impl CoreConfig {
     #[must_use]
     pub const fn network(&self) -> &NetworkConfig {
         &self.network
+    }
+}
+
+/// The explicitly selected native backend; no automatic fallback is implied.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    /// GitHub Copilot with the separately configured GitHub authentication.
+    Copilot,
+    /// The native OpenAI-compatible client.
+    Openai,
+    /// The native Anthropic client.
+    Anthropic,
+    /// No provider or authentication flow may be started.
+    Disabled,
+}
+
+/// OpenAI-compatible completion protocol, never guessed from the endpoint.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCompletionApi {
+    /// Chat Completions streaming protocol.
+    ChatCompletions,
+    /// Stateless Responses streaming protocol.
+    Responses,
+}
+
+/// Validated explicit provider settings, containing references rather than secret material.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderConfig {
+    pub(crate) kind: ProviderKind,
+    pub(crate) model: Option<String>,
+    pub(crate) model_aliases: Vec<ModelAliasConfig>,
+    pub(crate) api_key: Option<SecretRef>,
+    pub(crate) base_url: Option<String>,
+    pub(crate) credential_origin: Option<String>,
+    pub(crate) request_timeout_ms: Option<u64>,
+    pub(crate) completion_api: Option<ProviderCompletionApi>,
+    pub(crate) max_observed_turn_tokens: Option<u64>,
+}
+
+impl ProviderConfig {
+    /// Returns the explicit selection, including disabled.
+    #[must_use]
+    pub const fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+
+    /// Returns the native SDK catalogue identity, distinct from configuration spelling.
+    #[must_use]
+    pub const fn catalogue_provider_id(&self) -> Option<&'static str> {
+        match self.kind {
+            ProviderKind::Copilot => Some("github-copilot"),
+            ProviderKind::Openai => Some("openai"),
+            ProviderKind::Anthropic => Some("anthropic"),
+            ProviderKind::Disabled => None,
+        }
+    }
+
+    /// Returns the exact model, absent only when explicitly disabled.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// Returns the native API credential reference; Copilot uses `core.auth.github`.
+    #[must_use]
+    pub const fn api_key(&self) -> Option<&SecretRef> {
+        self.api_key.as_ref()
+    }
+
+    /// Returns the native API base URL, not an independently enrolled origin.
+    #[must_use]
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+
+    /// Returns the endpoint's declared credential origin, not authorization to use it.
+    #[must_use]
+    pub fn credential_origin(&self) -> Option<&str> {
+        self.credential_origin.as_deref()
+    }
+
+    /// Returns the bounded request timeout, absent only when disabled.
+    #[must_use]
+    pub const fn request_timeout_ms(&self) -> Option<u64> {
+        self.request_timeout_ms
+    }
+
+    /// Returns the OpenAI-only completion dialect.
+    #[must_use]
+    pub const fn completion_api(&self) -> Option<ProviderCompletionApi> {
+        self.completion_api
+    }
+
+    /// Returns the optional observed-token threshold, including explicit zero.
+    #[must_use]
+    pub const fn max_observed_turn_tokens(&self) -> Option<u64> {
+        self.max_observed_turn_tokens
+    }
+
+    /// Returns explicit aliases whose targets still require catalogue validation.
+    #[must_use]
+    pub fn model_aliases(&self) -> &[ModelAliasConfig] {
+        &self.model_aliases
+    }
+}
+
+/// A case-sensitive name for an exact model in the same provider configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelAliasConfig {
+    pub(crate) alias: String,
+    pub(crate) model: String,
+}
+
+impl ModelAliasConfig {
+    /// Returns the explicit alias, without normalization.
+    #[must_use]
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// Returns the exact target identifier, never another alias.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
     }
 }
 
@@ -610,6 +749,12 @@ impl CopilotConfig {
     #[must_use]
     pub fn default_model(&self) -> &str {
         &self.default_model
+    }
+
+    /// Returns the validated request timeout in milliseconds.
+    #[must_use]
+    pub const fn request_timeout_ms(&self) -> u64 {
+        self.request_timeout_ms
     }
 }
 

@@ -392,6 +392,69 @@ impl MethodHandler for RuntimeHealthHandler {
 }
 
 #[derive(Debug)]
+pub(super) struct RuntimeModelHandler {
+    provider: Arc<super::http_api::SwappableProvider>,
+    original: claw_gateway::MethodRegistry,
+}
+
+impl RuntimeModelHandler {
+    pub(super) fn new(
+        provider: Arc<super::http_api::SwappableProvider>,
+        original: claw_gateway::MethodRegistry,
+    ) -> Arc<Self> {
+        Arc::new(Self { provider, original })
+    }
+}
+
+impl MethodHandler for RuntimeModelHandler {
+    fn handle<'a>(&'a self, context: MethodContext<'a>, params: Value) -> MethodFuture<'a> {
+        Box::pin(async move {
+            if let Some(refresh) = params.get("nativeCatalogRefresh") {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Refresh {
+                    sha256: String,
+                }
+                let invalid = || {
+                    DispatchError::InvalidParams {method:context.method.to_owned(),detail:"catalogue refresh requires a pinned snapshot, write scope and no mixed operation".to_owned()}
+                };
+                if params.as_object().is_none_or(|fields| fields.len() != 1)
+                    || !context.scopes.iter().any(|scope| {
+                        matches!(
+                            scope,
+                            claw_protocol::gateway::OperatorScope::Write
+                                | claw_protocol::gateway::OperatorScope::Admin
+                        )
+                    })
+                {
+                    return Err(invalid());
+                }
+                let refresh: Refresh =
+                    serde_json::from_value(refresh.clone()).map_err(|_| invalid())?;
+                return self
+                    .provider
+                    .refresh_catalogue(&refresh.sha256, tokio_util::sync::CancellationToken::new())
+                    .await
+                    .map_err(|error| runtime_dispatch_error(context.method, &error));
+            }
+            if let Some(page) = params.get("nativeCatalogPage") {
+                if params.as_object().is_none_or(|fields| fields.len() != 1) {
+                    return Err(DispatchError::InvalidParams {
+                        method: context.method.to_owned(),
+                        detail: "native catalogue request cannot mix operations".to_owned(),
+                    });
+                }
+                self.provider
+                    .catalogue_page(page)
+                    .map_err(|error| runtime_dispatch_error(context.method, &error))
+            } else {
+                self.original.dispatch(context, params).await
+            }
+        })
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct RuntimeSessionHandler {
     runtime: std::sync::Weak<AgentRuntime>,
 }

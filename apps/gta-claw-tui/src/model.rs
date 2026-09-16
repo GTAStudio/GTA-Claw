@@ -208,16 +208,19 @@ pub enum Screen {
     Artifacts,
     /// Keyboard reference.
     Help,
+    /// Bounded cached provider model catalogue.
+    Models,
 }
 
 impl Screen {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Sessions,
         Self::Workspace,
         Self::Runs,
         Self::Diff,
         Self::Artifacts,
         Self::Help,
+        Self::Models,
     ];
 
     pub(crate) const fn title(self) -> &'static str {
@@ -228,6 +231,7 @@ impl Screen {
             Self::Diff => "Diff",
             Self::Artifacts => "Artifacts",
             Self::Help => "Help",
+            Self::Models => "Models",
         }
     }
 }
@@ -311,8 +315,18 @@ pub struct AppModel {
     pub active_run_version: Option<(Option<u64>, u64)>,
     /// Last explicitly viewed partial page, never eligible for acknowledgement.
     pub partial_page: Option<crate::gateway::PartialPage>,
+    /// Explicitly viewed provider rounds, never eligible for acknowledgement.
+    pub accounting_page: Option<crate::gateway::AccountingPage>,
     /// Observed usage for the selected native run; absence is not zero cost.
     pub provider_accounting: Option<claw_protocol::native_accounting::ProviderAccounting>,
+    /// One validated provider catalogue page for the current connection.
+    pub model_catalogue: Option<serde_json::Value>,
+    /// Single in-flight catalogue request, independent of chat submission.
+    pub pending_catalogue: Option<crate::gateway::ModelCatalogueRequest>,
+    /// Monotonic catalogue request identity, never reset on reconnect.
+    pub catalogue_sequence: u64,
+    /// Explicit local file work, retained independently of Gateway connection/session resets.
+    pub local_configuration: crate::local_configuration::LocalConfiguration,
     /// Complete results eligible for acknowledgement only after workspace rendering.
     pub pending_acks: VecDeque<(String, u64)>,
     /// Bounded identities of terminal results already added to this session view.
@@ -353,7 +367,12 @@ impl Default for AppModel {
             active_run: None,
             active_run_version: None,
             partial_page: None,
+            accounting_page: None,
             provider_accounting: None,
+            model_catalogue: None,
+            pending_catalogue: None,
+            catalogue_sequence: 0,
+            local_configuration: crate::local_configuration::LocalConfiguration::default(),
             pending_acks: VecDeque::new(),
             received_results: VecDeque::new(),
             pending_recovery: None,
@@ -413,6 +432,7 @@ impl AppModel {
         self.active_run = None;
         self.active_run_version = None;
         self.partial_page = None;
+        self.accounting_page = None;
         self.provider_accounting = None;
         self.pending_acks.clear();
         self.received_results.clear();
@@ -429,6 +449,7 @@ impl AppModel {
             Screen::Diff => self.diff.len(),
             Screen::Artifacts => self.artifacts.len().max(self.artifact_content.len()),
             Screen::Help => 0,
+            Screen::Models => crate::render::model_catalogue_row_count(self),
         }
     }
 

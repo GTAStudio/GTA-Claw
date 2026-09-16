@@ -1,0 +1,133 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-complete-accounting-export-and-client-round-inspection",
+  "capturedOn": "2026-09-15",
+  "baseCommit": "c360c2b36d3df1bf998b83ac7d171f78a39aade8",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "taskIds": ["M3-05", "M3-08", "M5-01", "M5-02"],
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "toolchain": "stable (installed Rust 1.98.1)",
+  "slintVersion": "1.17.1",
+  "cargoLockSha256": "7460323a924655a77c0c4fec247dd1635d72d7b358b889359e86aaf12100f674",
+  "desktopCargoLockSha256": "e90f63ff1eeb92af026fbea7b4d3356e913e39c5de085bc85a3f25fc7bf0f258",
+  "lockfilesChanged": false,
+  "sourceFiles": [
+    { "path": "apps/gta-claw-cli/src/lib.rs", "sha256": "770576e6ce02793da697aaa341376323166904cb38b0bc3dffe50cd558b153c5" },
+    { "path": "apps/gta-claw-cli/src/native_gateway.rs", "sha256": "3a6cd9cdbcd75c435308019ef0da45b3e99648cfc9b011023bd11da7eb7fe8c2" },
+    { "path": "apps/gta-claw-cli/src/state_snapshot.rs", "sha256": "78ee9bb35d090d39190aa3fe854ec2ca86fd57869a9b90ea08b06f22e4675958" },
+    { "path": "apps/gta-claw-cli/tests/foundation.rs", "sha256": "e3259ceef3fd5d400bf2c40886038bfb96ca4396626beb08c8e2d0cca71ccceb" },
+    { "path": "apps/gta-claw-cli/tests/gateway_health.rs", "sha256": "e2749cce7dba49c20fc6a84b8169c4c28af1394d6e65d965b6f0377a18d25c58" },
+    { "path": "apps/gta-claw-tui/src/gateway.rs", "sha256": "0af5ddc0579c42f4315954abc1894b94449314ea2e0e26c6a14bf400ced3d54a" },
+    { "path": "apps/gta-claw-tui/src/lib.rs", "sha256": "880ee90e60064545338923c021c7a4599ad313cc5f704c33ba10ea466586e977" },
+    { "path": "apps/gta-claw-tui/src/model.rs", "sha256": "d2c6bd95fe209c5694bd6a0575960ce5b6fa280daf19cbf5fed9c1b1480de281" },
+    { "path": "apps/gta-claw-tui/src/render.rs", "sha256": "02e377fda0fbf0749297bd5fedf8dcf7a97c521da006a49467c846fc04a181f1" },
+    { "path": "apps/gta-claw-tui/tests/gateway_double.rs", "sha256": "8a01b6535618f547cc44888f2f1646dd92a0200450ac349a79e155b30b3d7d4e" },
+    { "path": "apps/gta-claw-tui/tests/rendering.rs", "sha256": "ad9beab2c3f0c2a48a020d8e5ef26b8f6822152b2db8846fd9e27b9ad4cd754a" },
+    { "path": "crates/claw-protocol/Cargo.toml", "sha256": "43be5cc099f4d7b753ca4b0d36bc066d0c470df86570998079c9e1c79e2648ca" },
+    { "path": "crates/claw-protocol/src/native_accounting.rs", "sha256": "b7ac4f7c618454a7c571ea33fd17708386dcaa00b6d202375d0c4aea9e0bd013" },
+    { "path": "desktop/apps/gta-claw-desktop/src/controller.rs", "sha256": "b72d77194930862b9a55bed6453e141d978f6136f963a1fb7e3707a39feb79e3" },
+    { "path": "desktop/apps/gta-claw-desktop/src/main.rs", "sha256": "2cc7a3b98dfbd49d3322920793f878afe488509383ef385e8e4a86a6d8c72876" },
+    { "path": "desktop/apps/gta-claw-desktop/src/product_state.rs", "sha256": "fb2dfa2a37cd7b51fba6e99c78f1a4da1f67382b010c0d831451d8beb2692546" },
+    { "path": "desktop/apps/gta-claw-desktop/src/software_renderer_smoke.rs", "sha256": "3bcd8980115386ffdc25af447482ac078f7b09d35f896b970caf9c95dfdc1219" },
+    { "path": "desktop/apps/gta-claw-desktop/ui/app-window.slint", "sha256": "2228d61d607b9f12fc79fb595787ce8fcd268455c2e3db3809474b51855093f9" },
+    { "path": "desktop/apps/gta-claw-desktop/ui/modules/product-shell.slint", "sha256": "ca81e4cec10a00fd74fcef8ce1461a91a627281ce755d72224c4f244b8588fae" }
+  ],
+  "checks": [
+    {
+      "command": "cargo +stable test -p claw-protocol -p gta-claw-daemon -p gta-claw-cli -p gta-claw-tui --all-targets --no-fail-fast --locked --offline -j 2",
+      "result": "passed", "exitCode": 0, "passed": 486, "failed": 0, "ignored": 5, "testBinaries": 27,
+      "log": "target/native-accounting-contract-tests-20260915.log",
+      "sha256": "4d0da75ee77650e3284cd361dc8fbcba65f065f9712010d219cda61cd1a52818",
+      "scopeNote": "70 protocol, 102 CLI, 241 daemon and 73 TUI passing tests. CLI runtime initialization error is the existing passing fault-injection test; five ignored cases remain their existing helpers or acceptance boundaries"
+    },
+    {
+      "command": "cargo +stable clippy -p claw-protocol -p gta-claw-daemon -p gta-claw-cli -p gta-claw-tui --all-targets --locked --offline -j 2 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-accounting-contract-clippy-20260915.log",
+      "sha256": "c9a631c242c370203ba61ed35d6eced13abdea948df56997896175a25fc01489"
+    },
+    {
+      "command": "cargo +stable check --workspace --all-targets --locked --offline -j 2",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-accounting-contract-check-20260915.log",
+      "sha256": "ce868bca45ce7ac6236c89b734fe09d9efedd46fc17b24073949fcc13fec3096"
+    },
+    {
+      "command": "cargo +stable test --manifest-path desktop/Cargo.toml -p gta-claw-desktop --all-targets --no-fail-fast --locked --offline -j 1 --config profile.test.package.gta-claw-desktop.debug=0 --config profile.test.package.gta-claw-desktop.codegen-units=16",
+      "result": "passed", "exitCode": 0, "passed": 88, "failed": 0, "ignored": 0,
+      "log": "target/native-accounting-desktop-contract-tests-20260915.log",
+      "sha256": "255bf84b15a448182ec70a59d84bd9a6d50e23511fa89b814821a78e52a26557",
+      "artifact": "desktop/target/debug/deps/gta_claw_desktop-96d6ad81213bf148.exe",
+      "artifactSha256": "60eaf4cde6fb9c7d5e8295c38081596e8652e64597b6760e6df0f268fddcafe4",
+      "scopeNote": "Windows native tests and Slint software renderer; macOS harness is a non-applicable Windows no-op, not macOS runtime acceptance. Low-peak compiler flags are invocation-local and do not change repository profiles"
+    },
+    {
+      "command": "cargo +stable clippy --manifest-path desktop/Cargo.toml -p gta-claw-desktop --all-targets --locked --offline -j 1 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-accounting-desktop-contract-clippy-20260915.log",
+      "sha256": "4bf5d5a103da742a08db81e647e87a98507fc584bf5f21c4a60872a4c6b4b72a"
+    }
+  ],
+  "behaviorEvidence": [
+    "accounting_export_command_requires_a_new_local_target_and_a_complete_read",
+    "accounting_export_verifies_the_entire_snapshot_not_only_individual_pages",
+    "accounting_export_cli_pins_all_pages_and_writes_only_verified_new_files",
+    "accounting_snapshot_preserves_the_existing_ordered_json_contract",
+    "accounting_page_identity_summary_and_full_digest_are_checked_before_display",
+    "accounting_pages_pin_connection_revision_and_cursor_without_acknowledgements",
+    "native_tui_accounting_pages_are_bound_read_only_and_never_acknowledge_results",
+    "accounting_round_details_wrap_with_unknown_and_explicit_zero_kept_distinct",
+    "accounting_round_pages_preserve_run_outcome_and_reject_stale_or_changed_snapshots",
+    "product_accounting_pages_use_real_transport_and_existing_digest_without_ack",
+    "native_accounting_renders_from_bound_state_at_narrow_and_wide_sizes"
+  ],
+  "retainedFailures": [
+    {
+      "reason": "Initial Cargo call failed because the terminal PATH omitted Cargo. Existing USERPROFILE/.cargo/bin/cargo.exe was used; no installation or global environment change"
+    },
+    {
+      "reason": "Initial new test used Result::expect on a deliberately non-Debug diagnostic type, then the new parser fixture omitted its explicit endpoint. Fixed test assertions and fixture only; identical focused checks passed. Strict lint defects were repaired without new allowances"
+    },
+    {
+      "reason": "An exploratory hypothesis that desktop JSON ordering required canonical sorting was disproved by the existing root workspace preserve_order contract. The trial caused combined CLI/TUI digest fixture failures. All production canonicalization changes were withdrawn; daemon byte-for-byte diff is empty. Final validation and independent desktop digest use the existing v1 ordered format, not a new protocol or a claimed cross-feature fix",
+      "log": "target/native-accounting-final-tests-20260915.log",
+      "sha256": "8895927a0333dcbc54b6ba7dcd80c03e50a3c42a90ec433dfcd3f6265410d663"
+    },
+    {
+      "reason": "After a confirmed native credential write and successful parent readback, an independent CLI status returned present:false in mcp_credential_cli_native_roundtrip_is_stdin_only_and_never_connects. Added failure-only booleans for parent/reopened read status and metadata, with no secret output, retry, locking or backend change. Focused and later combined passes are not a root-cause fix; this anomaly remains open",
+      "log": "target/native-accounting-canonical-tests-20260915.log",
+      "sha256": "c376e75ca3c57c80b3cd826686943dccd417a905e070180ef03f3c49145a84a4"
+    },
+    {
+      "reason": "First desktop UI test compile with normal test debug settings ended in LLVM out-of-memory before assertions ran. Read-only OS check showed about 16 GiB free physical/commit space. Invocation-local package debug=0/codegen-units=16 and one Cargo job allowed the same test and full suite to finish; no other process, pagefile, production proxy or repository build profile was changed"
+    }
+  ],
+  "notes": [
+    "CLI gateway export-accounting uses one observed device connection, one run revision, at most 1024 pages/rounds and a 4 MiB UTF-8 output budget under the existing deadline. Each page pins session, turn, terminal status, total, summary/provenance and digest; the full snapshot also validates exact aggregate classes, counts and digest before local creation",
+    "Ten real CLI subprocess/WebSocket scenarios cover multi-page success, available empty, modified response, changed session/provenance, forged aggregate despite matching page digests, disconnect, existing target, unavailable record and explicit refusal. Only operator.read is requested; no new ACK, inference, wait or replay is sent",
+    "The new plaintext JSON file has schemaVersion 1 and kind gta-claw.provider-accounting. Receipt identifies both snapshot and file SHA256 without rendering provider/model/response identifiers. Parent is pinned and output is create-new with file sync; no overwrite or atomic-rename/parent-directory durability claim. Local write failures may leave a file",
+    "Moved strict round/response validation into claw-protocol with its already locked sha2 dependency. Existing v1 server shape, original object field order, provider invocation, pricing, retry and result ACK policies are unchanged",
+    "TUI accounting/accounting-next retain a single bounded page, pin connection/session/run/turn/revision/state and summary provenance, and reject stale results. Eight real worker scenarios and state/render tests preserve unknown versus explicit zero. Widths 40/80/120 and heights 10/24 were checked with long wide-character model names",
+    "Slint uses existing icon controls/tooltips and controller product_request. One accounting request is in flight, terminal identity is bound before enqueue, and invalid/refused reads preserve previous valid data without changing transcript or run outcome. Six state scenarios and four real controller/WebSocket scenarios pass",
+    "The desktop full single-page fixture has an independently computed existing-order SHA256 of 72f1a001eed81051e5e48f6d0e7c3a08e188144fb539af4e5908f51820c571a3. It passes through actual transport, preserves explicit zero counters and rejects substituted response metadata",
+    "Slint software-pixel tests at 1080x720 and 720x520 verify content, enabled/disabled controls, in-flight state and disconnect clearing. These are headless native renderer tests, not real user/window/platform acceptance",
+    "Individual GUI continuation pages pin a whole-snapshot digest but do not independently verify every omitted round; complete independent verification belongs to CLI export-accounting. Missing reports, open journals and outcome_unknown remain distinct from zero usage, settled cost or permission to replay",
+    "No real provider/cloud account, paid model, third-party channel, mobile device, production server, proxy lifecycle, migration, deployment, release, branch, commit or push was used by this development increment. Test credentials are independently namespaced fixtures; no user credentials were queried",
+    "Plans and guides describe only this increment. Parent checklist acceptance counts are unchanged, and older ledgers are not overwritten. Logs are UTF-16 from Windows PowerShell Tee-Object; native exit codes and test summaries were checked separately from NativeCommandError progress formatting"
+  ],
+  "recovery": [
+    "A refused or interrupted export creates no output until all pages are verified. Start a new explicit export from offset zero with the current observed run revision; never repeat the provider request to reconstruct usage",
+    "If the local writer reports unconfirmed I/O, preserve any output and choose a new path for an explicitly requested export. Existing files are never overwritten or deleted by the command",
+    "GUI failure retains the last verified page and permits explicit reread on the current connection. Reconnect or session/run changes require a fresh observed terminal record; no automatic continuation, ACK or replay is added"
+  ],
+  "unverified": [
+    "Prices, invoices, charge allocation, monetary reservations/hard limits and rolling/global quotas",
+    "GUI full-snapshot export, encrypted accounting archives, offline import, whole-file resume and crash-durable client cursors",
+    "Unified typed model configuration/editing lifecycle, real accounts, user acceptance and cross-platform/device/release gates",
+    "Original and newly reproduced native credential/OAuth cross-process anomalies; no root-cause correction is claimed",
+    "Existing cargo-deny policy debt, full migration and whole-project completion"
+  ]
+}

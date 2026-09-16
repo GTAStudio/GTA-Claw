@@ -5,9 +5,9 @@ use url::Url;
 use crate::error::ConfigError;
 use crate::model::{
     AdminConfig, AuthConfig, CONFIG_SCHEMA_VERSION, ChannelsConfig, ConfigSnapshot, CopilotConfig,
-    CoreConfig, DiscordConfig, LegacySkillsConfig, LogLevel, LoggingConfig, NetworkConfig,
-    RoleConfig, SecretRef, ServerConfig, SessionsConfig, TeamsConfig, TelegramConfig,
-    UpdatesConfig, WhatsappConfig,
+    CoreConfig, DiscordConfig, LegacySkillsConfig, LogLevel, LoggingConfig, ModelAliasConfig,
+    NetworkConfig, ProviderCompletionApi, ProviderConfig, ProviderKind, RoleConfig, SecretRef,
+    ServerConfig, SessionsConfig, TeamsConfig, TelegramConfig, UpdatesConfig, WhatsappConfig,
 };
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -36,6 +36,8 @@ pub(crate) struct CoreWire {
     pub(crate) logging: LoggingWire,
     pub(crate) sessions: SessionsWire,
     pub(crate) copilot: CopilotWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<ProviderWire>,
     pub(crate) legacy: LegacyWire,
     pub(crate) updates: UpdatesWire,
     pub(crate) admin: AdminWire,
@@ -228,6 +230,269 @@ impl Default for CopilotWire {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderWire {
+    kind: ProviderKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_aliases: Option<Vec<ModelAliasWire>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential_origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_api: Option<ProviderCompletionApi>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_observed_turn_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ModelAliasWire {
+    alias: String,
+    model: String,
+}
+
+impl ProviderWire {
+    fn validate(self) -> Result<ProviderConfig, ConfigError> {
+        if self.kind == ProviderKind::Disabled {
+            if self.model.is_some()
+                || self.model_aliases.is_some()
+                || self.api_key.is_some()
+                || self.base_url.is_some()
+                || self.credential_origin.is_some()
+                || self.request_timeout_ms.is_some()
+                || self.completion_api.is_some()
+                || self.max_observed_turn_tokens.is_some()
+            {
+                return validation(
+                    "core.provider",
+                    "disabled selection must not include active provider settings",
+                );
+            }
+            return Ok(ProviderConfig {
+                kind: self.kind,
+                model: None,
+                model_aliases: Vec::new(),
+                api_key: None,
+                base_url: None,
+                credential_origin: None,
+                request_timeout_ms: None,
+                completion_api: None,
+                max_observed_turn_tokens: None,
+            });
+        }
+        let Some(model) = self.model.filter(|model| valid_model_identifier(model)) else {
+            return validation(
+                "core.provider.model",
+                "requires an exact nonblank model identifier of at most 256 bytes",
+            );
+        };
+        let model_aliases = self.model_aliases.unwrap_or_default();
+        if model_aliases.len() > 128 {
+            return validation(
+                "core.provider.model_aliases",
+                "exceeds 128 explicit aliases",
+            );
+        }
+        if model_aliases
+            .iter()
+            .map(|entry| entry.alias.len().saturating_add(entry.model.len()))
+            .fold(0_usize, usize::saturating_add)
+            > 4096
+        {
+            return validation(
+                "core.provider.model_aliases",
+                "alias names and targets exceed 4096 UTF-8 bytes",
+            );
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for entry in &model_aliases {
+            if !valid_model_identifier(&entry.alias)
+                || !valid_model_identifier(&entry.model)
+                || entry.alias == model
+                || entry.alias == "openclaw"
+                || entry.alias.starts_with("openclaw/")
+                || !names.insert(entry.alias.as_str())
+            {
+                return validation(
+                    "core.provider.model_aliases",
+                    "requires unique valid aliases distinct from the exact selected model",
+                );
+            }
+        }
+        if model_aliases
+            .iter()
+            .any(|entry| names.contains(entry.model.as_str()))
+        {
+            return validation(
+                "core.provider.model_aliases",
+                "must point directly to exact model identifiers, not aliases",
+            );
+        }
+        let model_aliases = model_aliases
+            .into_iter()
+            .map(|entry| ModelAliasConfig {
+                alias: entry.alias,
+                model: entry.model,
+            })
+            .collect();
+        let timeout = self.request_timeout_ms.unwrap_or(120_000);
+        validate_range(timeout, 1_000, 120_000, "core.provider.request_timeout_ms")?;
+        if self.kind == ProviderKind::Copilot {
+            if self.api_key.is_some()
+                || self.base_url.is_some()
+                || self.credential_origin.is_some()
+                || self.completion_api.is_some()
+            {
+                return validation(
+                    "core.provider",
+                    "Copilot uses core.auth.github and does not accept native endpoint or API key fields",
+                );
+            }
+            return Ok(ProviderConfig {
+                kind: self.kind,
+                model: Some(model),
+                model_aliases,
+                api_key: None,
+                base_url: None,
+                credential_origin: None,
+                request_timeout_ms: Some(timeout),
+                completion_api: None,
+                max_observed_turn_tokens: self.max_observed_turn_tokens,
+            });
+        }
+        if self.kind == ProviderKind::Anthropic && self.completion_api.is_some() {
+            return validation(
+                "core.provider.completion_api",
+                "is supported only for OpenAI-compatible selection",
+            );
+        }
+        if self
+            .api_key
+            .as_ref()
+            .is_some_and(|reference| reference.len() > 1024)
+        {
+            return validation(
+                "core.provider.api_key",
+                "credential reference exceeds 1024 bytes",
+            );
+        }
+        let api_key = secret(self.api_key, "core.provider.api_key")?;
+        if api_key.is_none() {
+            return validation(
+                "core.provider.api_key",
+                "is required for the selected native provider",
+            );
+        }
+        let endpoint = self.base_url.unwrap_or_else(|| {
+            if self.kind == ProviderKind::Openai {
+                "https://api.openai.com/v1/".to_owned()
+            } else {
+                "https://api.anthropic.com/".to_owned()
+            }
+        });
+        let endpoint = provider_url(&endpoint, "core.provider.base_url")?;
+        let origin = endpoint.origin().ascii_serialization();
+        if let Some(expected) = self.credential_origin {
+            let expected = provider_url(&expected, "core.provider.credential_origin")?;
+            if expected.path() != "/" || expected.origin() != endpoint.origin() {
+                return validation(
+                    "core.provider.credential_origin",
+                    "must name exactly the endpoint origin, without a path",
+                );
+            }
+        }
+        Ok(ProviderConfig {
+            kind: self.kind,
+            model: Some(model),
+            model_aliases,
+            api_key,
+            base_url: Some(endpoint.to_string()),
+            credential_origin: Some(origin),
+            request_timeout_ms: Some(timeout),
+            completion_api: if self.kind == ProviderKind::Openai {
+                Some(
+                    self.completion_api
+                        .unwrap_or(ProviderCompletionApi::ChatCompletions),
+                )
+            } else {
+                None
+            },
+            max_observed_turn_tokens: self.max_observed_turn_tokens,
+        })
+    }
+}
+
+fn valid_model_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+}
+
+fn provider_url(value: &str, path: &str) -> Result<Url, ConfigError> {
+    if value.len() > 2048 {
+        return validation(path, "provider URL exceeds 2048 bytes");
+    }
+    require_url(value, path, &["https", "http"])?;
+    let endpoint = Url::parse(value).map_err(|_| ConfigError::Validation {
+        path: path.to_owned(),
+        message: "invalid provider URL".to_owned(),
+    })?;
+    if endpoint.query().is_some()
+        || value.contains('\\')
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || value.split('/').any(|part| matches!(part, "." | ".."))
+        || (endpoint.scheme() == "http"
+            && !match endpoint.host() {
+                Some(url::Host::Ipv4(address)) => address.is_loopback(),
+                Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                _ => false,
+            })
+    {
+        return validation(
+            path,
+            "requires HTTPS or literal loopback HTTP without query, whitespace or ambiguous paths",
+        );
+    }
+    Ok(endpoint)
+}
+
+impl From<&ProviderConfig> for ProviderWire {
+    fn from(config: &ProviderConfig) -> Self {
+        Self {
+            kind: config.kind,
+            model: config.model.clone(),
+            model_aliases: (!config.model_aliases.is_empty()).then(|| {
+                config
+                    .model_aliases
+                    .iter()
+                    .map(|entry| ModelAliasWire {
+                        alias: entry.alias.clone(),
+                        model: entry.model.clone(),
+                    })
+                    .collect()
+            }),
+            api_key: config.api_key.as_ref().map(secret_string),
+            base_url: config.base_url.clone(),
+            credential_origin: config.credential_origin.clone(),
+            request_timeout_ms: config.request_timeout_ms,
+            completion_api: config.completion_api,
+            max_observed_turn_tokens: config.max_observed_turn_tokens,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct LegacyWire {
@@ -279,6 +544,7 @@ impl EnvelopeWire {
             });
         }
 
+        let provider = self.core.provider.map(ProviderWire::validate).transpose()?;
         let auth = AuthConfig {
             github_pat: secret(self.core.auth.github.pat, "core.auth.github.pat")?,
             device_enabled: self.core.auth.github.device.enabled,
@@ -293,7 +559,12 @@ impl EnvelopeWire {
                 "is required when device flow is enabled",
             );
         }
-        if !auth.device_enabled && auth.github_pat.is_none() {
+        if !auth.device_enabled
+            && auth.github_pat.is_none()
+            && provider
+                .as_ref()
+                .is_none_or(|provider| provider.kind == ProviderKind::Copilot)
+        {
             return validation(
                 "core.auth.github.pat",
                 "is required when device flow is disabled",
@@ -484,6 +755,7 @@ impl EnvelopeWire {
                     default_model: self.core.copilot.default_model,
                     request_timeout_ms: self.core.copilot.request_timeout_ms,
                 },
+                provider,
                 legacy_skills: LegacySkillsConfig {
                     source_urls: self.core.legacy.skills.source_urls,
                     execution_timeout_ms: self.core.legacy.skills.execution_timeout_ms,
@@ -580,6 +852,7 @@ impl From<&ConfigSnapshot> for EnvelopeWire {
                     default_model: core.copilot.default_model.clone(),
                     request_timeout_ms: core.copilot.request_timeout_ms,
                 },
+                provider: core.provider.as_ref().map(ProviderWire::from),
                 legacy: LegacyWire {
                     skills: LegacySkillsWire {
                         source_urls: core.legacy_skills.source_urls.clone(),

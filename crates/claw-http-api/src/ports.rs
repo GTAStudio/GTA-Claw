@@ -248,6 +248,16 @@ pub trait ProviderPort: Send + Sync {
     /// Lists configured `OpenClaw` model aliases.
     fn models(&self) -> PortFuture<'_, Result<Vec<Model>, PortError>>;
 
+    /// Resolves an explicitly configured native alias to its exact model without I/O.
+    ///
+    /// The default preserves the existing `OpenClaw` routing-only contract.
+    ///
+    /// # Errors
+    /// A native implementation may reject stale configuration or a target outside its policy.
+    fn resolve_model_alias(&self, _alias: &str) -> Result<Option<String>, PortError> {
+        Ok(None)
+    }
+
     /// Runs a non-streaming generation.
     fn generate(
         &self,

@@ -18,6 +18,8 @@ use url::Url;
 pub mod diagnostics;
 /// Asynchronous Gateway adapter and bounded UI channels.
 pub mod gateway;
+/// Explicit local model configuration candidates, independent of Gateway execution.
+pub mod local_configuration;
 /// TUI state and the complete run-state vocabulary.
 pub mod model;
 /// Deterministic cell-buffer renderer and Crossterm flusher.
@@ -282,13 +284,17 @@ async fn run_interactive(options: GatewayOptions, no_color: bool) -> io::Result<
                 }
                 event = worker.events.recv(), if worker_events_open => {
                     let Some(event) = event else {
-                        "Gateway: worker stopped".clone_into(&mut model.connection);
+                        apply_worker_event(&mut model, WorkerEvent::Connection("Gateway: worker stopped".to_owned()));
                         model.notice = Some("Gateway worker stopped unexpectedly".to_owned());
                         worker_events_open = false;
                         redraw = true;
                         continue;
                     };
                     apply_worker_event(&mut model, event);
+                    redraw = true;
+                }
+                () = model.local_configuration.receive() => {
+                    model.notice = Some("Local configuration result available".to_owned());
                     redraw = true;
                 }
                 result = &mut signal => {
@@ -304,11 +310,50 @@ async fn run_interactive(options: GatewayOptions, no_color: bool) -> io::Result<
     drop(input_thread);
     let restore_result = terminal.restore();
     worker.shutdown().await;
+    if model.local_configuration.is_pending() {
+        model.local_configuration.receive().await;
+        let receipt = diagnostics::sanitize(&model.local_configuration.lines().join("\n"));
+        std::io::Write::write_all(&mut stdout, format!("{receipt}\n").as_bytes())?;
+    }
     loop_result.and(restore_result)
+}
+
+fn local_configuration_input(command: &str) -> Option<&str> {
+    let trimmed = command.trim_start();
+    let (name, rest) = trimmed
+        .split_once(char::is_whitespace)
+        .unwrap_or((trimmed, ""));
+    name.eq_ignore_ascii_case("config-provider")
+        .then_some(rest.trim())
+}
+
+fn palette_limit(command: &str) -> usize {
+    if local_configuration_input(command).is_some() {
+        local_configuration::MAX_COMMAND_BYTES + 32
+    } else {
+        MAX_PALETTE_BYTES
+    }
 }
 
 fn handle_input(model: &mut AppModel, event: &Event, commands: &mpsc::Sender<UiCommand>) -> bool {
     if let Event::Paste(text) = event {
+        if model.palette_open {
+            let length = model.palette.len().saturating_add(text.len());
+            if length <= local_configuration::MAX_COMMAND_BYTES + 32
+                && !text.chars().any(|character| {
+                    character.is_control() && !matches!(character, '\n' | '\r' | '\t')
+                })
+            {
+                let candidate = format!("{}{text}", model.palette);
+                if candidate.len() <= palette_limit(&candidate) {
+                    model.palette = candidate;
+                    return false;
+                }
+            }
+            model.notice =
+                Some("Command paste exceeds its limit or contains unsupported controls".to_owned());
+            return false;
+        }
         if model.composer_open && model.prompt.is_none() && !model.palette_open {
             let limit = model
                 .memory_draft
@@ -466,7 +511,9 @@ fn handle_input(model: &mut AppModel, event: &Event, commands: &mpsc::Sender<UiC
         KeyCode::Char('y') => resolve_prompt(model, commands, true),
         KeyCode::Char('n') => resolve_prompt(model, commands, false),
         KeyCode::Char('r') => {
-            if queue_command(model, commands, UiCommand::Refresh) {
+            if model.screen == Screen::Models {
+                model_catalogue_command(model, commands, "models");
+            } else if queue_command(model, commands, UiCommand::Refresh) {
                 model.notice = Some("Refreshing sessions...".to_owned());
             }
         }
@@ -475,7 +522,7 @@ fn handle_input(model: &mut AppModel, event: &Event, commands: &mpsc::Sender<UiC
             model.palette_open = true;
         }
         KeyCode::Char('?') => model.screen = Screen::Help,
-        KeyCode::Char(character @ '1'..='6') => {
+        KeyCode::Char(character @ '1'..='7') => {
             let index = usize::from(character as u8 - b'1');
             model.screen = Screen::ALL[index];
             model.scroll = 0;
@@ -504,13 +551,27 @@ fn handle_palette(
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
-            if !push_bounded(&mut model.palette, character, MAX_PALETTE_BYTES) {
-                model.notice = Some(format!("Command limit reached ({MAX_PALETTE_BYTES} bytes)"));
+            let limit = palette_limit(&model.palette);
+            if !push_bounded(&mut model.palette, character, limit) {
+                model.notice = Some(format!("Command limit reached ({limit} bytes)"));
             }
         }
         KeyCode::Enter => {
             let command = std::mem::take(&mut model.palette);
             model.palette_open = false;
+            if let Some(encoded) = local_configuration_input(&command) {
+                let catalogue = model
+                    .model_catalogue
+                    .as_ref()
+                    .filter(|_| model.connection_id.is_some() && model.pending_catalogue.is_none());
+                model.notice = Some(match model.local_configuration.begin(encoded, catalogue) {
+                    Ok(()) => "Local configuration task started; source is not modified".to_owned(),
+                    Err(message) => message.to_owned(),
+                });
+                model.screen = Screen::Models;
+                model.scroll = 0;
+                return false;
+            }
             if command
                 .split_whitespace()
                 .next()
@@ -526,6 +587,11 @@ fn handle_palette(
                 "run" => native_run_command(model, commands, false),
                 "partial" => partial_page_command(model, commands, false),
                 "partial-next" => partial_page_command(model, commands, true),
+                "accounting" => accounting_page_command(model, commands, false),
+                "accounting-next" => accounting_page_command(model, commands, true),
+                "models" | "models-next" | "models-status" | "refresh-models" => {
+                    model_catalogue_command(model, commands, &command.trim().to_ascii_lowercase());
+                }
                 "retry-send" => {
                     if let Some(pending) = model
                         .pending_message
@@ -584,6 +650,12 @@ fn handle_palette(
                         | "run"
                         | "partial"
                         | "partial-next"
+                        | "accounting"
+                        | "accounting-next"
+                        | "models"
+                        | "models-status"
+                        | "models-next"
+                        | "refresh-models"
                         | "retry-send"
                         | "discard-send"
                         | "discard-draft"
@@ -843,7 +915,164 @@ fn partial_page_command(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>
     }
 }
 
+fn accounting_page_command(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>, next: bool) {
+    let Some(connection_id) = model.connection_id else {
+        model.notice = Some("Gateway is not ready".to_owned());
+        return;
+    };
+    let Some((session_id, run_id)) = model.active_run.clone() else {
+        model.notice = Some("No confirmed run is selected".to_owned());
+        return;
+    };
+    let Some((Some(turn), revision)) = model.active_run_version else {
+        model.notice = Some("A bound terminal run revision is required".to_owned());
+        return;
+    };
+    let Some(session) = model
+        .selected_session()
+        .filter(|session| session.id == session_id)
+    else {
+        return;
+    };
+    let state = session.state;
+    if !matches!(
+        state,
+        model::RunState::Completed
+            | model::RunState::CompletedWithChanges
+            | model::RunState::Failed
+            | model::RunState::Cancelled
+            | model::RunState::OutcomeUnknown
+    ) {
+        model.notice = Some("The selected run has not reached a terminal state".to_owned());
+        return;
+    }
+    let request = if next {
+        let Some(page) = model.accounting_page.as_ref().filter(|page| {
+            page.request.connection_id == connection_id
+                && page.request.session_id == session_id
+                && page.request.run_id == run_id
+                && page.request.turn == turn
+                && page.request.revision == revision
+                && page.request.state == state
+        }) else {
+            model.notice = Some("No accounting continuation is selected".to_owned());
+            return;
+        };
+        let Some(offset) = page.next_offset else {
+            model.notice = Some("End of provider accounting snapshot".to_owned());
+            return;
+        };
+        gateway::AccountingPageRequest {
+            offset,
+            total_rounds: Some(page.total_rounds),
+            sha256: Some(page.sha256.clone()),
+            summary: Some(page.summary.clone()),
+            ..page.request.clone()
+        }
+    } else {
+        gateway::AccountingPageRequest {
+            connection_id,
+            session_id,
+            run_id,
+            revision,
+            turn,
+            state,
+            offset: 0,
+            total_rounds: None,
+            sha256: None,
+            summary: None,
+        }
+    };
+    if queue_command(model, commands, UiCommand::ReadAccounting(request)) {
+        model.screen = Screen::Workspace;
+        model.notice = Some("Reading provider accounting".to_owned());
+    }
+}
+
+fn model_catalogue_command(
+    model: &mut AppModel,
+    commands: &mpsc::Sender<UiCommand>,
+    command: &str,
+) {
+    if model.pending_catalogue.is_some() {
+        model.notice = Some("A model catalogue request is still in progress".to_owned());
+        return;
+    }
+    let Some(connection_id) = model.connection_id else {
+        model.notice = Some("Gateway is not ready; no catalogue request was sent".to_owned());
+        return;
+    };
+    let action = if command == "models-status" {
+        gateway::ModelCatalogueAction::Availability
+    } else if command == "models" {
+        gateway::ModelCatalogueAction::Read {
+            offset: 0,
+            sha256: None,
+        }
+    } else {
+        let Some(page) = model
+            .model_catalogue
+            .as_ref()
+            .filter(|page| page["available"] == true)
+        else {
+            model.notice = Some("No observed model catalogue is available".to_owned());
+            return;
+        };
+        let Some(digest) = page["sha256"].as_str() else {
+            return;
+        };
+        if command == "models-next" {
+            let Some(offset) = page["nextOffset"]
+                .as_u64()
+                .and_then(|offset| usize::try_from(offset).ok())
+            else {
+                model.notice = Some("End of cached model catalogue".to_owned());
+                return;
+            };
+            gateway::ModelCatalogueAction::Read {
+                offset,
+                sha256: Some(digest.to_owned()),
+            }
+        } else if command == "refresh-models" {
+            gateway::ModelCatalogueAction::Refresh {
+                sha256: digest.to_owned(),
+            }
+        } else {
+            return;
+        }
+    };
+    let Some(sequence) = model.catalogue_sequence.checked_add(1) else {
+        model.notice = Some("Model catalogue request capacity exhausted".to_owned());
+        return;
+    };
+    let request = gateway::ModelCatalogueRequest {
+        connection_id,
+        sequence,
+        action,
+    };
+    if queue_command(model, commands, UiCommand::ModelCatalogue(request.clone())) {
+        model.catalogue_sequence = sequence;
+        model.pending_catalogue = Some(request);
+        model.screen = Screen::Models;
+        model.scroll = 0;
+        model.notice = Some(
+            if command == "refresh-models" {
+                "Refreshing provider catalogue"
+            } else {
+                "Reading cached model catalogue"
+            }
+            .to_owned(),
+        );
+    }
+}
+
 fn load_screen(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>) {
+    if model.screen == Screen::Models {
+        if model.model_catalogue.is_none() {
+            model_catalogue_command(model, commands, "models");
+        }
+        return;
+    }
     let Some(session) = model.selected_session() else {
         return;
     };
@@ -851,7 +1080,7 @@ fn load_screen(model: &mut AppModel, commands: &mpsc::Sender<UiCommand>) {
         Screen::Workspace => Some(UiCommand::SelectSession(session.id.clone())),
         Screen::Diff => Some(UiCommand::LoadDiff(session.id.clone())),
         Screen::Artifacts => Some(UiCommand::LoadArtifacts(session.id.clone())),
-        Screen::Sessions | Screen::Runs | Screen::Help => None,
+        Screen::Sessions | Screen::Runs | Screen::Help | Screen::Models => None,
     };
     if let Some(command) = command {
         let _ = queue_command(model, commands, command);
@@ -926,6 +1155,67 @@ fn previous_screen(model: &mut AppModel) {
 
 fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
     match event {
+        WorkerEvent::ModelCatalogue { request, result } => {
+            if model.connection_id != Some(request.connection_id)
+                || model.pending_catalogue.as_ref() != Some(&request)
+            {
+                return;
+            }
+            model.pending_catalogue = None;
+            match result {
+                Err(error) => {
+                    model.notice = Some(bounded_owned(
+                        crate::diagnostics::sanitize(&error),
+                        MAX_NOTICE_BYTES,
+                    ));
+                }
+                Ok(page) => match request.action {
+                    gateway::ModelCatalogueAction::Availability => {
+                        model.model_catalogue = Some(page);
+                        model.notice = Some("Provider catalogue status received".to_owned());
+                        model.scroll = 0;
+                    }
+                    gateway::ModelCatalogueAction::Read { offset, .. } => {
+                        if offset > 0
+                            && model.model_catalogue.as_ref().is_none_or(|previous| {
+                                previous["nextOffset"].as_u64() != u64::try_from(offset).ok()
+                                    || [
+                                        "provider",
+                                        "providerGeneration",
+                                        "selectedModel",
+                                        "selectionPinned",
+                                        "observedAtMs",
+                                        "totalModels",
+                                        "sha256",
+                                        "source",
+                                    ]
+                                    .iter()
+                                    .any(|field| previous[field] != page[field])
+                            })
+                        {
+                            model.notice =
+                                Some("Model catalogue changed; previous page preserved".to_owned());
+                            return;
+                        }
+                        model.notice = Some(
+                            if page["available"] == true {
+                                "Cached model catalogue received"
+                            } else {
+                                "Provider catalogue is unavailable"
+                            }
+                            .to_owned(),
+                        );
+                        model.model_catalogue = Some(page);
+                        model.scroll = 0;
+                    }
+                    gateway::ModelCatalogueAction::Refresh { .. } => {
+                        model.model_catalogue = None;
+                        model.notice =
+                            Some("Catalogue refreshed; model selection unchanged".to_owned());
+                    }
+                },
+            }
+        }
         WorkerEvent::Accepted {
             session_id,
             run_id,
@@ -955,6 +1245,8 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
             {
                 model.active_run = Some((session_id, run_id));
                 model.active_run_version = None;
+                model.accounting_page = None;
+                model.provider_accounting = None;
             }
             model.notice = Some("Message accepted durably".to_owned());
         }
@@ -990,6 +1282,39 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
                     format!("Not sent: {}", bounded_owned(reason, MAX_NOTICE_BYTES / 2))
                 });
             }
+        }
+        WorkerEvent::AccountingPage(page) => {
+            if model.connection_id != Some(page.request.connection_id)
+                || model.selected_session().is_none_or(|session| {
+                    session.id != page.request.session_id || session.state != page.request.state
+                })
+                || model.active_run.as_ref().is_none_or(|(session, run)| {
+                    *session != page.request.session_id || *run != page.request.run_id
+                })
+                || model.active_run_version
+                    != Some((Some(page.request.turn), page.request.revision))
+            {
+                return;
+            }
+            if page.request.offset > 0
+                && model.accounting_page.as_ref().is_none_or(|previous| {
+                    previous.next_offset != Some(page.request.offset)
+                        || previous.sha256 != page.sha256
+                        || previous.summary != page.summary
+                        || previous.total_rounds != page.total_rounds
+                        || previous.request.run_id != page.request.run_id
+                        || previous.request.revision != page.request.revision
+                })
+            {
+                return;
+            }
+            model.provider_accounting = Some(page.summary.clone());
+            model.notice = Some(format!(
+                "Provider rounds {}..{} of {}",
+                page.request.offset, page.end_offset, page.total_rounds
+            ));
+            model.accounting_page = Some(page);
+            model.scroll = 0;
         }
         WorkerEvent::PartialPage(mut page) => {
             if model.selected_session().is_none_or(|session| {
@@ -1095,6 +1420,7 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
                     }
                 }
                 model.partial_page = None;
+                model.accounting_page = None;
                 model.active_run = Some((session_id, run_id));
                 model.active_run_version = Some((turn, revision));
                 model.provider_accounting = provider_accounting;
@@ -1114,6 +1440,8 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
         WorkerEvent::ResultAcknowledged { .. } => {}
         WorkerEvent::Connection(connection) => {
             model.clear_session_view();
+            model.model_catalogue = None;
+            model.pending_catalogue = None;
             model.connection_id = None;
             if let Some(pending) = model.pending_message.as_mut() {
                 pending.may_have_been_sent |= !pending.unconfirmed;
@@ -1126,6 +1454,10 @@ fn apply_worker_event(model: &mut AppModel, event: WorkerEvent) {
             connection_id,
             description,
         } => {
+            if model.connection_id != Some(connection_id) {
+                model.model_catalogue = None;
+                model.pending_catalogue = None;
+            }
             model.connection_id = Some(connection_id);
             model.connection = bounded_owned(description, MAX_NOTICE_BYTES);
         }
@@ -1415,6 +1747,103 @@ const fn help_text() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn local_configuration_palette_drives_files_without_gateway_commands_or_acks() {
+        use crate::{handle_input, local_configuration::MAX_COMMAND_BYTES};
+        use serde_json::json;
+        struct OwnedRoot(std::path::PathBuf);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = OwnedRoot(std::env::temp_dir().join(format!(
+                "claw-tui-palette-config-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            )));
+        std::fs::create_dir(&root.0).expect("owned root");
+        let source = root.0.join("source with spaces.json5");
+        let destination = root.0.join("candidate.json5");
+        let original=json!({"schema_version":1,"core":{"role":{"source_url":"http://127.0.0.1:9/role"},"channels":{"teams":{"enabled":false}},
+            "auth":{},"server":{},"logging":{},"sessions":{},"copilot":{},"legacy":{},"updates":{},"admin":{},"network":{},
+            "provider":{"kind":"openai","model":"before","api_key":"env:TUI_PRIVATE_REFERENCE"}}}).to_string();
+        std::fs::write(&source, &original).expect("source");
+        let mut model = AppModel {
+            palette_open: true,
+            palette: "config-provider ".to_owned(),
+            ..AppModel::default()
+        };
+        let (commands, mut queued) = tokio::sync::mpsc::channel(4);
+        let inspect = json!({"action":"inspect","source":source}).to_string();
+        assert!(!handle_input(
+            &mut model,
+            &crossterm::event::Event::Paste(inspect),
+            &commands
+        ));
+        let enter = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(!handle_input(&mut model, &enter, &commands));
+        assert!(model.local_configuration.is_pending());
+        assert_eq!(model.screen, Screen::Models);
+        assert!(queued.try_recv().is_err());
+        model.local_configuration.receive().await;
+        model.connection_id = Some(1);
+        model.model_catalogue = Some(
+            json!({"available":true,"provider":"openai","selectedModel":"before","models":[{"id":"before"},{"id":"after"}]}),
+        );
+        let prepare = format!(
+            "config-provider {}",
+            json!({"action":"prepare","source":source,"destination":destination,"model":"after"})
+        );
+        model.palette_open = true;
+        model.palette = prepare.clone();
+        assert!(!handle_input(&mut model, &enter, &commands));
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::Connection("disconnected".to_owned()),
+        );
+        assert!(
+            model.local_configuration.is_pending(),
+            "disconnect cannot detach a local candidate task"
+        );
+        model.local_configuration.receive().await;
+        assert!(destination.exists());
+        assert_eq!(
+            std::fs::read_to_string(&source).expect("source preserved"),
+            original
+        );
+        assert!(
+            model
+                .local_configuration
+                .lines()
+                .join("\n")
+                .contains("not applied")
+        );
+        assert!(model.pending_acks.is_empty() && model.transcript.is_empty());
+        assert!(queued.try_recv().is_err());
+        model.palette_open = true;
+        model.palette = prepare;
+        assert!(!handle_input(&mut model, &enter, &commands));
+        assert!(
+            !model.local_configuration.is_pending(),
+            "stale disconnected catalogue cannot authorize another candidate"
+        );
+        model.palette_open = true;
+        model.palette = "config-provider ".to_owned();
+        handle_input(
+            &mut model,
+            &crossterm::event::Event::Paste("x".repeat(MAX_COMMAND_BYTES + 33)),
+            &commands,
+        );
+        assert_eq!(model.palette, "config-provider ");
+    }
+
     #[test]
     fn native_session_events_and_selection_cannot_mix_views_or_acknowledgements() {
         use crate::model::{RunState, ToolActivity};
@@ -1550,6 +1979,277 @@ mod tests {
             WorkerEvent::Connection("reconnecting".to_owned()),
         );
         assert!(model.transcript.is_empty());
+    }
+
+    #[test]
+    fn model_catalogue_view_pins_requests_preserves_failures_and_never_acknowledges_chat() {
+        use crate::{gateway::ModelCatalogueAction, model_catalogue_command};
+        use serde_json::json;
+        let mut model = AppModel {
+            connection_id: Some(1),
+            ..AppModel::default()
+        };
+        let (commands, mut queued) = tokio::sync::mpsc::channel(4);
+        model_catalogue_command(&mut model, &commands, "models");
+        let first_request = model.pending_catalogue.clone().expect("pending catalogue");
+        assert_eq!(
+            queued.try_recv().expect("one read"),
+            UiCommand::ModelCatalogue(first_request.clone()).for_connection(1)
+        );
+        assert_eq!(model.screen, Screen::Models);
+        model_catalogue_command(&mut model, &commands, "models");
+        assert!(queued.try_recv().is_err(), "only one pending request");
+        let first = json!({"available":true,"provider":"fixture","providerGeneration":1,"selectedModel":"fixture-0","selectionPinned":true,
+            "observedAtMs":123,"source":"provider_sdk_catalogue","sha256":"a".repeat(64),"offset":0,"nextOffset":8,"endOffset":8,"totalModels":9,"models":[]});
+        let mut stale = first_request.clone();
+        stale.sequence += 1;
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::ModelCatalogue {
+                request: stale,
+                result: Ok(first.clone()),
+            },
+        );
+        assert!(model.model_catalogue.is_none());
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::ModelCatalogue {
+                request: first_request,
+                result: Ok(first.clone()),
+            },
+        );
+        model_catalogue_command(&mut model, &commands, "models-next");
+        let next = model.pending_catalogue.clone().expect("continuation");
+        assert_eq!(
+            next.action,
+            ModelCatalogueAction::Read {
+                offset: 8,
+                sha256: Some("a".repeat(64))
+            }
+        );
+        let _ = queued.try_recv().expect("continuation queued");
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::ModelCatalogue {
+                request: next,
+                result: Err("Refused catalogue".to_owned()),
+            },
+        );
+        assert_eq!(model.model_catalogue, Some(first.clone()));
+        assert!(model.pending_catalogue.is_none());
+        model_catalogue_command(&mut model, &commands, "models-next");
+        let next = model
+            .pending_catalogue
+            .clone()
+            .expect("another explicit continuation");
+        let _ = queued.try_recv().expect("queued");
+        let mut changed = first.clone();
+        changed["providerGeneration"] = json!(2);
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::ModelCatalogue {
+                request: next,
+                result: Ok(changed),
+            },
+        );
+        assert_eq!(model.model_catalogue, Some(first));
+        model_catalogue_command(&mut model, &commands, "refresh-models");
+        let refresh = model.pending_catalogue.clone().expect("explicit refresh");
+        assert_eq!(
+            refresh.action,
+            ModelCatalogueAction::Refresh {
+                sha256: "a".repeat(64)
+            }
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::ModelCatalogue {
+                request: refresh.clone(),
+                result: Ok(json!({"refreshed":true})),
+            },
+        );
+        assert!(
+            model.model_catalogue.is_none(),
+            "refresh invalidates prior cursor"
+        );
+        assert!(
+            model.transcript.is_empty()
+                && model.pending_acks.is_empty()
+                && model.received_results.is_empty()
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::Ready {
+                connection_id: 2,
+                description: "reconnected".to_owned(),
+            },
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::ModelCatalogue {
+                request: refresh,
+                result: Ok(json!({"available":true})),
+            },
+        );
+        assert!(model.model_catalogue.is_none() && model.pending_catalogue.is_none());
+        while queued.try_recv().is_ok() {}
+        model_catalogue_command(&mut model, &commands, "models-status");
+        let status = model
+            .pending_catalogue
+            .clone()
+            .expect("explicit status query");
+        assert_eq!(status.action, ModelCatalogueAction::Availability);
+        assert_eq!(
+            queued.try_recv().expect("status queued"),
+            UiCommand::ModelCatalogue(status.clone()).for_connection(2)
+        );
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::ModelCatalogue {
+                request: crate::gateway::ModelCatalogueRequest {
+                    connection_id: 1,
+                    ..status.clone()
+                },
+                result: Ok(json!({"available":false,"unavailableReason":"retired"})),
+            },
+        );
+        assert!(model.model_catalogue.is_none());
+        let unavailable = json!({"available":false,"unavailableReason":"authentication_pending"});
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::ModelCatalogue {
+                request: status,
+                result: Ok(unavailable.clone()),
+            },
+        );
+        assert_eq!(model.model_catalogue, Some(unavailable.clone()));
+        model_catalogue_command(&mut model, &commands, "models-status");
+        let status = model.pending_catalogue.clone().expect("explicit retry");
+        apply_worker_event(
+            &mut model,
+            WorkerEvent::ModelCatalogue {
+                request: status,
+                result: Err("Status query unsupported".to_owned()),
+            },
+        );
+        assert_eq!(model.model_catalogue, Some(unavailable));
+        assert!(model.transcript.is_empty() && model.pending_acks.is_empty());
+    }
+
+    #[test]
+    fn accounting_pages_pin_connection_revision_and_cursor_without_acknowledgements() {
+        use crate::{
+            accounting_page_command,
+            gateway::{AccountingPage, AccountingPageRequest},
+            model::{RunState, SessionSummary},
+        };
+        use claw_protocol::native_accounting::{
+            AccountingSource, CounterCoverage, ObservedTokens, ProviderAccounting,
+        };
+        let mut model = AppModel {
+            connection_id: Some(1),
+            screen: Screen::Workspace,
+            sessions: vec![SessionSummary {
+                id: "selected".to_owned(),
+                state: RunState::OutcomeUnknown,
+                ..SessionSummary::default()
+            }],
+            active_run: Some(("selected".to_owned(), "a".repeat(64))),
+            active_run_version: Some((Some(2), 4)),
+            ..AppModel::default()
+        };
+        let (commands, mut queued) = tokio::sync::mpsc::channel(4);
+        accounting_page_command(&mut model, &commands, false);
+        let request = AccountingPageRequest {
+            connection_id: 1,
+            session_id: "selected".to_owned(),
+            run_id: "a".repeat(64),
+            revision: 4,
+            turn: 2,
+            state: RunState::OutcomeUnknown,
+            offset: 0,
+            total_rounds: None,
+            sha256: None,
+            summary: None,
+        };
+        assert_eq!(
+            queued.try_recv().expect("explicit read"),
+            UiCommand::ReadAccounting(request.clone()).for_connection(1)
+        );
+        let summary = ProviderAccounting {
+            recorded_rounds: 17,
+            complete_counter_rounds: 0,
+            partial_counter_rounds: 0,
+            unreported_rounds: 17,
+            coverage: CounterCoverage::Unreported,
+            observed_tokens: Some(ObservedTokens {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                cached_input_tokens: 0,
+                reasoning_tokens: 0,
+            }),
+            source: AccountingSource::ProviderJournal {
+                revision: 7,
+                closed: false,
+            },
+            attempts_may_be_unsent: Some(true),
+        };
+        let page = AccountingPage {
+            request,
+            end_offset: 16,
+            next_offset: Some(16),
+            total_rounds: 17,
+            sha256: "b".repeat(64),
+            summary,
+            rounds: Vec::new(),
+        };
+        apply_worker_event(&mut model, WorkerEvent::AccountingPage(page.clone()));
+        accounting_page_command(&mut model, &commands, true);
+        let next = AccountingPageRequest {
+            offset: 16,
+            total_rounds: Some(17),
+            sha256: Some(page.sha256.clone()),
+            summary: Some(page.summary.clone()),
+            ..page.request.clone()
+        };
+        assert_eq!(
+            queued.try_recv().expect("pinned next"),
+            UiCommand::ReadAccounting(next.clone()).for_connection(1)
+        );
+        let last = AccountingPage {
+            request: next,
+            end_offset: 17,
+            next_offset: None,
+            ..page.clone()
+        };
+        model.connection_id = Some(2);
+        apply_worker_event(&mut model, WorkerEvent::AccountingPage(last.clone()));
+        assert_eq!(model.accounting_page, Some(page.clone()));
+        accounting_page_command(&mut model, &commands, true);
+        assert!(queued.try_recv().is_err());
+        model.connection_id = Some(1);
+        model.active_run_version = Some((Some(2), 5));
+        apply_worker_event(&mut model, WorkerEvent::AccountingPage(last.clone()));
+        assert_eq!(model.accounting_page, Some(page.clone()));
+        model.active_run_version = Some((Some(2), 4));
+        let mut substituted = last.clone();
+        substituted.summary.source = AccountingSource::TerminalTurn;
+        apply_worker_event(&mut model, WorkerEvent::AccountingPage(substituted));
+        assert_eq!(model.accounting_page, Some(page));
+        apply_worker_event(&mut model, WorkerEvent::AccountingPage(last.clone()));
+        assert_eq!(model.accounting_page, Some(last.clone()));
+        accounting_page_command(&mut model, &commands, true);
+        assert!(queued.try_recv().is_err());
+        assert!(
+            model.pending_acks.is_empty()
+                && model.received_results.is_empty()
+                && model.transcript.is_empty()
+        );
+        assert_eq!(model.sessions[0].state, RunState::OutcomeUnknown);
+        model.clear_session_view();
+        apply_worker_event(&mut model, WorkerEvent::AccountingPage(last));
+        assert!(model.accounting_page.is_none());
     }
 
     #[test]

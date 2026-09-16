@@ -1,0 +1,242 @@
+{
+  "schemaVersion": 1,
+  "stage": "native-offline-provider-application-recovery-and-desktop-model-candidates",
+  "capturedOn": "2026-09-16",
+  "baseCommit": "c360c2b36d3df1bf998b83ac7d171f78a39aade8",
+  "upstreamCommit": "3a9d69db306cd7f081e06254cb89c4bcc14a7107",
+  "taskIds": ["M3-06", "M3-07.04", "M4-10", "M5-01", "M5-02.02"],
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "platform": "windows-x86_64",
+  "toolchain": "installed stable Rust 1.98.1",
+  "slintVersion": "1.17.1",
+  "cargoLockSha256": "03ae0a54ee93bb13ccaf84f53747742ef5fd48103ef6032b07e4793baeae7834",
+  "desktopCargoLockSha256": "010bfa56d6a6e3d3e6479c705dc6da6e6065ea8471d542c837eaa025459bbd20",
+  "sourceFiles": [
+    { "path": "apps/gta-claw-cli/Cargo.toml", "sha256": "1d6f85b3d43c323a6d5b6f787235de7dc548fbb4601be91fb70b76fe9052569c" },
+    { "path": "apps/gta-claw-cli/src/provider_config.rs", "sha256": "a37aa9399fe99fca5f6dbc9e8a7702159595670696c1d5a8506e9002b927102e" },
+    { "path": "apps/gta-claw-cli/src/lib.rs", "sha256": "a3224eaad0dd81de697a69847264112ce8ec393082e0dad01387e8a07092515b" },
+    { "path": "apps/gta-claw-cli/tests/foundation.rs", "sha256": "f226ed994144149d0ec3848eb87141d7d866e12800feb0196a5132f6517a53c6" },
+    { "path": "apps/gta-claw-daemon/tests/production_composition.rs", "sha256": "cfc87a5603890a1832ce5b4c18939a86a1930cd66ed84a3cd645c5b906756fd2" },
+    { "path": "crates/claw-config/src/lib.rs", "sha256": "10a57eec8027bcae8266c1849e8465e62ff4a007f57b1b19b0d0b71a6fa7ab43" },
+    { "path": "crates/claw-config/tests/configuration.rs", "sha256": "ef4391574a3cf86a1d1facea10785cb74aabc3c4a2d83efcb4ee8ac1c1ed9574" },
+    { "path": "crates/claw-platform/Cargo.toml", "sha256": "ed1c96d5b933d67b69140bbbca2b246eaf1a838b55015a1b324d56d81a34da46" },
+    { "path": "crates/claw-platform/src/lib.rs", "sha256": "b707678a64984fda68d702d2110208566674853fd0337600125f34140fb07d70" },
+    { "path": "crates/claw-platform/src/configuration.rs", "sha256": "0cab5e53af806c23ed624728d3883d45a5a910b75213230ff3fe0f837e86635f" },
+    { "path": "crates/claw-tools/src/sandbox.rs", "sha256": "7ba49c8ab1bacac5d445e38e9a9ed8359558ba322e61b67ff4771b66b51aee48" },
+    { "path": "desktop/apps/gta-claw-desktop/Cargo.toml", "sha256": "7b84774a7e0e3da147ca00492b0be19126a823da2614232e905458237b91a381" },
+    { "path": "desktop/apps/gta-claw-desktop/src/controller.rs", "sha256": "6c07f5ac8929c3eb258302834e07975232836da377ceb6c18d4d913cab5e9f87" },
+    { "path": "desktop/apps/gta-claw-desktop/src/main.rs", "sha256": "084f389f85107eb301e85b9e82f5f58462dfc2cf08a8ed363569e97cf6b71ec7" },
+    { "path": "desktop/apps/gta-claw-desktop/src/product_state.rs", "sha256": "b1f8dbb23a9f73bd235a3d975ceb87545b17f9e386d55fd62b2cc354389b5149" },
+    { "path": "desktop/apps/gta-claw-desktop/src/software_renderer_smoke.rs", "sha256": "5206092ccd592860094b226039a0baf080ea096ada92fdee06efec254a76c148" },
+    { "path": "desktop/apps/gta-claw-desktop/ui/app-window.slint", "sha256": "3fb6733e09836e920bef4214c7a9fa71dc66d21ea37004e94c444fd8fd8d78e9" },
+    { "path": "desktop/apps/gta-claw-desktop/ui/modules/product-shell.slint", "sha256": "5250e7ed780a5c6ccc923d2020969df8ef60e71c34e78e3bbe94afd61018b0ee" }
+  ],
+  "checks": [
+    {
+      "command": "cargo +stable test -p claw-tools -p claw-config -p claw-platform -p claw-provider-sdk -p claw-protocol -p gta-claw-cli -p gta-claw-daemon -p gta-claw-tui --all-targets --no-fail-fast --locked --offline -j 1",
+      "result": "passed", "exitCode": 0, "passed": 1087, "failed": 0, "ignored": 11, "testBinaries": 50,
+      "log": "target/native-provider-application-final-tests-20260916.log",
+      "sha256": "14e6258d52efb55286938ec473a4449cdd01fc26f9ae9f2a10a9b0d7c6d52476",
+      "scopeNote": "Includes earlier uncommitted configuration, catalogue, accounting and credential test increments. Ten ignored helper entries are invoked by their owning tests; the eleventh is the separately executed CLI-to-daemon integration below. The runtime initialization error line is the existing passing failure-injection test"
+    },
+    {
+      "command": "cargo +stable clippy -p claw-tools -p claw-config -p claw-platform -p claw-provider-sdk -p claw-protocol -p gta-claw-cli -p gta-claw-daemon -p gta-claw-tui --all-targets --locked --offline -j 1 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-provider-application-final-clippy-20260916.log",
+      "sha256": "38272488dbbf34e30a7022942c5c3d0f9f42943ecc481e2b73e414a58c29cd08"
+    },
+    {
+      "command": "cargo +stable check --workspace --all-targets --locked --offline -j 1",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-provider-application-final-check-20260916.log",
+      "sha256": "39ce96180ad7f6a0e3091fbe04e4269c01f37228185fd2fd13e99241633e3108"
+    },
+    {
+      "command": "cargo +stable test --manifest-path desktop/Cargo.toml -p gta-claw-desktop --all-targets --no-fail-fast --locked --offline -j 1 --config profile.test.package.gta-claw-desktop.debug=0 --config profile.test.package.gta-claw-desktop.codegen-units=16",
+      "result": "passed", "exitCode": 0, "passed": 96, "failed": 0, "ignored": 0,
+      "log": "target/native-provider-application-desktop-final-tests-20260916.log",
+      "sha256": "a48bcbbb8b684bbbc5ff2e60cfe1deec072b6338ce08aeabb6c942d0caa3a5fd",
+      "artifact": "desktop/target/debug/deps/gta_claw_desktop-570736a4c9147cfe.exe",
+      "artifactSha256": "44f4bf1b589140c7688b4d89d8e0dff78d0e954bfb59063b655611c6332060fc",
+      "scopeNote": "Windows native tests and headless Slint software renderer. macOS harness is not macOS execution on Windows. Compiler memory flags are invocation-local, not repository profile changes"
+    },
+    {
+      "command": "cargo +stable clippy --manifest-path desktop/Cargo.toml -p gta-claw-desktop --all-targets --locked --offline -j 1 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-provider-application-desktop-final-clippy-20260916.log",
+      "sha256": "9fecbf4a555759dbfe86cb415d6754ad41891b43e1771e523370b1ce36a2f89a"
+    },
+    {
+      "command": "cargo +stable build -p gta-claw-cli --locked --offline -j 1; GTA_CLAW_TEST_PROVIDER_CLI=<absolute built CLI>; cargo +stable test -p gta-claw-daemon --test production_composition bound_cli_provider_model_prepare_apply_and_daemon_start_use_the_saved_selection --locked --offline -j 1 -- --ignored --exact",
+      "result": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0,
+      "log": "target/native-provider-application-integration-20260916.log",
+      "sha256": "6fe6630e4076e79c754d2fd6fde20c3cea7824de908290d7a3608cc554733d29",
+      "scopeNote": "Three actual CLI inspect/prepare --model/apply subprocess workflows followed by a new isolated daemon start and real local HTTP/Gateway requests. This is not an automatic daemon restart or a real account test. Later source changes were formatting, Windows-only helper cfg and unrelated diagnostic assertions"
+    }
+  ],
+  "behaviorEvidence": [
+    "provider_config_apply_requires_two_digests_backup_and_explicit_confirmation",
+    "exclusive_maintenance_handles_refuse_read_write_rename_and_existing_owners",
+    "provider_config_cli_apply_is_reviewed_backed_up_and_never_activates_a_provider",
+    "provider_config_write_failures_preserve_backup_and_report_source_uncertainty",
+    "provider_config_process_interruptions_keep_exact_backup_and_support_reviewed_restore",
+    "provider_model_edit_keeps_identity_credentials_limits_and_original_snapshot",
+    "provider_config_cli_prepares_verified_new_files_without_network_secrets_or_source_changes",
+    "bound_native_providers_use_rust_http_clients_and_preserve_explicit_selection",
+    "bound_cli_provider_model_prepare_apply_and_daemon_start_use_the_saved_selection",
+    "local_model_candidate_state_binds_source_catalogue_and_preserves_receipts_across_reset",
+    "local_configuration_controller_creates_candidates_without_gateway",
+    "local_configuration_shutdown_waits_for_started_work_and_reports_once",
+    "native_local_model_editor_callbacks_create_a_verified_candidate_without_applying",
+    "native_model_catalogue_renders_cached_metadata_and_control_states_at_two_sizes",
+    "lost_local_configuration_receipts_release_busy_and_reject_late_results"
+  ],
+  "retainedFailures": [
+    {
+      "reason": "First apply parser test failed because the command did not exist. Added the explicit mode and mandatory dual hashes/backup/confirmation; later added a separate offline confirmation and restore confirmation. Identical focused checks passed"
+    },
+    {
+      "reason": "Test fixtures initially parsed JSON5 as JSON or omitted full core fields, and a sync/async Cursor read was ambiguous. Fixed test setup/call disambiguation without relaxing schema or changing validation. Slint initially used an unimported LineEdit and was changed to the existing TextField component"
+    },
+    {
+      "reason": "A deterministic desktop test proved a stale model index was accepted after moving to another page sharing the same whole-catalogue digest. Added page offset/end to generation/epoch/SHA binding; same test then passed. Hidden-form binding changes also reset selection"
+    },
+    {
+      "reason": "Initial combined run had 1086 passes and one existing OAuth status failure: after writing a corrupt test-owned native record, CLI status unexpectedly succeeded (foundation.rs:909 in that snapshot). Added pre-child presence and sanitized returned-state diagnostics only. Focused and final combined passes do not establish a credential backend fix",
+      "log": "target/native-provider-application-tests-20260916.log",
+      "sha256": "8a8b281ab8c02e5d5bdb521dde533ddff45ffaeeaa81240fe0ad0d814ad9b383"
+    },
+    {
+      "reason": "New platform-local dependency edges required an offline lock update. Desktop libc 0.2.186 conflicted with the existing claw-tools exact 0.2.189 dependency; aligned only libc and added already root-locked configuration dependencies. No dependency downloads or policy waivers"
+    },
+    {
+      "reason": "Desktop dependency rebuilds moved two synchronous tests into background terminals. Old notification included shell history; actual final lines were checked, first schema fixture failed then passed after repair, latest callback test passed. Another joint command had no output and no log/process after terminal cleanup; it was not claimed executed and was later run with independent logs. Both owned background executions are complete"
+    }
+  ],
+  "notes": [
+    "Windows config provider apply requires current source and candidate SHA256, a new backup and both --confirm-apply and --confirm-offline. Only the Provider domain may change. It refuses unchanged selection, invalid input, source drift, candidate drift, unrelated domains, read-only source, existing file owners, hard links, unsafe parents, oversize data and existing backup",
+    "The exact source/candidate handles and directory pins remain held. New backup bytes are synchronized and read back before source mutation. Source is overwritten, length-adjusted, synchronized and read back on the original held handle. This preserves identity/ACLs but is non-atomic and not power-loss safe; exclusive Windows data handles do not prove every configured daemon is stopped",
+    "Twenty real CLI scenarios include provider-only save, restoring a prior valid provider, full corrupt-source recovery, bad recovery input, no confirmations, held inputs, hard links, read-only source/candidate, oversized candidate and missing backup parent. Ten injected I/O failures plus a pre-write failure validate source uncertainty and no automatic rollback",
+    "Three independent child exits occur after verified backup, after twelve source bytes and after source synchronization. Parent reopens files, verifies exact original backup and retained residue, then explicitly restores a valid full configuration while preserving the residue in another new file. Process exit is not a physical-power-failure test",
+    "Restore is a separately confirmed full-snapshot operation, not a provider-only merge. It can recover an invalid source but requires a valid bounded reviewed candidate, both current digests and a new residue backup. All source-write uncertainties remain unknown; no retry, automatic rollback, daemon restart, environment overlay or secret resolution occurs",
+    "with_provider_model changes only an explicitly configured active provider model and revalidates the whole snapshot. Copilot/OpenAI/Anthropic tests preserve credential references, endpoint, protocol, timeout and zero/nonzero observed-token limits. CLI prepare --model and --selection-stdin are mutually exclusive",
+    "claw-platform native-config is an optional shared inspection/preparation service reused by CLI and Slint. Windows source/output are exclusive for operation lifetime; new candidate is read back and source is never mutated. No new provider authentication or catalogue claim is inferred. Unix/macOS prepare uses existing sandbox guarantees; apply/restore explicitly reject unsupported platforms before mutation",
+    "Slint adds a local source/path inspection and exact current-page model menu with full long-ID preview and a new candidate destination. Provider kind and current model must match the observed catalogue, but Gateway file/account/endpoint association is not proven and must be independently reviewed. There is no graphical online switch or direct apply button",
+    "Desktop file work is independent of Gateway RPC and runs off the UI thread. One local task is admitted, started tasks are drained on normal shutdown, generation reset preserves local pending/results, and lost UI result queues release busy state with explicit outcome unknown. Stale sequence, connection, page or source hash cannot silently redirect a candidate. Candidate files are never deleted on an uncertain result",
+    "Actual Slint callback-to-controller-to-file test verifies inspection and candidate creation without a Gateway connection, preserves source and rejects stale selection after disconnect. Software pixels at 1080x720 and 720x520 cover 252-byte model ID, wrapping preview, disabled controls and clearing a hidden editor's old index. These are not physical user/platform acceptance",
+    "Source/checkpoint comparisons include all current core configuration domains. The existing provider fixed-model, permission, observed-budget, result ACK and v1 ordered JSON contracts remain unchanged. No protected validator, release toolchain, sealed upstream contract or old ledger was edited",
+    "No real cloud/model account, paid inference, third-party channel, user configuration/state, device, live service, proxy, deployment or release was touched. All modified data files were temporary owned test fixtures. No git branch, commit or push was performed in this increment"
+  ],
+  "recovery": [
+    "Preserve source, candidate and every backup on failure or missing receipt. Inspect the current bytes and digests before choosing another explicit action; never recreate usage or configuration by replaying a model request",
+    "Before apply/restore, independently stop configuration readers/writers and explicitly confirm offline maintenance. CLI cannot attest idle state or stop consumers. No application command should target user data without those explicit reviewed paths and hashes",
+    "If source is valid, use inspect plus a new candidate/backup for a provider-only change. If source is partial or invalid, compute its current residual SHA externally and restore a full valid reviewed backup with --confirm-restore --confirm-offline and a new residual backup path",
+    "A saved configuration requires separate --check-config and controlled daemon start/restart to verify real credentials, independent origin policy and actual model readiness. Windows directory durability and physical power loss remain unverified"
+  ],
+  "unverified": [
+    "Full online provider replacement/retirement, account changes, all-platform exclusive application and physical power loss",
+    "TUI local candidate editor, GUI direct apply/restore, browsing OS-native file dialogs and complete cross-platform user workflows",
+    "Authoritative association of a local configuration with a remote Gateway or its account/endpoint",
+    "Original and newly reproduced native credential/OAuth anomalies; no root-cause change was made",
+    "Alias semantics, complete capability enforcement, real accounts, billed budgets, migration, mobile clients, release policy and whole-project completion"
+  ],
+  "followups": [
+    {
+      "stage": "tui-local-model-candidates-and-copilot-catalogue-identity",
+      "capturedOn": "2026-09-16",
+      "result": "focused-clients-passed-joint-native-credential-failure-retained",
+      "sourceFrozen": false,
+      "completeBuildInputManifest": false,
+      "wholeProjectAccepted": false,
+      "supersedes": [
+        "The earlier TUI local candidate editor gap is implemented and verified on Windows in this follow-up; GUI direct apply and full online replacement remain open",
+        "Model-capability admission has separate evidence in docs/ledger/native-model-admission-20260916.json; neither increment is real-account capability acceptance"
+      ],
+      "cargoLockSha256": "03ae0a54ee93bb13ccaf84f53747742ef5fd48103ef6032b07e4793baeae7834",
+      "desktopCargoLockSha256": "010bfa56d6a6e3d3e6479c705dc6da6e6065ea8471d542c837eaa025459bbd20",
+      "sourceFiles": [
+        { "path": "apps/gta-claw-tui/Cargo.toml", "sha256": "f9bacbbb4d268bce3f89bb91a663d6485c253ea8e83c343b25cd9da4a02f76bb" },
+        { "path": "apps/gta-claw-tui/src/local_configuration.rs", "sha256": "4a2603c10a9aa9327d43458ff678ad9818623544e99fde0e6ecda25a31c7e7c6" },
+        { "path": "apps/gta-claw-tui/src/lib.rs", "sha256": "9331ed2a1eb700a5f9b5a2145a70197843a8ca06e8b9d34640c305a2018c8d48" },
+        { "path": "apps/gta-claw-tui/src/model.rs", "sha256": "8e1a9849988a82340d0cb3eed4deec9bd3dbe45f00d748daad2881218466d789" },
+        { "path": "apps/gta-claw-tui/src/render.rs", "sha256": "4a733aad595a7788f7e0f9d817f33d1de6df202d702a967ae400bd90e072d0d8" },
+        { "path": "apps/gta-claw-tui/src/gateway.rs", "sha256": "284f8d642dcca684eceaf28acc9d576facf537930b8d437a59df219c29cd89bd" },
+        { "path": "apps/gta-claw-tui/tests/rendering.rs", "sha256": "ea4e6b6574317a9fb69626a782dba49a02ea5c30e4d334ca5413cfee4eeae815" },
+        { "path": "crates/claw-config/src/model.rs", "sha256": "1e87071e012ac26c9c659bb6962769e082d2c5b3126d7600f943ddeb396b0fc5" },
+        { "path": "crates/claw-config/tests/configuration.rs", "sha256": "2136b86ca30796a4a52e92ddb6a6f4b3d834de7d914d1654318982f7c92ac205" },
+        { "path": "crates/claw-platform/src/configuration.rs", "sha256": "0cab5e53af806c23ed624728d3883d45a5a910b75213230ff3fe0f837e86635f" },
+        { "path": "desktop/apps/gta-claw-desktop/src/product_state.rs", "sha256": "c7b05f68cab410546d6ed7e7d6105a8dd71391cb86fda4fc6ac383415e21914b" }
+      ],
+      "checks": [
+        {
+          "command": "cargo +stable test -p gta-claw-tui -p claw-config --all-targets --no-fail-fast --locked --offline -j 1",
+          "result": "passed", "exitCode": 0, "passed": 192, "failed": 0, "ignored": 0, "testBinaries": 16,
+          "log": "target/native-model-local-clients-tests-20260916.log", "sha256": "85c8b92f2233b473a026d08eb3dee7199817dab1c8aff8c7163b6b15906b1aeb",
+          "scopeNote": "82 TUI tests and 110 configuration tests, including actual palette-to-file tasks, disconnect ownership and rendering at 20/40/80/120 columns by 10/24 rows"
+        },
+        {
+          "command": "cargo +stable clippy -p gta-claw-tui -p claw-config --all-targets --locked --offline -j 1 -- -D warnings",
+          "result": "passed", "exitCode": 0,
+          "log": "target/native-model-local-clients-clippy-20260916.log", "sha256": "d0994eaa0b5ca2216c3ff3fd35bb2315d72c1ff8d99cd5b34f98005b2c8a11a2"
+        },
+        {
+          "command": "cargo +stable test --manifest-path desktop/Cargo.toml -p gta-claw-desktop --all-targets --no-fail-fast --locked --offline -j 1 --config profile.test.package.gta-claw-desktop.debug=0 --config profile.test.package.gta-claw-desktop.codegen-units=16",
+          "result": "passed", "exitCode": 0, "passed": 97, "failed": 0, "ignored": 0, "testBinaries": 1,
+          "log": "target/native-model-local-desktop-final-tests-20260916.log", "sha256": "55bbc35602d7f9c9a3eef28ca2b637e7a061908ae41464119183f01063499302",
+          "scopeNote": "Includes the new Copilot SDK identity test and existing real local file callbacks and headless Slint software renderer; not physical macOS or device execution"
+        },
+        {
+          "command": "cargo +stable clippy --manifest-path desktop/Cargo.toml -p gta-claw-desktop --all-targets --locked --offline -j 1 -- -D warnings",
+          "result": "passed", "exitCode": 0,
+          "log": "target/native-model-local-desktop-final-clippy-20260916.log", "sha256": "c77f3b99f5694eeb56f4dea2ebfec95c9835f10db98faa655c5db248e8692ffc"
+        },
+        {
+          "command": "cargo +stable test -p claw-tools -p claw-config -p claw-platform -p claw-provider-sdk -p claw-protocol -p claw-providers -p claw-http-api -p gta-claw-cli -p gta-claw-daemon -p gta-claw-tui --all-targets --no-fail-fast --locked --offline -j 1",
+          "result": "failed", "exitCode": 101, "passed": 1460, "failed": 1, "ignored": 11, "testBinaries": 65,
+          "log": "target/native-model-workflow-joint-tests-20260916.log", "sha256": "df05b364013e88645add63adeee1a3038275e60cfb37347814f21dac0c30b82c",
+          "scopeNote": "native_mcp_keyring_rotation_and_deletion_revoke_before_connecting case 0 returned OutcomeUnknown instead of durable revocation; initialized=0 and calls=0. No backend change or clean joint-suite claim. Runtime initialization stderr is an unrelated passing failure-injection test"
+        },
+        {
+          "command": "cargo +stable test -p gta-claw-daemon --lib adapters::native_mcp::tests::native_mcp_keyring_rotation_and_deletion_revoke_before_connecting --locked --offline -j 1 -- --exact",
+          "result": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0, "testBinaries": 1,
+          "log": "target/native-model-workflow-mcp-recheck-20260916.log", "sha256": "d4feeffdb47f6b413923fae0a5821a4097387a4933ad14fa2485438aac25c910",
+          "scopeNote": "One focused package rebuild/recheck only; not the same feature-unified joint test binary and not a credential root-cause fix"
+        },
+        {
+          "command": "cargo +stable clippy -p claw-tools -p claw-config -p claw-platform -p claw-provider-sdk -p claw-protocol -p claw-providers -p claw-http-api -p gta-claw-cli -p gta-claw-daemon -p gta-claw-tui --all-targets --locked --offline -j 1 -- -D warnings",
+          "result": "passed", "exitCode": 0,
+          "log": "target/native-model-workflow-joint-clippy-20260916.log", "sha256": "0b4af4479fe35678ceeca3f29ee60d1af01be6c1bc7f8364c64709b06a90f8a1"
+        },
+        {
+          "command": "cargo +stable check --workspace --all-targets --locked --offline -j 1",
+          "result": "passed", "exitCode": 0,
+          "log": "target/native-model-workflow-joint-check-20260916.log", "sha256": "15d554af252350dc48578fa7fd9c05df01fa271e61995d69f4ffe642b23b042d"
+        }
+      ],
+      "behaviorEvidence": [
+        "local_commands_are_closed_bounded_and_keep_paths_as_data",
+        "local_model_candidates_pin_source_and_catalogue_without_modifying_originals",
+        "local_configuration_palette_drives_files_without_gateway_commands_or_acks",
+        "interrupted_local_result_wait_keeps_the_started_task_for_shutdown",
+        "local_configuration_receipts_render_long_ids_without_secrets_or_chat_results",
+        "provider_model_edit_keeps_identity_credentials_limits_and_original_snapshot",
+        "local_copilot_candidate_uses_the_sdk_catalogue_identity_not_config_spelling"
+      ],
+      "notes": [
+        "TUI config-provider accepts one closed JSON inspect/prepare object, at most 16 KiB, absolute local paths at most 4096 bytes and an exact model ID at most 256 bytes. No shell interpolation or Gateway command is used",
+        "Preparation binds the inspected source path/hash and exact ID on the current validated catalogue page; pending catalogue requests and disconnected selections are refused. Source provider/current model must match, with copilot mapped to github-copilot. Account, endpoint and remote-file association are not inferred",
+        "A single spawn_blocking JoinHandle belongs to AppModel, not the Gateway worker. Select cancellation retains the handle, disconnect retains task/results, and normal exit waits for a pending local task. Results do not become chat entries or ACKs",
+        "Shared file service creates a new synchronized/read-back candidate without changing source or resolving secrets. Metadata-only receipts wrap and scroll; file errors never automatically delete, overwrite, retry or apply a candidate",
+        "No downloads, real accounts, paid requests, user configuration mutations, live services, proxy operations, Git writes, deployment or device tests were performed"
+      ],
+      "unverified": [
+        "Local filesystem calls have no hard deadline, and forced process termination may leave a candidate without a durable receipt",
+        "GUI direct application/recovery, online provider retirement, account/endpoint association, non-Windows exclusive maintenance and physical user/platform acceptance",
+        "The retained joint native credential failure and all earlier OAuth/keyring intermittency remain unresolved; the focused pass does not close them",
+        "Pricing, monetary budgets, migration, mobile products, real accounts and release/whole-project acceptance"
+      ]
+    }
+  ]
+}

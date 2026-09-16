@@ -35,6 +35,439 @@ impl Drop for OAuthCoordinationRoot {
 }
 
 #[test]
+fn provider_config_cli_prepares_verified_new_files_without_network_secrets_or_source_changes() {
+    use serde_json::{Value, json};
+    use std::fmt::Write as _;
+    struct OwnedRoot(std::path::PathBuf);
+    impl Drop for OwnedRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = OwnedRoot(std::env::temp_dir().join(format!(
+            "gta-claw-config-cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        )));
+    std::fs::create_dir(&root.0).expect("owned candidate directory");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("no-network witness");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let origin = format!("http://{}", listener.local_addr().expect("address"));
+    let initial = claw_config::ConfigLayers::new().with_workspace_json5(json!({"core":{
+        "role":{"source_url":format!("{origin}/role")},"channels":{"teams":{"enabled":false}},
+        "provider":{"kind":"openai","model":"initial-model","api_key":"env:UNRESOLVED_CONFIG_TEST_KEY","base_url":format!("{origin}/v1/")}
+    }}).to_string()).resolve().expect("initial typed config").config;
+    let source = root.0.join("source.json5");
+    let original = claw_config::to_json5(&initial).expect("initial encoding");
+    std::fs::write(&source, &original).expect("source file");
+    let run = |action: &str,
+               destination: Option<&std::path::Path>,
+               digest: Option<&str>,
+               model: Option<&str>,
+               input: &[u8]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-cli"));
+        command.env_clear();
+        for name in ["SystemRoot", "SystemDrive", "WINDIR"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+            .args(["config", "provider", action, "--source"])
+            .arg(&source)
+            .arg("--json")
+            .env(
+                "GTA_CLAW_PROVIDER_POLICY",
+                "invalid-runtime-policy-must-not-be-applied",
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(destination) = destination {
+            command
+                .arg("--destination")
+                .arg(destination)
+                .args(["--expected-sha256", digest.expect("explicit digest")]);
+            if let Some(model) = model {
+                command.args(["--model", model]);
+            } else {
+                command.arg("--selection-stdin");
+            }
+        }
+        let mut child = command.spawn().expect("config CLI");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(input)
+            .expect("selection input");
+        let output = child.wait_with_output().expect("config CLI finished");
+        assert!(output.stderr.is_empty());
+        let text = String::from_utf8(output.stdout).expect("receipt UTF8");
+        assert!(
+            !text.contains("private-fixture-token") && !text.contains("UNRESOLVED_CONFIG_TEST_KEY")
+        );
+        (
+            output.status.success(),
+            serde_json::from_str::<Value>(&text).expect("JSON receipt"),
+        )
+    };
+    let (success, inspection) = run("inspect", None, None, None, &[]);
+    assert!(success, "{inspection}");
+    assert_eq!(inspection["selection"]["model"], "initial-model");
+    assert_eq!(inspection["environmentApplied"], false);
+    assert_eq!(inspection["credentialsResolved"], false);
+    let digest = inspection["sourceSha256"].as_str().expect("source SHA");
+    for scenario in [
+        "valid",
+        "disabled",
+        "changed-source",
+        "duplicate",
+        "literal",
+        "unknown",
+        "existing",
+        "invalid-endpoint",
+        "missing-github",
+        "exact-model",
+    ] {
+        let destination = root.0.join(format!("{scenario}.json5"));
+        if scenario == "existing" {
+            std::fs::write(&destination, b"keep-existing-config").expect("existing target");
+        }
+        let selection = match scenario {
+            "disabled" => r#"{"kind":"disabled"}"#.to_owned(),
+            "duplicate" => r#"{"kind":"openai","kind":"disabled"}"#.to_owned(),
+            "literal" => r#"{"kind":"openai","model":"model","api_key":"private-fixture-token"}"#.to_owned(),
+            "unknown" => r#"{"kind":"disabled","extra":"private-fixture-token"}"#.to_owned(),
+            "invalid-endpoint" => r#"{"kind":"openai","model":"model","api_key":"env:KEY","base_url":"https://user:private-fixture-token@example.test"}"#.to_owned(),
+            "missing-github" => r#"{"kind":"copilot","model":"model"}"#.to_owned(),
+            _ => json!({"kind":"anthropic","model":"candidate-model","api_key":"env:UNRESOLVED_CONFIG_TEST_KEY","base_url":origin,"credential_origin":origin,"request_timeout_ms":5000}).to_string(),
+        };
+        let bad_digest = "0".repeat(64);
+        let (success, receipt) = run(
+            "prepare",
+            Some(&destination),
+            Some(if scenario == "changed-source" {
+                &bad_digest
+            } else {
+                digest
+            }),
+            (scenario == "exact-model").then_some("Exact-Model:2026-09"),
+            selection.as_bytes(),
+        );
+        assert_eq!(
+            success,
+            matches!(scenario, "valid" | "disabled" | "exact-model"),
+            "{scenario}: {receipt}"
+        );
+        assert_eq!(receipt["sourceModified"], false);
+        assert_eq!(receipt["credentialsResolved"], false);
+        assert_eq!(receipt["networkContacted"], false);
+        assert_eq!(receipt["applied"], false);
+        assert_eq!(
+            std::fs::read_to_string(&source).expect("source preserved"),
+            original
+        );
+        if success {
+            let candidate = std::fs::read_to_string(&destination).expect("new candidate");
+            let parsed = claw_config::parse_json5(&candidate, "candidate.json5")
+                .expect("full candidate validates");
+            assert_eq!(
+                parsed.core().provider().expect("selection").kind(),
+                if scenario == "exact-model" {
+                    claw_config::ProviderKind::Openai
+                } else if scenario == "disabled" {
+                    claw_config::ProviderKind::Disabled
+                } else {
+                    claw_config::ProviderKind::Anthropic
+                }
+            );
+            if scenario == "exact-model" {
+                assert_eq!(
+                    parsed,
+                    claw_config::with_provider_model(&initial, "Exact-Model:2026-09")
+                        .expect("exact model only")
+                );
+                assert_eq!(receipt["modelOnly"], true);
+                assert_eq!(receipt["catalogueVerified"], false);
+            }
+            let mut file_sha = String::with_capacity(64);
+            for byte in ring::digest::digest(&ring::digest::SHA256, candidate.as_bytes()).as_ref() {
+                write!(file_sha, "{byte:02x}").expect("candidate digest");
+            }
+            assert_eq!(receipt["candidateSha256"], file_sha);
+            assert_eq!(receipt["restartRequired"], true);
+        } else if scenario == "existing" {
+            assert_eq!(
+                std::fs::read(&destination).expect("old target preserved"),
+                b"keep-existing-config"
+            );
+        } else {
+            assert!(!destination.exists(), "invalid candidate creates no file");
+        }
+        assert!(
+            matches!(listener.accept(),Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+}
+
+#[test]
+fn provider_config_cli_apply_is_reviewed_backed_up_and_never_activates_a_provider() {
+    use serde_json::{Value, json};
+    use std::fmt::Write as _;
+    struct OwnedRoot(std::path::PathBuf);
+    impl Drop for OwnedRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = OwnedRoot(std::env::temp_dir().join(format!(
+            "claw-config-apply-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        )));
+    std::fs::create_dir(&root.0).expect("owned directory");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("no network witness");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let origin = format!("http://{}", listener.local_addr().expect("address"));
+    let initial = claw_config::ConfigLayers::new().with_workspace_json5(json!({"core":{
+        "role":{"source_url":format!("{origin}/role")},"channels":{"teams":{"enabled":false}},
+        "provider":{"kind":"openai","model":"first","api_key":"env:PRIVATE_APPLY_REFERENCE","base_url":format!("{origin}/v1/")}
+    }}).to_string()).resolve().expect("typed initial").config;
+    let original = claw_config::to_json5(&initial).expect("original");
+    let candidate_config =
+        claw_config::with_provider_json(&initial, r#"{"kind":"disabled"}"#).expect("candidate");
+    let candidate_text = claw_config::to_json5(&candidate_config).expect("encoded candidate");
+    let hash = |bytes: &[u8]| {
+        let mut digest = String::with_capacity(64);
+        for byte in ring::digest::digest(&ring::digest::SHA256, bytes).as_ref() {
+            write!(digest, "{byte:02x}").expect("digest");
+        }
+        digest
+    };
+    for scenario in [
+        "valid",
+        "restore",
+        "recover-corrupt",
+        "recover-bad-candidate",
+        "source-drift",
+        "candidate-drift",
+        "unrelated",
+        "invalid",
+        "backup-exists",
+        "no-confirm",
+        "no-offline",
+        "same-selection",
+        "source-held",
+        "candidate-held",
+        "source-hardlink",
+        "candidate-hardlink",
+        "source-readonly",
+        "candidate-readonly",
+        "candidate-oversize",
+        "backup-parent-missing",
+    ] {
+        let directory = root.0.join(scenario);
+        std::fs::create_dir(&directory).expect("case directory");
+        let source = directory.join("source.json5");
+        let candidate = directory.join("candidate.json5");
+        let backup = directory.join(if scenario == "backup-parent-missing" {
+            "missing/backup.json5"
+        } else {
+            "backup.json5"
+        });
+        let source_contents = if scenario.starts_with("recover-") {
+            "partial-crash-residue"
+        } else if scenario == "restore" {
+            &candidate_text
+        } else {
+            &original
+        };
+        let mut candidate_contents = if matches!(scenario, "restore" | "same-selection")
+            || scenario.starts_with("recover-")
+        {
+            original.clone()
+        } else {
+            candidate_text.clone()
+        };
+        if scenario == "unrelated" {
+            let changed = claw_config::ConfigLayers::new().with_workspace_json5(json!({"core":{
+                "role":{"source_url":format!("{origin}/role")},"channels":{"teams":{"enabled":false}},
+                "provider":{"kind":"disabled"},"logging":{"level":"debug"}
+            }}).to_string()).resolve().expect("unrelated change").config;
+            candidate_contents =
+                claw_config::to_json5(&changed).expect("encoded changed configuration");
+        } else if matches!(scenario, "invalid" | "recover-bad-candidate") {
+            candidate_contents = "invalid-private-config".to_owned();
+        }
+        if scenario == "candidate-oversize" {
+            candidate_contents = " ".repeat(4 * 1024 * 1024 + 1);
+        }
+        std::fs::write(&source, source_contents).expect("source");
+        std::fs::write(&candidate, &candidate_contents).expect("candidate");
+        if scenario == "backup-exists" {
+            std::fs::write(&backup, b"keep-existing").expect("old backup");
+        }
+        if matches!(scenario, "source-hardlink" | "candidate-hardlink") {
+            std::fs::hard_link(
+                if scenario == "source-hardlink" {
+                    &source
+                } else {
+                    &candidate
+                },
+                directory.join("alias.json5"),
+            )
+            .expect("owned hard link");
+        }
+        let held = match scenario {
+            "source-held" => Some(std::fs::File::open(&source).expect("existing reader")),
+            "candidate-held" => {
+                Some(std::fs::File::open(&candidate).expect("existing candidate reader"))
+            }
+            _ => None,
+        };
+        let readonly_path = match scenario {
+            "source-readonly" => Some(&source),
+            "candidate-readonly" => Some(&candidate),
+            _ => None,
+        };
+        let previous_permissions = readonly_path.map(|path| {
+            let previous = std::fs::metadata(path)
+                .expect("owned attributes")
+                .permissions();
+            let mut readonly = previous.clone();
+            readonly.set_readonly(true);
+            std::fs::set_permissions(path, readonly).expect("owned read-only fixture");
+            previous
+        });
+        let mut command = Command::new(env!("CARGO_BIN_EXE_gta-claw-cli"));
+        command.env_clear();
+        for name in ["SystemRoot", "SystemDrive", "WINDIR"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+            .args([
+                "config",
+                "provider",
+                if scenario.starts_with("recover-") {
+                    "restore"
+                } else {
+                    "apply"
+                },
+                "--source",
+            ])
+            .arg(&source)
+            .arg("--candidate")
+            .arg(&candidate)
+            .arg("--backup")
+            .arg(&backup)
+            .args([
+                "--expected-sha256",
+                &if scenario == "source-drift" {
+                    "0".repeat(64)
+                } else {
+                    hash(source_contents.as_bytes())
+                },
+                "--candidate-sha256",
+                &if scenario == "candidate-drift" {
+                    "0".repeat(64)
+                } else {
+                    hash(candidate_contents.as_bytes())
+                },
+                "--json",
+            ])
+            .env("GTA_CLAW_PROVIDER_POLICY", "not-applied-by-offline-command");
+        if scenario != "no-confirm" {
+            command.arg(if scenario.starts_with("recover-") {
+                "--confirm-restore"
+            } else {
+                "--confirm-apply"
+            });
+        }
+        if scenario != "no-offline" {
+            command.arg("--confirm-offline");
+        }
+        let output = command.output().expect("actual apply command");
+        drop(held);
+        if let Some((path, permissions)) = readonly_path.zip(previous_permissions) {
+            std::fs::set_permissions(path, permissions).expect("restore owned permissions");
+        }
+        let success = cfg!(windows)
+            && matches!(
+                scenario,
+                "valid" | "restore" | "recover-corrupt" | "candidate-readonly"
+            );
+        let text = String::from_utf8(output.stdout).expect("UTF8 receipt");
+        assert_eq!(output.status.success(), success, "{scenario}: {text}");
+        assert!(output.stderr.is_empty());
+        assert!(
+            !text.contains("PRIVATE_APPLY_REFERENCE") && !text.contains("invalid-private-config")
+        );
+        if matches!(scenario, "no-confirm" | "no-offline") {
+            assert!(!backup.exists());
+        } else {
+            let receipt: Value = serde_json::from_str(&text).expect("receipt");
+            assert_eq!(receipt["applied"], false);
+            assert_eq!(receipt["networkContacted"], false);
+            assert_eq!(receipt["credentialsResolved"], false);
+            assert_eq!(receipt["sourceModified"], success);
+            if success {
+                assert_eq!(receipt["backupVerified"], true);
+                assert_eq!(receipt["configurationSaved"], true);
+                assert_eq!(receipt["restartRequired"], true);
+                assert_eq!(receipt["restartPerformed"], false);
+                assert_eq!(receipt["atomicPublication"], false);
+                assert_eq!(receipt["offlineConfirmed"], true);
+                assert_eq!(receipt["offlineIndependentlyVerified"], false);
+                assert_eq!(
+                    receipt["fullSnapshotRestored"],
+                    scenario == "recover-corrupt"
+                );
+                assert_eq!(receipt["savedSha256"], hash(candidate_contents.as_bytes()));
+                assert_eq!(
+                    std::fs::read(&backup).expect("verified original backup"),
+                    source_contents.as_bytes()
+                );
+                claw_config::load_file(&source).expect("saved file remains valid");
+            } else if scenario == "backup-exists" {
+                assert_eq!(
+                    std::fs::read(&backup).expect("old backup"),
+                    b"keep-existing"
+                );
+            } else {
+                assert!(
+                    !backup.exists(),
+                    "preflight cannot create a backup: {scenario}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read(&source).expect("source preserved or saved"),
+            if success {
+                candidate_contents.as_bytes()
+            } else {
+                source_contents.as_bytes()
+            }
+        );
+        assert_eq!(
+            std::fs::read(&candidate).expect("candidate unchanged"),
+            candidate_contents.as_bytes()
+        );
+        assert!(
+            matches!(listener.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock)
+        );
+    }
+}
+
+#[test]
 fn version_remains_a_successful_bounded_command() {
     let output = Command::new(env!("CARGO_BIN_EXE_gta-claw-cli"))
         .arg("--version")
@@ -281,7 +714,20 @@ fn mcp_credential_cli_native_roundtrip_is_stdin_only_and_never_connects() {
                 owned.store.get(&owned.key).expect("native readback"),
                 Some(SecretString::new(token))
             );
-            assert_eq!(run("status", &[], &[]).1["present"], true);
+            let (status_ok, status) = run("status", &[], &[]);
+            assert!(status_ok, "native {service} status failed: {status}");
+            if status["present"] != true {
+                let parent = owned.store.get(&owned.key);
+                let reopened =
+                    WindowsCredentialManagerStore::new().and_then(|store| store.get(&owned.key));
+                panic!(
+                    "native {service} status lost an independently confirmed fixture: status={status}; parent_read_ok={}, parent_present={}, reopened_read_ok={}, reopened_present={}",
+                    parent.is_ok(),
+                    parent.as_ref().is_ok_and(Option::is_some),
+                    reopened.is_ok(),
+                    reopened.as_ref().is_ok_and(Option::is_some),
+                );
+            }
         }
         assert!(!run("delete", &[], &[]).0);
         assert!(
@@ -460,7 +906,18 @@ fn mcp_oauth_cli_reports_local_states_and_only_logs_out_with_explicit_confirmati
             &SecretString::new(r#"{"invalid":"private-oauth-corrupt-record"}"#),
         )
         .expect("owned corrupt record");
-    assert!(!run("status", &[]).0);
+    assert!(
+        backend
+            .get(&key)
+            .expect("corrupt fixture readback")
+            .is_some(),
+        "corrupt native fixture disappeared before the child status check"
+    );
+    let (success, corrupt_status) = run("status", &[]);
+    assert!(
+        !success,
+        "corrupt native fixture status unexpectedly succeeded: {corrupt_status}"
+    );
     assert!(
         backend
             .get(&key)
@@ -858,14 +1315,18 @@ fn mcp_oauth_login_uses_reviewed_metadata_real_callback_and_native_pending_recov
             "success" | "refresh-lost-response" | "refresh-refused" => {
                 assert_eq!(completed["nativeRecordVerified"], true);
                 assert_eq!(completed["resourceRequestPerformed"], false);
-                assert!(matches!(
-                    owned.store.status(&owned.binding).expect("persisted token"),
-                    NativeTokenStatus::Available {
-                        fresh: true,
-                        can_refresh: true,
-                        ..
-                    }
-                ));
+                let persisted = owned.store.status(&owned.binding).expect("persisted token");
+                assert!(
+                    matches!(
+                        persisted,
+                        NativeTokenStatus::Available {
+                            fresh: true,
+                            can_refresh: true,
+                            ..
+                        }
+                    ),
+                    "{mode}: CLI confirmed native storage but independent status is {persisted:?}"
+                );
             }
             "lost-token-response" => {
                 assert_eq!(completed["mayHaveChanged"], true);

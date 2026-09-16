@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "stage": "complete-read-only-native-model-catalogue-export",
+  "capturedOn": "2026-09-16",
+  "baseCommit": "8c3abffc3299db1fa5add5c7d705fe39b1236a6d",
+  "taskIds": ["M3-07.01", "M3-07.04", "M5-01"],
+  "platform": "windows-x86_64",
+  "sourceFrozen": false,
+  "completeBuildInputManifest": false,
+  "wholeProjectAccepted": false,
+  "developmentPublished": false,
+  "cargoLockSha256": "03ae0a54ee93bb13ccaf84f53747742ef5fd48103ef6032b07e4793baeae7834",
+  "sourceFiles": [
+    { "path": "crates/claw-protocol/src/native_models.rs", "sha256": "175de131fa35e5f03a3e31ca405ed2086b285a99d5f78f2fa26002e7d6f9e204" },
+    { "path": "apps/gta-claw-cli/src/native_gateway.rs", "sha256": "2dbfa84a16ee530bb33df63eb293bf0bc67cfbbd187bde52e2f481216b67142e" },
+    { "path": "apps/gta-claw-cli/src/lib.rs", "sha256": "e1df883b4e43dd286408ed5a0ccb87f0d6708b1cd1565daab4c2aeb324e45b3f" },
+    { "path": "apps/gta-claw-cli/src/state_snapshot.rs", "sha256": "bdc0dbd55681a83a24c92169d84612658506d612a2ef4ff39f434e2c78bf35ed" },
+    { "path": "apps/gta-claw-cli/tests/gateway_health.rs", "sha256": "42f902110b4bb8ba2259ed970abaa592fe266e2c758e65aeaeeb4196594beb63" },
+    { "path": "apps/gta-claw-daemon/Cargo.toml", "sha256": "d4334ff639efe7161cb1c2d61cd9b6c0108b62a02049fc7eadbdbdd3143e6863" },
+    { "path": "apps/gta-claw-daemon/tests/production_composition.rs", "sha256": "d0ce84d0c68618dec874d53a0329216d9cb4ba6bea1e3ec16e4e0ded635ac9d5" }
+  ],
+  "checks": [
+    {
+      "command": "cargo +stable test -p claw-protocol -p gta-claw-cli -p gta-claw-daemon --all-targets --no-fail-fast --locked --offline -j 1",
+      "result": "passed", "exitCode": 0, "passed": 441, "failed": 0, "ignored": 7, "testBinaries": 22,
+      "log": "target/native-model-export-final-tests-20260916.log",
+      "sha256": "e45bd7f552debbef90a3702700260201e447c58d8ef01054cbb70fb3f5df0414"
+    },
+    {
+      "command": "cargo +stable test -p gta-claw-daemon --test production_composition bound_cli_provider_model_prepare_apply_and_daemon_start_use_the_saved_selection --locked --offline -j 1 -- --ignored --exact",
+      "environment": "GTA_CLAW_TEST_PROVIDER_CLI points to the explicitly built target/debug/gta-claw-cli.exe",
+      "result": "passed", "exitCode": 0, "passed": 1, "failed": 0, "ignored": 0, "testBinaries": 1,
+      "log": "target/native-model-export-completed-production-20260916.log",
+      "sha256": "99f13327bd17fa45a155e5d239ce3500397bff980afe7df20c71757915da06fb",
+      "scopeNote": "One separately invoked test executes Chat Completions, Responses and Anthropic fixtures; not three separately counted test functions"
+    },
+    {
+      "command": "cargo +stable clippy -p claw-protocol -p gta-claw-cli -p gta-claw-daemon --all-targets --locked --offline -j 1 -- -D warnings",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-model-export-completed-clippy-20260916.log",
+      "sha256": "642eff52119ecbbe626278dc3aee7ed6a0bd49cf642f5b9fa793d5a615bf8a1a"
+    },
+    {
+      "command": "cargo +stable check --workspace --all-targets --locked --offline -j 1",
+      "result": "passed", "exitCode": 0,
+      "log": "target/native-model-export-final-check-20260916.log",
+      "sha256": "adf3c6e8859aa08f54dd21dabb806c6e1a5c556ccc55da79243799d725b2d3e2"
+    }
+  ],
+  "artifacts": [
+    { "path": "target/debug/gta-claw-cli.exe", "sha256": "3505a1349b221fb0b2d8578ad2cb3ebcd37cec8e56ade283e6b914f1e22ef689" },
+    { "path": "target/debug/gta-claw-daemon.exe", "sha256": "efe2e857c202286b91a9552433ef1f64f16f97576f923412d467dbf4bb0ee6a4" }
+  ],
+  "behaviorEvidence": [
+    "complete_model_snapshots_verify_global_identity_aliases_and_digest",
+    "model_export_verifies_all_pages_without_inventing_a_directory_or_alias_target",
+    "model_export_command_requires_a_new_destination_and_a_complete_read",
+    "model_catalogue_export_cli_verifies_complete_pages_before_creating_a_file",
+    "model_alias_metadata_is_bounded_distinct_and_covered_by_the_catalogue_digest",
+    "bound_cli_provider_model_prepare_apply_and_daemon_start_use_the_saved_selection"
+  ],
+  "retainedFailures": [
+    { "log": "target/native-model-export-production-tests-20260916.log", "reason": "Patch relocation initially inserted a fixture block into the control method; compilation correctly rejected out-of-scope names. Moved only that new block to the actual catalogue observation" },
+    { "log": "target/native-model-export-production-retest-20260916.log", "reason": "Actual CLI rejected a trailing-slash endpoint spelling. Corrected the fixture to the existing CLI canonical spelling, without weakening endpoint validation" },
+    { "log": "target/native-model-export-production-final-tests-20260916.log", "reason": "Actual daemon refused the new ephemeral CLI identity as unpaired before any catalogue read or file creation. The fixture now reuses its normally paired, isolated native device profile" },
+    { "log": "target/native-model-export-production-paired-tests-20260916.log", "reason": "The daemon-only test graph did not enable claw-platform/native-identity. With user confirmation, enabled the existing feature only in daemon dev-dependencies; production dependency declaration is unchanged" },
+    { "log": "target/native-model-export-final-clippy-20260916.log", "reason": "One new test match branch omitted a required statement semicolon. Fixed locally and reran the same strict check" }
+  ],
+  "notes": [
+    "gateway export-models requires an explicit new absolute destination and only operator.read. It refuses offset, SHA, overwrite, wait and idempotency options so an export always starts from the first cached page",
+    "All reads use one connection epoch, no reconnect, and the existing whole-command timeout/cancellation budget. Later requests pin the first page digest and the next exact offset. At most 1024 nonempty pages and 1024 models are retained",
+    "Every page uses the existing 16 KiB/eight-model validation. The collector additionally pins provider, generation, selected model, pin state, observation time, source, total and digest. Complete snapshot validation reuses the same closed fields, globally checks duplicates and alias-to-exact collisions, and recomputes the original ordered JSON digest within 2 MiB",
+    "The archive kind is gta-claw.provider-model-catalogue. Exact IDs, configured aliases, absent limits and unverified advertised capabilities remain unchanged. The receipt has independent file SHA-256, snapshot SHA-256, page/model counts and fileCreated; it never claims live capabilities, selection changes or provider inference",
+    "networkContacted:false describes the provider cache operation, not the authenticated Gateway transport. No provider discovery, credential enrollment, account change, generation, result ACK or state migration is performed",
+    "Only after full validation does the existing pinned-parent create-new writer write/sync the bounded plaintext archive. Existing files are preserved. Snapshot/read failures create nothing; writer failure or lost receipt can leave a file and must not be treated as permission to overwrite. Directory durability remains explicitly unverified",
+    "Thirteen real CLI/WebSocket scenarios cover valid three-page export, shorter pages, tampering, changed generation/selection/time/total, cross-page duplicate IDs/aliases, disconnect, existing output, unavailable catalogue and refusal. Success independently verifies file bytes/digest and complete snapshot; protocol failures produce no output file",
+    "The separately executed production test uses actual daemon and CLI processes for all three native HTTP dialects. Its unique temporary native identity is paired through the normal approval flow, reused by CLI, and deleted afterward. Local coordination files live under the owned test root. Export leaves upstream request counters unchanged",
+    "Seven ignored entries in the combined batch remain excluded from its pass count. The explicit production invocation is separately recorded. The intentional CLI async-runtime initialization failure message is passing fault-injection output, not a failed test",
+    "The alias ledger remains an immutable historical snapshot; this record supersedes only its subsequently extended protocol/CLI/production-test files. No old source hashes were rewritten. All application development remains uncommitted; the base commit contains only the separately published dependency patch",
+    "No real account, paid model, device, deployment, production proxy, external user configuration or release qualification was used. Earlier native OAuth/MCP credential anomalies remain unresolved; these passing tests are not a root-cause fix"
+  ],
+  "unverified": [
+    "Cross-platform runtime and actual cloud-account capabilities",
+    "Full online provider retirement, account switching and GUI snapshot export/import",
+    "Exact token budgets, monetary accounting and invoice settlement",
+    "Crash durability of the containing directory and rollback after output uncertainty",
+    "Original native credential intermittency and whole-project acceptance"
+  ]
+}

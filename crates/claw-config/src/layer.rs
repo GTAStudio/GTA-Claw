@@ -283,19 +283,104 @@ fn read_layer(path: &Path, layer: ConfigLayerKind) -> Result<String, LayeredConf
     })
 }
 
+struct UniqueLayerValue(Value);
+
+impl<'de> Deserialize<'de> for UniqueLayerValue {
+    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
+    where
+        Deserializer: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = UniqueLayerValue;
+
+            fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON5 value without duplicate object fields")
+            }
+
+            fn visit_unit<Failure>(self) -> Result<Self::Value, Failure> {
+                Ok(UniqueLayerValue(Value::Null))
+            }
+
+            fn visit_bool<Failure>(self, value: bool) -> Result<Self::Value, Failure> {
+                Ok(UniqueLayerValue(Value::Bool(value)))
+            }
+
+            fn visit_i64<Failure>(self, value: i64) -> Result<Self::Value, Failure> {
+                Ok(UniqueLayerValue(Value::Number(value.into())))
+            }
+
+            fn visit_u64<Failure>(self, value: u64) -> Result<Self::Value, Failure> {
+                Ok(UniqueLayerValue(Value::Number(value.into())))
+            }
+
+            fn visit_f64<Failure>(self, value: f64) -> Result<Self::Value, Failure>
+            where
+                Failure: serde::de::Error,
+            {
+                serde_json::Number::from_f64(value)
+                    .map(|number| UniqueLayerValue(Value::Number(number)))
+                    .ok_or_else(|| {
+                        Failure::custom("non-finite configuration numbers are not supported")
+                    })
+            }
+
+            fn visit_str<Failure>(self, value: &str) -> Result<Self::Value, Failure> {
+                Ok(UniqueLayerValue(Value::String(value.to_owned())))
+            }
+
+            fn visit_string<Failure>(self, value: String) -> Result<Self::Value, Failure> {
+                Ok(UniqueLayerValue(Value::String(value)))
+            }
+
+            fn visit_seq<Sequence>(
+                self,
+                mut sequence: Sequence,
+            ) -> Result<Self::Value, Sequence::Error>
+            where
+                Sequence: serde::de::SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<UniqueLayerValue>()? {
+                    values.push(value.0);
+                }
+                Ok(UniqueLayerValue(Value::Array(values)))
+            }
+
+            fn visit_map<Mapping>(self, mut mapping: Mapping) -> Result<Self::Value, Mapping::Error>
+            where
+                Mapping: serde::de::MapAccess<'de>,
+            {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = mapping.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom(
+                            "configuration object contains duplicate fields",
+                        ));
+                    }
+                    values.insert(key, mapping.next_value::<UniqueLayerValue>()?.0);
+                }
+                Ok(UniqueLayerValue(Value::Object(values)))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 pub(crate) fn merge_layer(
     merged: &mut Value,
     source: &str,
     layer: ConfigLayerKind,
 ) -> Result<(), LayeredConfigError> {
-    let candidate =
-        json5::from_str::<Value>(source).map_err(|error| LayeredConfigError::Layer {
+    let candidate = json5::from_str::<UniqueLayerValue>(source)
+        .map_err(|error| LayeredConfigError::Layer {
             layer,
             error: ConfigError::Syntax {
                 source_name: format!("{layer:?}"),
                 message: error.to_string(),
             },
-        })?;
+        })?
+        .0;
     if !candidate.is_object() {
         return Err(LayeredConfigError::Layer {
             layer,
@@ -353,7 +438,9 @@ fn replace_discriminated_object(
             && path[1] == "providers"
             && path[3] == "request"
             && matches!(path[4].as_str(), "auth" | "proxy"));
-    let discriminator = if path.len() == 2 && path[0] == "accessGroups" {
+    let discriminator = if path.len() == 2 && path[0] == "core" && path[1] == "provider" {
+        Some("kind")
+    } else if path.len() == 2 && path[0] == "accessGroups" {
         Some("type")
     } else if path.len() == 3 && path[0] == "secrets" && path[1] == "providers" {
         Some("source")

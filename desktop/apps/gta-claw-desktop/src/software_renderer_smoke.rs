@@ -140,6 +140,315 @@ fn tab_until_connection_action(
 }
 
 #[test]
+fn native_local_model_editor_callbacks_create_a_verified_candidate_without_applying() {
+    use crate::controller::{DesktopController, ProductConnection, ProductUpdate};
+    use serde_json::json;
+    struct OwnedRoot(std::path::PathBuf);
+    impl Drop for OwnedRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = OwnedRoot(std::env::temp_dir().join(format!(
+            "claw-slint-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        )));
+    std::fs::create_dir(&root.0).expect("owned local config root");
+    let source = root.0.join("source.json5");
+    let destination = root.0.join("candidate.json5");
+    let original=json!({"schema_version":1,"core":{"role":{"source_url":"http://127.0.0.1:9/role"},"channels":{"teams":{"enabled":false}},
+        "auth":{},"server":{},"logging":{},"sessions":{},"copilot":{},"legacy":{},"updates":{},"admin":{},"network":{},
+        "provider":{"kind":"openai","model":"model-0","api_key":"env:SLINT_NOT_RESOLVED"}}}).to_string();
+    std::fs::write(&source, &original).expect("complete local source");
+    let software_window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+    slint::platform::set_platform(Box::new(SoftwarePlatform {
+        window: software_window,
+        started: Instant::now(),
+    }))
+    .expect("local editor renderer");
+    let app = AppWindow::new().expect("component tree");
+    let view = std::rc::Rc::new(
+        crate::ProductView::attach(&app, crate::product_state::ProductState::native())
+            .expect("native view"),
+    );
+    let (updates, observed) = std::sync::mpsc::sync_channel(8);
+    let controller = DesktopController::spawn_product(
+        |_| {},
+        move |update| {
+            assert!(updates.try_send(update).is_ok());
+        },
+    )
+    .expect("local controller");
+    crate::wire_native_callbacks(&app, controller.sender(), &view);
+    let connection = ProductConnection {
+        generation: 0,
+        epoch: 1,
+    };
+    view.state
+        .borrow_mut()
+        .apply_native(ProductUpdate::Ready { connection });
+    let parameters = view
+        .state
+        .borrow()
+        .native_model_catalogue(0)
+        .expect("page read");
+    view.state
+        .borrow_mut()
+        .native_model_catalogue_enqueued(&parameters);
+    view.state.borrow_mut().apply_native(ProductUpdate::Response {connection,method:"models.list",params:parameters,
+        payload:json!({"schemaVersion":1,"available":true,"offset":0,"endOffset":8,"nextOffset":8,"totalModels":9,"sha256":"a".repeat(64),
+            "provider":"openai","providerGeneration":1,"selectedModel":"model-0","selectionPinned":true,"observedAtMs":123,
+            "source":"provider_sdk_catalogue","liveCapabilitiesVerified":false,"selectionChanged":false,"networkContacted":false,
+            "models":(0..8).map(|ordinal|json!({"id":format!("model-{ordinal}"),"displayName":null,"contextWindow":null,"maxOutputTokens":null,"advertisedCapabilities":["completion"]})).collect::<Vec<_>>()}),
+    });
+    view.apply(&app);
+    let binding = app.get_model_choice_binding();
+    app.invoke_local_configuration_requested(
+        0,
+        source.to_str().expect("source path").into(),
+        "".into(),
+        "".into(),
+        -1,
+    );
+    assert!(app.get_local_configuration_busy());
+    view.state.borrow_mut().apply_native(
+        observed
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("actual inspection"),
+    );
+    view.apply(&app);
+    assert!(!app.get_local_configuration_busy());
+    assert!(app.get_local_configuration().contains("Source SHA256:"));
+    app.invoke_local_configuration_requested(
+        1,
+        source.to_str().expect("source path").into(),
+        destination.to_str().expect("candidate path").into(),
+        binding.clone(),
+        1,
+    );
+    assert!(app.get_local_configuration_busy());
+    view.state.borrow_mut().apply_native(
+        observed
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("actual candidate"),
+    );
+    view.apply(&app);
+    assert!(
+        app.get_local_configuration()
+            .contains("Candidate created and read back")
+    );
+    assert!(app.get_local_configuration().contains("not applied"));
+    assert!(!app.get_local_configuration().contains("SLINT_NOT_RESOLVED"));
+    let candidate = claw_platform::configuration::inspect_provider(&destination)
+        .expect("actual candidate file");
+    assert_eq!(
+        candidate
+            .snapshot
+            .core()
+            .provider()
+            .expect("provider")
+            .model(),
+        Some("model-1")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source).expect("unchanged source"),
+        original
+    );
+    view.state.borrow_mut().native_unavailable();
+    view.apply(&app);
+    let rejected = root.0.join("stale.json5");
+    app.invoke_local_configuration_requested(
+        1,
+        source.to_str().expect("path").into(),
+        rejected.to_str().expect("path").into(),
+        binding,
+        1,
+    );
+    assert!(!app.get_local_configuration_busy());
+    assert!(!rejected.exists());
+    assert!(observed.try_recv().is_err());
+    assert!(app.get_local_configuration().contains("Candidate created"));
+    controller.shutdown().expect("local work drained");
+}
+
+#[test]
+fn native_model_catalogue_renders_cached_metadata_and_control_states_at_two_sizes() {
+    use crate::controller::{ProductConnection, ProductUpdate};
+    use serde_json::json;
+    let software_window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+    slint::platform::set_platform(Box::new(SoftwarePlatform {
+        window: software_window.clone(),
+        started: Instant::now(),
+    }))
+    .expect("model renderer");
+    let app = AppWindow::new().expect("model component tree");
+    let view = crate::ProductView::attach(&app, crate::product_state::ProductState::native())
+        .expect("native view");
+    let connection = ProductConnection {
+        generation: 0,
+        epoch: 1,
+    };
+    view.state
+        .borrow_mut()
+        .apply_native(ProductUpdate::Ready { connection });
+    view.state
+        .borrow_mut()
+        .select_destination(crate::product_state::PrimaryDestination::Settings);
+    view.state.borrow_mut().select_settings_section(1);
+    app.set_workspace_ready(true);
+    view.apply(&app);
+    app.show().expect("headless models tree");
+    let params = view
+        .state
+        .borrow()
+        .native_model_catalogue(0)
+        .expect("cache read");
+    view.state
+        .borrow_mut()
+        .native_model_catalogue_enqueued(&params);
+    view.apply(&app);
+    assert!(
+        !app.get_can_read_models() && !app.get_can_next_models() && !app.get_can_refresh_models()
+    );
+    let mut page = json!({"schemaVersion":1,"available":true,"offset":0,"endOffset":8,"nextOffset":8,"totalModels":9,"sha256":"a".repeat(64),
+        "provider":"fixture","providerGeneration":1,"selectedModel":"fixture-model-0","selectionPinned":true,"observedAtMs":123,
+        "source":"provider_sdk_catalogue","liveCapabilitiesVerified":false,"selectionChanged":false,"networkContacted":false,
+        "models":(0..8).map(|ordinal|json!({"id":if ordinal == 7 {format!("{}MODEL-ID-END","x".repeat(240))} else {format!("fixture-model-{ordinal}")},"displayName":format!("{} model {ordinal}","\u{754c}".repeat(30)),
+            "contextWindow":null,"maxOutputTokens":1024,"advertisedCapabilities":["completion"]})).collect::<Vec<_>>()});
+    page["models"][0]["aliases"] = json!(["work", format!("{}ALIAS-END", "a".repeat(240))]);
+    view.state
+        .borrow_mut()
+        .apply_native(ProductUpdate::Response {
+            connection,
+            method: "models.list",
+            params,
+            payload: page,
+        });
+    let expected = view.state.borrow().model_catalogue_text();
+    assert!(expected.contains("Selected: fixture-model-0 (pinned)"));
+    assert!(expected.contains("Alias (config): work") && expected.contains("ALIAS-END"));
+    assert!(
+        expected.contains("Context: not reported")
+            && expected.contains("Live capabilities: unverified")
+    );
+    for (width, height) in [(1080_u16, 720_u16), (720, 520)] {
+        app.set_layout_width(f32::from(width));
+        software_window.set_size(slint::PhysicalSize::new(
+            u32::from(width),
+            u32::from(height),
+        ));
+        app.set_model_catalogue("".into());
+        let empty = render(&software_window, usize::from(width), usize::from(height));
+        view.apply(&app);
+        assert_eq!(app.get_model_catalogue().as_str(), expected);
+        assert!(
+            app.get_can_read_models() && app.get_can_next_models() && app.get_can_refresh_models()
+        );
+        let populated = render(&software_window, usize::from(width), usize::from(height));
+        assert!(
+            changed_pixel_count(&empty, &populated) > 1000,
+            "{width}x{height}: actual metadata rendered"
+        );
+        app.set_can_read_models(false);
+        app.set_can_next_models(false);
+        app.set_can_refresh_models(false);
+        let disabled = render(&software_window, usize::from(width), usize::from(height));
+        assert!(
+            changed_pixel_count(&populated, &disabled) > 8,
+            "{width}x{height}: controls visibly change"
+        );
+        view.apply(&app);
+        app.set_local_configuration_open(true);
+        app.set_local_model_index(7);
+        app.set_local_configuration(
+            "Source verified\nSaved model: fixture-model-0\nCandidate not applied".into(),
+        );
+        let editor = render(&software_window, usize::from(width), usize::from(height));
+        assert!(
+            changed_pixel_count(&populated, &editor) > 1000,
+            "{width}x{height}: local editor replaces catalogue"
+        );
+        assert_eq!(app.get_model_choices().row_count(), 8);
+        assert_eq!(app.get_local_model_index(), 7);
+        assert!(
+            app.get_model_choices()
+                .row_data(7)
+                .expect("long exact ID")
+                .ends_with("MODEL-ID-END")
+        );
+        assert!(!app.get_model_choice_binding().is_empty());
+        app.set_local_configuration_busy(true);
+        let busy = render(&software_window, usize::from(width), usize::from(height));
+        assert!(
+            changed_pixel_count(&editor, &busy) > 8,
+            "{width}x{height}: local fields visibly disable"
+        );
+        app.set_local_configuration_open(false);
+        app.set_model_choice_binding("replaced-while-editor-closed".into());
+        render(&software_window, usize::from(width), usize::from(height));
+        assert_eq!(
+            app.get_local_model_index(),
+            -1,
+            "hidden editor must discard a stale choice"
+        );
+        view.apply(&app);
+    }
+    for reason in [
+        claw_protocol::native_models::CatalogueUnavailableReason::Disabled,
+        claw_protocol::native_models::CatalogueUnavailableReason::AuthenticationPending,
+        claw_protocol::native_models::CatalogueUnavailableReason::NotInitialized,
+        claw_protocol::native_models::CatalogueUnavailableReason::Retired,
+    ] {
+        let params = view
+            .state
+            .borrow()
+            .native_model_catalogue(3)
+            .expect("status query");
+        view.state
+            .borrow_mut()
+            .native_model_catalogue_enqueued(&params);
+        view.state.borrow_mut().apply_native(ProductUpdate::Response {
+            connection, method: "models.list", params,
+            payload: json!({"schemaVersion":1,"available":false,"selectionChanged":false,"networkContacted":false,"unavailableReason":reason}),
+        });
+        for (width, height) in [(1080_u16, 720_u16), (720, 520)] {
+            app.set_layout_width(f32::from(width));
+            software_window.set_size(slint::PhysicalSize::new(
+                u32::from(width),
+                u32::from(height),
+            ));
+            app.set_model_catalogue("".into());
+            let empty = render(&software_window, usize::from(width), usize::from(height));
+            view.apply(&app);
+            assert_eq!(app.get_model_catalogue().as_str(), reason.to_string());
+            assert!(
+                app.get_can_read_models()
+                    && !app.get_can_next_models()
+                    && !app.get_can_refresh_models()
+            );
+            assert!(app.get_model_choice_binding().is_empty());
+            assert_eq!(app.get_model_choices().row_count(), 0);
+            let populated = render(&software_window, usize::from(width), usize::from(height));
+            assert!(
+                changed_pixel_count(&empty, &populated) > 100,
+                "{width}x{height}: {reason}"
+            );
+        }
+    }
+    view.state.borrow_mut().native_unavailable();
+    view.apply(&app);
+    assert_eq!(app.get_model_catalogue(), "Gateway disconnected");
+    assert!(
+        !app.get_can_read_models() && !app.get_can_next_models() && !app.get_can_refresh_models()
+    );
+    app.hide().expect("hide models tree");
+}
+
+#[test]
 fn native_accounting_renders_from_bound_state_at_narrow_and_wide_sizes() {
     let software_window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
     slint::platform::set_platform(Box::new(SoftwarePlatform {
@@ -171,6 +480,8 @@ fn native_accounting_renders_from_bound_state_at_narrow_and_wide_sizes() {
         if scenario == "missing" {
             accounting = serde_json::Value::Null;
         } else if scenario == "journal" {
+            accounting["recordedRounds"] = serde_json::json!(17);
+            accounting["unreportedRounds"] = serde_json::json!(16);
             accounting["recordSource"] = serde_json::json!("provider_journal");
             accounting["journalRevision"] = serde_json::json!(2);
             accounting["journalClosed"] = serde_json::json!(false);
@@ -183,6 +494,26 @@ fn native_accounting_renders_from_bound_state_at_narrow_and_wide_sizes() {
             connection, method: "agent.wait", params: serde_json::json!({"runId":run}),
             payload: serde_json::json!({"runId":run,"sessionId":"native-session","phase":"outcome_unknown","status":"outcome_unknown","turn":index+1,"revision":4,"durable":true,"result":{"status":"outcome_unknown","text":"Retained run status"},"providerAccounting":accounting}),
         });
+        if scenario == "journal" {
+            let params = view
+                .state
+                .borrow()
+                .native_accounting(false)
+                .expect("readable accounting");
+            view.state.borrow_mut().native_accounting_enqueued(&params);
+            view.apply(&app);
+            assert!(!app.get_can_read_accounting() && !app.get_can_next_accounting());
+            let rounds = (0..16).map(|round| serde_json::json!({"round":round,"response":if round == 0 {
+                serde_json::json!({"provider":"renderer-provider","model":"renderer-model","responseId":"renderer-response",
+                    "usageReporting":"partial","finishReason":"length","observedTokens":{"inputTokens":0,"outputTokens":0,"totalTokens":0,"cachedInputTokens":0,"reasoningTokens":0}})
+            } else {serde_json::Value::Null}})).collect::<Vec<_>>();
+            view.state.borrow_mut().apply_native(crate::controller::ProductUpdate::Response {
+                connection,method:"agent.wait",params,
+                payload:serde_json::json!({"runId":run,"sessionId":"native-session","revision":4,"turn":index+1,"status":"outcome_unknown",
+                    "durable":true,"acknowledged":false,"automaticReplay":false,"accounting":{"available":true,"offset":0,"endOffset":16,"nextOffset":16,
+                        "totalRounds":17,"sha256":"b".repeat(64),"summary":accounting,"rounds":rounds}}),
+            });
+        }
         let expected = view.state.borrow().accounting_summary();
         assert!(expected.contains("Billing: unreconciled"));
         if scenario == "missing" {
@@ -192,6 +523,8 @@ fn native_accounting_renders_from_bound_state_at_narrow_and_wide_sizes() {
         } else {
             assert!(expected.contains("Tokens (partial): 0"));
             assert!(expected.contains("journal r2 (open)"));
+            assert!(expected.contains("renderer-response"));
+            assert!(expected.contains("Round 1: report unavailable; delivery unknown"));
         }
         for (width, height) in [(1080_u16, 720_u16), (720, 520)] {
             app.set_layout_width(f32::from(width));
@@ -203,6 +536,8 @@ fn native_accounting_renders_from_bound_state_at_narrow_and_wide_sizes() {
             let empty = render(&software_window, usize::from(width), usize::from(height));
             view.apply(&app);
             assert_eq!(app.get_provider_accounting().as_str(), expected);
+            assert!(app.get_can_read_accounting());
+            assert_eq!(app.get_can_next_accounting(), scenario == "journal");
             let populated = render(&software_window, usize::from(width), usize::from(height));
             assert!(
                 changed_pixel_count(&empty, &populated) > 1_000,
@@ -215,11 +550,20 @@ fn native_accounting_renders_from_bound_state_at_narrow_and_wide_sizes() {
                     .count()
                     > 10_000
             );
+            app.set_can_read_accounting(false);
+            app.set_can_next_accounting(false);
+            let disabled = render(&software_window, usize::from(width), usize::from(height));
+            assert!(
+                changed_pixel_count(&populated, &disabled) > 8,
+                "accounting controls are visible at {width}x{height}"
+            );
+            view.apply(&app);
         }
     }
     view.state.borrow_mut().native_unavailable();
     view.apply(&app);
     assert!(app.get_provider_accounting().is_empty());
+    assert!(!app.get_can_read_accounting() && !app.get_can_next_accounting());
     app.hide().expect("hide software accounting tree");
 }
 

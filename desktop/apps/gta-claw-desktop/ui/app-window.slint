@@ -173,6 +173,18 @@ export component AppWindow inherits Window {
     in property <bool> can-retry-memory: false;
     in property <string> memory-result: "";
     in property <string> provider-accounting: "";
+    in property <bool> can-read-accounting: false;
+    in property <bool> can-next-accounting: false;
+    in property <string> model-catalogue: "";
+    in property <bool> can-read-models: false;
+    in property <bool> can-next-models: false;
+    in property <bool> can-refresh-models: false;
+    in property <[string]> model-choices;
+    in property <string> model-choice-binding: "";
+    in property <string> local-configuration: "";
+    in property <bool> local-configuration-busy: false;
+    in-out property <bool> local-configuration-open: false;
+    in-out property <int> local-model-index: -1;
     in-out property <bool> memory-open: false;
     in property <bool> can-answer: false;
     in property <string> approval-prompt: "";
@@ -220,6 +232,9 @@ export component AppWindow inherits Window {
     callback message-submitted(string);
     callback memory-submitted(string, int, string, int, string, string, string, bool);
     callback memory-retry-requested(string);
+    callback accounting-requested(bool);
+    callback model-catalogue-requested(int);
+    callback local-configuration-requested(int, string, string, string, int);
     callback abort-requested;
     callback file-selected(int);
     callback schedule-create-requested();
@@ -441,6 +456,18 @@ export component AppWindow inherits Window {
         can-retry-memory: root.can-retry-memory;
         memory-result: root.memory-result;
         provider-accounting: root.provider-accounting;
+        can-read-accounting: root.can-read-accounting;
+        can-next-accounting: root.can-next-accounting;
+        model-catalogue: root.model-catalogue;
+        can-read-models: root.can-read-models;
+        can-next-models: root.can-next-models;
+        can-refresh-models: root.can-refresh-models;
+        model-choices: root.model-choices;
+        model-choice-binding: root.model-choice-binding;
+        local-configuration: root.local-configuration;
+        local-configuration-busy: root.local-configuration-busy;
+        local-configuration-open <=> root.local-configuration-open;
+        local-model-index <=> root.local-model-index;
         memory-open <=> root.memory-open;
         can-answer: root.can-answer;
         approval-prompt: root.approval-prompt;
@@ -486,6 +513,9 @@ export component AppWindow inherits Window {
         message-submitted(message) => { root.message-submitted(message); }
         memory-submitted(binding, action, id, kind, revision, offset, content, overwrite) => { root.memory-submitted(binding, action, id, kind, revision, offset, content, overwrite); }
         memory-retry-requested(binding) => { root.memory-retry-requested(binding); }
+        accounting-requested(next) => { root.accounting-requested(next); }
+        model-catalogue-requested(action) => { root.model-catalogue-requested(action); }
+        local-configuration-requested(action, source, destination, binding, selected) => { root.local-configuration-requested(action, source, destination, binding, selected); }
         abort-requested => { root.abort-requested(); }
         file-selected(index) => { root.file-selected(index); }
         schedule-create-requested => { root.schedule-create-requested(); }
