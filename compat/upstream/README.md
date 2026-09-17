@@ -419,7 +419,95 @@ stable, and each entry names the rule that refuses it — three `build.rs`, one
 `harness = false` desktop target. A measurement that moves with the tree is
 recorded with the revision it was taken at, or it is not reproducible.
 
-That agreement proves nothing about
+#### `evidence-reachability-sweep.tsv` — the checked-in cross-check
+
+That per-file verdict list is now a committed artifact rather than a number
+quoted in prose. `evidence-reachability-sweep.tsv` holds one
+`<verdict><TAB><path>` row for every tracked `.rs` file in its cited
+`base-commit` tree, sorted ordinally, with a header naming the command that
+produced it, the commit it was swept at and the totals. Regenerate it with:
+
+```
+powershell -NoProfile -File compat/upstream/validate.ps1 -ReplayEvidenceSweep
+```
+
+That mode reruns the shipped reachability rule over every tracked `.rs` file,
+rewrites the record, prints a differential against the previous one — verdict
+changes, files added, files removed — and prints the digest to paste into
+`$ExpectedEvidenceSweepDigest`. It touches nothing else: ledger digests,
+inventory digests, the schema digest and `baseline.json` are all unreachable
+from it, exactly as `-WriteLedgerDigests` cannot reach anything but the three
+ledgers. Those are the only two writer modes, they are pairwise exclusive, and
+binding both is rejected before either artifact can be written.
+
+**This record grants no permission, and it must not be mistaken for one.** A row
+saying `accept` does not make that file citable; every citation is checked
+against the live rule by the evidence admission path, which never consults this
+file. The record exists so that two independent implementations of reachability
+have a shared expectation that either one failing would expose. Its value is
+entirely as a cross-check, which is why the five refusals matter more than the
+399 acceptances: those five are where the rule says *no*, and a rule
+that silently stops saying no is the failure this artifact is here to catch.
+
+Every ordinary run enforces three independent layers:
+
+- **Outer integrity.** The LF-normalised digest catches an unreviewed byte edit
+  while remaining invariant between a uniform LF checkout and a uniform CRLF
+  checkout.
+- **One canonical grammar.** The complete nine-line header is positional and
+  exact, including the generator. Headers cannot be reordered, duplicated,
+  invented, malformed or placed after a row. Every following line is exactly
+  `<accept|reject><TAB><path>`, paths are unique and strictly ascending under
+  ordinal comparison, and the file uses exactly one trailing newline with either
+  uniform LF or uniform CRLF.
+- **Independent semantic authority.** The verifier invokes the shipped
+  reachability rule for every one of the 404 rows. The record's own verdict never
+  decides whether verification runs. Any `accept`/`reject` disagreement fails by
+  path with the live rule's reason; only after all 404 comparisons agree does the
+  validator require exactly 399 accepts and five rejects.
+
+That last ordering is deliberate. The self-test flips each refusal to `accept`
+one at a time, corrects the totals and re-pins the digest, and every case still
+reaches the semantic mismatch. It also plants the inverse `accept` to `reject`
+forgery. A digest or a minimum-refusal count is integrity metadata, not semantic
+authority.
+
+One thing remains deliberately **not** enforced: a new tracked `.rs` file absent
+from the dated record. Later main growth therefore does not invalidate the pinned
+measurement. Every recorded row itself must still resolve ordinally to an
+existing regular non-reparse file and retain its recorded live-rule verdict;
+deletion, rename, case-only spelling drift, symlink or junction substitution all
+fail. Additions surface in the `-ReplayEvidenceSweep` differential when the
+record is intentionally refreshed.
+
+The swept universe is **git's tracked file list**, not a filesystem walk. A walk
+needs hand-written exclusions for `.git`, `target/` and `compat/legacy`, which is
+gitignore semantics reimplemented by hand, and it silently admits an *untracked*
+`.rs` file dropped anywhere else. `crates/claw-conformance` derives its
+denominator from `git ls-files`, so a walk here could admit a file that cannot
+enter theirs, and the two would read as disagreeing about the **rule** when they
+only disagree about which files exist. This was measured before it was changed:
+on the tree the current record was taken at, the walk and `git ls-files` returned
+the identical 404 paths. The walk was correct by luck of its exclusions, not by
+construction — the same defect this contract has twice found in its own scratch
+harnesses, both times producing a right number by an unsound method.
+
+`base-commit` is a claim that the record describes that commit's tree. The
+checked-in record cites
+`4ec8a66236ca7ff7e53bba36b59fb8630ddecb71`, whose tracked non-legacy Rust
+universe is exactly the record's 404 rows. Replay refuses to write a record it
+cannot honestly date. The rows are read from the working tree, so the claim holds
+only when no tracked `.rs` file differs from `HEAD`;
+`-ReplayEvidenceSweep` therefore fails, naming the paths, if any Rust file is
+modified, staged, deleted or untracked. This is not a hypothetical: regenerating
+in the middle of a merge produced a record of 332 files dated at a commit whose
+tree held 307, a checked-in artifact citing a commit that did not contain a
+quarter of its own rows. Nothing downstream would have caught it, because every
+other consistency rule about the record is internal to the record. The date
+covers the swept Rust files and not `validate.ps1` itself, which is necessarily
+uncommitted while a rule change is being reviewed against its own differential.
+
+That agreement between the two implementations proves nothing about
 the two rules both sides changed most recently, because neither construct occurs
 anywhere in either tree: scanned at the time of writing, there are **zero inline
 `#[path]` modules and zero ambiguous `foo.rs` + `foo/mod.rs` pairs** in the
