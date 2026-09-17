@@ -2736,6 +2736,37 @@ mod tests {
     }
 
     #[test]
+    fn module_cfg_test_attribute_must_be_exact() {
+        let cases = [
+            (
+                "#[cfg(test)]\nmod tests {\n#[test]\nfn exact_name() {}\n}",
+                true,
+            ),
+            (
+                "#[cfg(test = \"disabled\")]\nmod tests {\n#[test]\nfn exact_name() {}\n}",
+                false,
+            ),
+            (
+                "#[cfg(test /* keep */ = /* tokens */ \"disabled\")]\nmod tests {\n#[test]\nfn exact_name() {}\n}",
+                false,
+            ),
+            (
+                "#[cfg(test = \"disabled\")]\n#[allow(dead_code)]\nmod tests {\n#[test]\nfn exact_name() {}\n}",
+                false,
+            ),
+            (
+                "#[allow(dead_code)]\n#[cfg(test = \"disabled\")]\nmod tests {\n#[test]\nfn exact_name() {}\n}",
+                false,
+            ),
+        ];
+
+        assert_eq!(
+            cases.map(|(source, _)| declares_enabled_test(source, "tests::exact_name")),
+            cases.map(|(_, expected)| expected)
+        );
+    }
+
+    #[test]
     fn cargo_test_listing_matches_enabled_test_detector() {
         let source = concat!(
             r#"
@@ -3697,13 +3728,23 @@ mod nested {
         ))
         .expect("parse shared enabled-test oracle");
         assert_eq!(corpus.cases.len(), 120);
-        for case in corpus.cases {
-            assert_eq!(
-                declares_enabled_test(&case.source, &case.test),
-                case.expected,
-                "{}",
-                case.name
-            );
-        }
+        let mismatches = corpus
+            .cases
+            .iter()
+            .filter_map(|case| {
+                let actual = declares_enabled_test(&case.source, &case.test);
+                (actual != case.expected).then(|| {
+                    format!(
+                        "{}\texpected={}\tactual={}",
+                        case.name, case.expected, actual
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            mismatches.is_empty(),
+            "enabled-test oracle mismatches:\nname\texpected\tactual\n{}",
+            mismatches.join("\n")
+        );
     }
 }
