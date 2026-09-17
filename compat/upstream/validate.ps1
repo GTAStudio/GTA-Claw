@@ -3103,7 +3103,20 @@ if ($LedgerSpecs.Count -ne 3 -or $featureCount -ne 47) {
 }
 # Runs in write mode too, so -WriteLedgerDigests cannot re-bless a ledger whose
 # frozen text was edited: the regeneration command can only ever move the file
-# digest for a status or evidence change. It fails before it writes.
+# digest for a status or evidence change.
+#
+# NOTE ON ORDERING: this check runs AFTER ledger-digests.sha256 has already been
+# written above. A failing -WriteLedgerDigests run therefore leaves the sidecar
+# rewritten, and `git status` will show it. That is deliberate, not an oversight.
+# The sidecar is an ordinary text file whose format is documented in its own
+# header, so an attacker can hand-write it and gating the write would remove
+# convenience rather than capability. Gating it would also disarm the self-test:
+# its regenerate_digests cases exist to model an attacker who has ALREADY
+# re-blessed the digests, and they reach the specific evidence rules below only
+# because the sidecar is re-blessed first. Verified by execution -- gating the
+# write makes those cases fail on the fingerprint mismatch instead, so the
+# semantic rules would stop being exercised at all.
+# The barrier is the frozen constant, never the command.
 foreach ($spec in $LedgerSpecs) {
     if (-not (Test-OrdinalStringEqual `
                 ([string]$computedFrozenDigests[[string]$spec.path]) `

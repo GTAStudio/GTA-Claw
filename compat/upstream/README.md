@@ -633,6 +633,16 @@ Contract:
 - **Never** run `-WriteLedgerDigests` in CI. It rewrites `ledger-digests.sha256`,
   which is a reviewed, committed artifact; regenerating it inside a job would
   re-bless whatever the job happens to be looking at.
+- A **failing** `-WriteLedgerDigests` run still rewrites `ledger-digests.sha256`.
+  The sidecar is written before the per-feature evidence rules and the frozen
+  projection are checked, so a run that exits non-zero can still leave that file
+  modified in your working tree. This is deliberate — the self-test's re-blessing
+  pre-runs depend on it, and the barrier is the frozen constant rather than the
+  command — but it means **a failed regeneration is not a no-op**. Restore the
+  sidecar with `git checkout` before drawing any conclusion from the tree, and
+  never judge that tree by a string comparison: `[System.IO.File]::ReadAllText`
+  silently drops the UTF-8 BOM these JSON files carry, so a read/write round-trip
+  reports itself as byte-exact while having changed the file.
 
 The adversarial self-test is a separate, slower step. It spawns 257 child
 validator processes — one baseline run against the real tree, one per each of the
