@@ -1,0 +1,178 @@
+{
+  "accepted": [
+    {
+      "name": "create_flow_minimal",
+      "action": { "action": "create_flow", "goal": "ship the release" }
+    },
+    {
+      "name": "create_flow_full",
+      "action": {
+        "action": "create_flow",
+        "controllerId": "webhooks/zapier",
+        "goal": "ship the release",
+        "status": "waiting",
+        "notifyPolicy": "state_changes",
+        "currentStep": "await approval",
+        "stateJson": { "attempt": 1 },
+        "waitJson": { "reason": "approval" }
+      }
+    },
+    {
+      "name": "get_flow",
+      "action": { "action": "get_flow", "flowId": "flow-1" }
+    },
+    {
+      "name": "list_flows",
+      "action": { "action": "list_flows" }
+    },
+    {
+      "name": "find_latest_flow",
+      "action": { "action": "find_latest_flow" }
+    },
+    {
+      "name": "resolve_flow",
+      "action": { "action": "resolve_flow", "token": "resume-token" }
+    },
+    {
+      "name": "get_task_summary",
+      "action": { "action": "get_task_summary", "flowId": "flow-1" }
+    },
+    {
+      "name": "set_waiting",
+      "action": {
+        "action": "set_waiting",
+        "flowId": "flow-1",
+        "expectedRevision": 3,
+        "currentStep": "await approval",
+        "blockedTaskId": "task-9",
+        "blockedSummary": "waiting on review"
+      }
+    },
+    {
+      "name": "resume_flow",
+      "action": {
+        "action": "resume_flow",
+        "flowId": "flow-1",
+        "expectedRevision": 4,
+        "status": "running",
+        "currentStep": "apply patch"
+      }
+    },
+    {
+      "name": "finish_flow",
+      "action": {
+        "action": "finish_flow",
+        "flowId": "flow-1",
+        "expectedRevision": 5,
+        "stateJson": { "result": "ok" }
+      }
+    },
+    {
+      "name": "fail_flow",
+      "action": {
+        "action": "fail_flow",
+        "flowId": "flow-1",
+        "expectedRevision": 5,
+        "blockedTaskId": "task-9",
+        "blockedSummary": "provider outage"
+      }
+    },
+    {
+      "name": "request_cancel",
+      "action": { "action": "request_cancel", "flowId": "flow-1", "expectedRevision": 6 }
+    },
+    {
+      "name": "cancel_flow",
+      "action": { "action": "cancel_flow", "flowId": "flow-1" }
+    },
+    {
+      "name": "run_task_queued",
+      "action": {
+        "action": "run_task",
+        "flowId": "flow-1",
+        "runtime": "subagent",
+        "task": "summarise the diff"
+      }
+    },
+    {
+      "name": "run_task_running",
+      "action": {
+        "action": "run_task",
+        "flowId": "flow-1",
+        "runtime": "acp",
+        "task": "summarise the diff",
+        "status": "running",
+        "startedAt": 1750000000,
+        "lastEventAt": 1750000001,
+        "progressSummary": "reading files"
+      }
+    }
+  ],
+  "rejected": [
+    {
+      "name": "unknown_action",
+      "action": { "action": "delete_everything", "flowId": "flow-1" }
+    },
+    {
+      "name": "action_missing",
+      "action": { "flowId": "flow-1" }
+    },
+    {
+      "name": "create_flow_without_goal",
+      "action": { "action": "create_flow" }
+    },
+    {
+      "name": "create_flow_with_blank_goal",
+      "action": { "action": "create_flow", "goal": "   " }
+    },
+    {
+      "name": "create_flow_with_unknown_field",
+      "action": { "action": "create_flow", "goal": "ship", "sessionKey": "other-session" }
+    },
+    {
+      "name": "get_flow_without_flow_id",
+      "action": { "action": "get_flow" }
+    },
+    {
+      "name": "list_flows_with_extra_field",
+      "action": { "action": "list_flows", "flowId": "flow-1" }
+    },
+    {
+      "name": "resolve_flow_with_blank_token",
+      "action": { "action": "resolve_flow", "token": "" }
+    },
+    {
+      "name": "set_waiting_without_expected_revision",
+      "action": { "action": "set_waiting", "flowId": "flow-1" }
+    },
+    {
+      "name": "resume_flow_with_terminal_status",
+      "action": {
+        "action": "resume_flow",
+        "flowId": "flow-1",
+        "expectedRevision": 4,
+        "status": "finished"
+      }
+    },
+    {
+      "name": "run_task_with_unknown_runtime",
+      "action": {
+        "action": "run_task",
+        "flowId": "flow-1",
+        "runtime": "shell",
+        "task": "rm -rf /"
+      }
+    },
+    {
+      "name": "run_task_with_progress_while_queued",
+      "action": {
+        "action": "run_task",
+        "flowId": "flow-1",
+        "runtime": "subagent",
+        "task": "summarise the diff",
+        "status": "queued",
+        "startedAt": 1750000000
+      }
+    }
+  ]
+}
