@@ -12,7 +12,7 @@ and records, per feature row, whether GTA-Claw actually implements it.
 | `feature-ledger.schema.json` | frozen, digest hardcoded in `validate.ps1` |
 | `enabled-test-oracle.json` (120 cases) | frozen, digest hardcoded in `validate.ps1` |
 | `reachability-corpus.json` (32 cases) | frozen, digest hardcoded in `validate.ps1` |
-| `manifest.json` | only `evidence_policy.status_totals` may change |
+| `manifest.json` | only `evidence_policy.status_totals` may change, and only through `validate.ps1 -WriteStatusTotals` |
 | `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence.status`, `acceptance_evidence.artifacts`, `implementation_pointers` and `known_differences` may change; every other field, **including `acceptance_evidence.required`**, is frozen by a digest hardcoded in `validate.ps1` |
 | `ledger-digests.sha256` | regenerated only by `validate.ps1 -WriteLedgerDigests` |
 
@@ -572,20 +572,54 @@ anything under `src/`, `compat/legacy/`, `packages/`, `node_modules/` or
    `acceptance_evidence.status`, the `artifacts`, optionally
    `implementation_pointers`, and replace the baseline `known_differences`
    placeholder with the real remaining differences.
-3. Update `manifest.json` `evidence_policy.status_totals` so the three counts
-   still sum to 47 and match reality. The validator cross-checks them.
-4. Regenerate the ledger digests through the reviewed command and review the
-   printed values against the diff:
+3. State the new totals and let the reviewed command make both edits in one step.
+   Regenerating the ledger digests and rewriting
+   `manifest.json` `evidence_policy.status_totals` is a single atomic operation,
+   because a row that moves without its aggregate leaves the contract internally
+   inconsistent:
 
    ```text
-   powershell -NoProfile -File compat/upstream/validate.ps1 -WriteLedgerDigests
+   powershell -NoProfile -File compat/upstream/validate.ps1 `
+       -WriteLedgerDigests -WriteStatusTotals "unimplemented=36,partial=0,implemented=11"
    ```
 
-   This is the only supported way to change a ledger digest. It rewrites
-   `ledger-digests.sha256` and nothing else: inventory digests, the feature schema
-   digest, the enabled-test oracle corpus digest and `baseline.json` stay
+   `-WriteLedgerDigests` is the only supported way to change a ledger digest. It
+   rewrites `ledger-digests.sha256` and nothing else: inventory digests, the feature
+   schema digest, the enabled-test oracle corpus digest and `baseline.json` stay
    hardcoded in `validate.ps1` and are unreachable from this command.
+
+   `-WriteStatusTotals` edits nothing but the three integers inside
+   `evidence_policy.status_totals`, byte for byte preserving the rest of the file.
+
+   **You state the totals; the command does not derive them.** If the declaration
+   does not already match the rows on disk, the run fails and writes nothing. This
+   is deliberate. Deriving the aggregate from the rows it is supposed to
+   cross-check would make the manifest pin a tautology, and a stray or mismerged
+   row edit — the one failure the pin still catches on its own — could then be
+   erased by reflex instead of being investigated.
+
+4. Paste the command's output into the pull request. It prints the totals and then
+   names every non-`unimplemented` row, so a reviewer can check the transition
+   against the ledgers directly instead of trusting the aggregate.
 5. Re-run `validate.ps1` and `validate-self-test.ps1`.
+
+### Nothing a rejected run touches can bless anything
+
+`-WriteStatusTotals` is the last thing the script does, after every evidence,
+digest, count and provenance rule. A rejected tree gets its `manifest.json` back
+exactly as it was found, which the self-test asserts directly rather than trusting
+the exit code: `status-totals-write-cannot-bless-a-missing-artifact` declares
+totals that genuinely match the rows, so the only thing standing between a forged
+citation and a written manifest is the artifact rule itself.
+
+`-WriteLedgerDigests` deliberately writes earlier, before the frozen feature-text
+comparison. The file it writes is a derived fingerprint that is worthless on its
+own — the frozen text is pinned by a constant inside `validate.ps1` that no write
+mode can reach — so regenerating it for a tree that is about to be rejected cannot
+bless anything, and every downstream path stays fail-closed. That ordering is also
+load-bearing for the self-test, whose 104 `regenerate_digests` cases model an
+attacker who re-blessed the mutable digests *before* presenting a forgery, and then
+prove which rule still catches them.
 
 ## Continuous integration
 
@@ -630,13 +664,14 @@ Contract:
 - The `try`/`catch` exists only so the rejection reason is one clean line;
   PowerShell 7's default error view wraps long messages mid-word and buries them
   under source-line art. Exit codes are the same without it.
-- **Never** run `-WriteLedgerDigests` in CI. It rewrites `ledger-digests.sha256`,
-  which is a reviewed, committed artifact; regenerating it inside a job would
-  re-bless whatever the job happens to be looking at.
+- **Never** run `-WriteLedgerDigests` or `-WriteStatusTotals` in CI. They rewrite
+  `ledger-digests.sha256` and `manifest.json`, which are reviewed, committed
+  artifacts; regenerating either inside a job would re-bless whatever the job
+  happens to be looking at.
 
-The adversarial self-test is a separate, slower step. It spawns 257 child
+The adversarial self-test is a separate, slower step. It spawns 260 child
 validator processes — one baseline run against the real tree, one per each of the
-153 cases, and a re-blessing pre-run for the 103 cases that model an attacker who
+155 cases, and a re-blessing pre-run for the 104 cases that model an attacker who
 had already regenerated the ledger digests — and takes several minutes,
 so prefer a job with a `paths:` filter on `compat/upstream/**` over running it on
 every push:
