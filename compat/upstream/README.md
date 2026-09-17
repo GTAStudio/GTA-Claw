@@ -342,8 +342,41 @@ Three limits, stated plainly rather than left to be discovered:
 - It proves a file is compiled and a test is enabled. It does not prove the test
   passes; that is `cargo test`'s job.
 
-This rule is **shared, not locally owned**. `crates/claw-conformance` implements
-the same rule — "a target root, or reachable from a target root" — after a
+This rule is **shared, not locally owned**, and the sharing is replayed rather
+than asserted. `crates/claw-conformance/src/claims.rs` implements the same rule —
+"a target root, or reachable from a target root" — in `CargoTestTargets::load`
+(target discovery), `uses_standard_test_harness` (the `harness = false`
+exclusion described above), `reachable_rust_sources` (`mod` and
+`#[path = "..."]` traversal) and `contains_compiled_source` (the membership
+query those two feed). Those mirror `Get-CrateCompiledFileSet`,
+`Get-RustModuleReferences` and `Assert-EvidenceFileIsCompiled` in `validate.ps1`.
+
+`contains_compiled_source` is worth naming precisely, because its old name is
+what made this rule easy to describe wrongly. It was once `contains`, on a type
+called `CargoTestTargets`, so every call site read as *target* membership while
+the set it searched had already been widened to the reachable closure. A reader
+who trusted the name concluded the Rust side was the stricter one. Renaming the
+query after the question it answers removed the trap; citing the old name would
+put it back.
+
+Agreement was verified at commit `1296e69f0efeb1c30f97e1fc405bc921f77cb43a`, on
+both sides: `validate.ps1` replays `reachability-corpus.json` on every run, and
+the Rust side replays the same file in
+`claims::tests::shared_reachability_corpus_matches_cargo`. Neither side is
+normative and neither may edit a case to match itself; every expectation was
+produced by running Cargo against the fixture. The corpus proves agreement only
+for the shapes it encodes — it is not an exhaustive proof of reachability
+behaviour outside them.
+
+That verification still holds at `997b4b6d5aeaeb153761cd5092b9d2f27f25a765`,
+and by identity rather than by re-argument: both implementations are byte-for-byte
+unchanged since it was measured — `crates/claw-conformance/src/claims.rs` is blob
+`22c40713` and `compat/upstream/validate.ps1` is blob `a013681f` at both commits.
+Re-state that identity, or re-run the replay, before citing this paragraph at a
+newer commit; a citation to a superseded state is how this rule got mislabelled
+in the first place.
+
+The rule was settled after a
 proposal to require the cited file to *be* a target root was put to the
 compatibility owner and then withdrawn: target-root-only left, at the time it was
 proposed, 225 tests across 34 files in 9 crates with no legal citation at all,
