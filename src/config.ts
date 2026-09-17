@@ -31,6 +31,7 @@ export interface AppConfig {
   WHATSAPP_VERIFY_TOKEN?: string;
   WHATSAPP_ACCESS_TOKEN?: string;
   WHATSAPP_PHONE_NUMBER_ID?: string;
+  WHATSAPP_APP_SECRET?: string;
   WHATSAPP_WEBHOOK_PATH: string;
 
   // Optional with defaults
@@ -172,6 +173,9 @@ export function loadConfig(): AppConfig {
   const WHATSAPP_PHONE_NUMBER_ID = parseOptionalNonEmptyEnv(
     "WHATSAPP_PHONE_NUMBER_ID",
   );
+  const WHATSAPP_APP_SECRET = parseOptionalNonEmptyEnv(
+    "WHATSAPP_APP_SECRET",
+  );
   const WHATSAPP_WEBHOOK_PATH =
     process.env["WHATSAPP_WEBHOOK_PATH"]?.trim() || "/whatsapp/webhook";
 
@@ -206,10 +210,11 @@ export function loadConfig(): AppConfig {
     ENABLE_WHATSAPP &&
     (!WHATSAPP_VERIFY_TOKEN ||
       !WHATSAPP_ACCESS_TOKEN ||
-      !WHATSAPP_PHONE_NUMBER_ID)
+      !WHATSAPP_PHONE_NUMBER_ID ||
+      !WHATSAPP_APP_SECRET)
   ) {
     throw new Error(
-      "ENABLE_WHATSAPP=true requires WHATSAPP_VERIFY_TOKEN, WHATSAPP_ACCESS_TOKEN, and WHATSAPP_PHONE_NUMBER_ID",
+      "ENABLE_WHATSAPP=true requires WHATSAPP_VERIFY_TOKEN, WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID, and WHATSAPP_APP_SECRET",
     );
   }
   if (!WHATSAPP_WEBHOOK_PATH.startsWith("/")) {
@@ -258,6 +263,7 @@ export function loadConfig(): AppConfig {
     WHATSAPP_VERIFY_TOKEN,
     WHATSAPP_ACCESS_TOKEN,
     WHATSAPP_PHONE_NUMBER_ID,
+    WHATSAPP_APP_SECRET,
     WHATSAPP_WEBHOOK_PATH,
 
     PORT: parseIntegerEnv("PORT", 3978, { min: 1, max: 65535 }),

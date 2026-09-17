@@ -161,7 +161,7 @@
       "secret": false,
       "default": false,
       "conversion": "Accept only exact lowercase true or false.",
-      "validation": "Requires verify_token, access_token, and phone_number_id when true.",
+      "validation": "Requires verify_token, access_token, phone_number_id, and app_secret when true.",
       "required_when": ""
     },
     {
@@ -191,6 +191,16 @@
       "secret": false,
       "default": null,
       "conversion": "Trim; empty becomes absent.",
+      "validation": "Nonempty when WhatsApp is enabled.",
+      "required_when": "channels.whatsapp.enabled is true"
+    },
+    {
+      "legacy_env": "WHATSAPP_APP_SECRET",
+      "scope": "runtime",
+      "target_json5_key": "channels.whatsapp.app_secret",
+      "secret": true,
+      "default": null,
+      "conversion": "Trim; empty becomes absent. Store as a secret reference.",
       "validation": "Nonempty when WhatsApp is enabled.",
       "required_when": "channels.whatsapp.enabled is true"
     },

@@ -1116,6 +1116,8 @@ pub struct BuiltinChannelConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_token: Option<SecretInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_secret: Option<SecretInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub phone_number_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webhook_path: Option<String>,

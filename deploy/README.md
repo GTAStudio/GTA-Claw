@@ -53,6 +53,8 @@ ENABLE_TEAMS=true
 ENABLE_TELEGRAM=false
 ENABLE_DISCORD=false
 ENABLE_WHATSAPP=false
+# 启用 WhatsApp 时还需配置 Verify Token、Access Token、Phone Number ID 和 App Secret。
+WHATSAPP_APP_SECRET=
 ```
 
 内网部署建议：优先 Telegram/Discord + PAT (`GITHUB_TOKEN`)。

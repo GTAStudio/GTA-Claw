@@ -12,6 +12,20 @@ fn workspace_and_packaged_contracts_match_completely() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let packaged = load_contract(&manifest.join("data/env-mapping.json"));
     validate_contract(&packaged).expect("packaged contract is structurally valid");
+    let app_secret = packaged
+        .mappings
+        .iter()
+        .find(|mapping| mapping.legacy_env == "WHATSAPP_APP_SECRET")
+        .expect("WhatsApp app secret mapping");
+    assert_eq!(
+        app_secret.target_json5_key,
+        "channels.whatsapp.app_secret"
+    );
+    assert!(app_secret.secret);
+    assert_eq!(
+        app_secret.required_when,
+        "channels.whatsapp.enabled is true"
+    );
 
     let repository_marker = manifest.join("../../compat/legacy/contract.json");
     if !repository_marker.is_file() {

@@ -737,6 +737,10 @@ impl EnvelopeWire {
                     "core.channels.whatsapp.phone_number_id",
                     whatsapp.phone_number_id.is_some(),
                 ),
+                (
+                    "core.channels.whatsapp.app_secret",
+                    whatsapp.app_secret.is_some(),
+                ),
             ],
         )?;
 
