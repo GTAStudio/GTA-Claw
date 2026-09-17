@@ -63,7 +63,7 @@ $ExpectedReachabilityCorpusAccepting = 15
 # Frozen exactly like the schema and corpus digests: -WriteLedgerDigests cannot
 # reach this constant, so re-blessing a hollowed-out self-test takes a reviewed
 # edit to this line.
-$ExpectedSelfTestDigest = "0da69d4ad9266c7a5cb4516dbf7fd95a4f0c7f0f82f6844bea44116a06956d96"
+$ExpectedSelfTestDigest = "320d361a5eca9fb88b7bad0fa342674c7bd3fbbac567384f31de4ed048d7495c"
 $LedgerDigestFileName = "ledger-digests.sha256"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
@@ -2110,11 +2110,17 @@ function Test-CratePackageIsBuilt {
 function Get-CargoManifestTargetSections {
     param([string]$ManifestText)
     # Every [lib] / [[bin]] / [[test]] / [[bench]] / [[example]] block, with the
-    # only three keys that decide whether `cargo test` runs #[test] items in the
+    # only four keys that decide whether `cargo test` runs #[test] items in the
     # named file. Keys are read per block: a bare `path = "..."` also appears
     # under [dependencies.<name>], and honouring that would let an author bless
     # an orphan file by adding one line to a manifest instead of wiring the file
     # into the crate.
+    # required-features is read as presence only, never resolved. Resolving it
+    # would mean reproducing cargo's default-feature expansion, transitive
+    # feature edges and workspace unification in this reader, and every one of
+    # those is a place for a resolver bug to hand out evidence for a test that
+    # never runs. Presence alone is decided fail-closed by
+    # Test-CargoSectionRunsTests.
     $sections = New-Object System.Collections.Generic.List[object]
     $current = $null
     $packageFlags = @{}
@@ -2126,7 +2132,7 @@ function Get-CargoManifestTargetSections {
             $kind = $header.Groups[1].Value
             $inPackage = (Test-OrdinalStringEqual $kind "package")
             if (Test-OrdinalContains @("lib", "bin", "test", "bench", "example") $kind) {
-                $current = [ordered]@{ kind = $kind; path = $null; test = $null; harness = $null }
+                $current = [ordered]@{ kind = $kind; path = $null; test = $null; harness = $null; requiredFeatures = $null }
                 [void]$sections.Add($current)
             } else {
                 $current = $null
@@ -2143,6 +2149,10 @@ function Get-CargoManifestTargetSections {
         if ($declared.Success) { $current.path = $declared.Groups[1].Value; continue }
         $flag = [regex]::Match($trimmed, '\A(test|harness)\s*=\s*(true|false)\z')
         if ($flag.Success) { $current[$flag.Groups[1].Value] = (Test-OrdinalStringEqual $flag.Groups[2].Value "true") }
+        # An empty list is not a gate, so the emptiness is measured rather than
+        # assumed: `required-features = []` leaves the target running by default.
+        $required = [regex]::Match($trimmed, '\Arequired-features\s*=\s*\[(.*)\]\z')
+        if ($required.Success) { $current.requiredFeatures = $required.Groups[1].Value.Trim() }
     }
     return [ordered]@{ sections = $sections.ToArray(); package = $packageFlags }
 }
@@ -2157,6 +2167,15 @@ function Test-CargoSectionRunsTests {
     # main(), which makes every #[test] item in it inert, so it can never be
     # acceptance evidence whatever `test` says.
     if ($Section.harness -eq $false) { return $false }
+    # A non-empty required-features list means cargo skips the target entirely
+    # unless every named feature is enabled, so a plain `cargo test` never
+    # builds it and its #[test] items never run. Measured, not recalled:
+    # `cargo metadata` still reports such a target with test = true, so metadata
+    # alone would bless a file that `cargo test` silently ignores. This is the
+    # same class as bench, example and harness = false -- a target whose
+    # #[test] items do not execute -- and it outranks an explicit `test = true`,
+    # because `test = true` describes a target cargo declined to build.
+    if (-not [string]::IsNullOrEmpty([string]$Section.requiredFeatures)) { return $false }
     if ($null -ne $Section.test) { return [bool]$Section.test }
     return (Test-OrdinalContains @("lib", "bin", "test") ([string]$Section.kind))
 }

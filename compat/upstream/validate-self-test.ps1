@@ -230,8 +230,16 @@ function New-SyntheticRepositoryRoot {
         "crates/nonrunning/Cargo.toml" =
             ("[package]`nname = `"nonrunning`"`nautotests = false`n`n" +
              "[[bin]]`nname = `"notest`"`npath = `"src/bin/notest.rs`"`ntest = false`n`n" +
-             "[[test]]`nname = `"noharness`"`npath = `"tests/noharness.rs`"`nharness = false`n")
+             "[[test]]`nname = `"noharness`"`npath = `"tests/noharness.rs`"`nharness = false`n`n" +
+             # A required-features target is skipped entirely by a plain
+             # cargo test, so its #[test] items never run. cargo metadata still
+             # reports test = true for it, which is why a metadata-only root set
+             # would hand out evidence for a file cargo declined to build.
+             "[[test]]`nname = `"gated`"`npath = `"tests/gated.rs`"`nrequired-features = [`"gated`"]`n`n" +
+             "[features]`ngated = []`n")
         "crates/nonrunning/src/lib.rs" = "`n"
+        "crates/nonrunning/tests/gated.rs" =
+            "#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/nonrunning/src/bin/notest.rs" =
             "fn main() {}`n#[test]`nfn $SyntheticTestName() {`n    assert!(true);`n}`n"
         "crates/nonrunning/tests/noharness.rs" =
@@ -1483,6 +1491,25 @@ $cases = @(
             # deliberately stricter than a metadata-only root set.
             Set-ForgedTransition $caseRoot @(
                 (New-Artifact "crates/nonrunning/tests/noharness.rs" $SyntheticTestName)
+            )
+        }
+    },    [ordered]@{
+        name = "implemented-citing-required-features-test-target"
+        expected_message = "is not reached by any cargo test target"
+        regenerate_digests = $true
+        repository_root = $SyntheticRoot
+        mutate = {
+            param($caseRoot)
+            # A non-empty required-features list makes cargo skip the target
+            # unless every named feature is enabled, so a plain cargo test never
+            # builds it and the #[test] items inside never run. Measured, not
+            # recalled: cargo metadata reports this target with test = true, and
+            # `cargo test` on the same crate runs 0 tests while
+            # `cargo test --features gated` runs it. The file exists, parses and
+            # holds a real #[test], so every check short of the root set would
+            # pass it -- which is exactly the forgery this rule refuses.
+            Set-ForgedTransition $caseRoot @(
+                (New-Artifact "crates/nonrunning/tests/gated.rs" $SyntheticTestName)
             )
         }
     },    [ordered]@{

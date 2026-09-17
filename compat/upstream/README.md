@@ -261,6 +261,22 @@ rather than recalled:
 - Any target with an explicit `test = false`.
 - Any target with `harness = false`, whose own `main()` replaces the libtest
   harness and makes every `#[test]` item in the file inert.
+- Any target with a non-empty `required-features`. cargo skips such a target
+  entirely unless every named feature is enabled, so a plain `cargo test` never
+  builds it. This one is worth stating precisely, because `cargo metadata`
+  reports the target with `test = true` and would therefore bless it: measured
+  on a crate whose only test target carries `required-features = ["gated"]`,
+  `cargo test` reports `running 0 tests` and never links the test binary, while
+  `cargo test --features gated` runs it. The cited file exists, parses, and
+  holds a genuine `#[test]`, so every check short of the root set passes it.
+  Presence is read, never resolved: deciding whether a feature is in fact
+  enabled would mean reproducing cargo's default-feature expansion, transitive
+  feature edges and workspace unification inside this reader, and a bug in any
+  one of those would hand out evidence for a test that never runs. A target
+  gated on a feature is therefore refused even when the feature is enabled by
+  default, and `required-features = []` — which gates nothing — is not refused.
+  This outranks an explicit `test = true`, which describes a target cargo
+  declined to build at all.
 
 Auto-discovery is suppressed by `autotests = false` and `autobins = false`, and a
 file named by an explicit target section is governed by that section alone —
