@@ -81,6 +81,24 @@ impl IosClientIdentity {
     }
 }
 
+// `targets_ios` is itself a `cfg!` expression, so any assertion written as the
+// same `cfg!` compares the function against a copy of its own body and cannot
+// fail. These const assertions pin the *value* the function must have on each
+// side of the target split, so the compiler evaluates them on whichever target
+// is built - including the `aarch64-apple-ios` cross-compile, which runs no
+// tests and is therefore the only place the iOS branch is ever checked.
+#[cfg(target_os = "ios")]
+const _: () = assert!(
+    IosClientIdentity::targets_ios(),
+    "targets_ios must report true when compiling for iOS"
+);
+
+#[cfg(not(target_os = "ios"))]
+const _: () = assert!(
+    !IosClientIdentity::targets_ios(),
+    "targets_ios must report false when not compiling for iOS"
+);
+
 fn field(label: &'static str, value: &str) -> Result<Name, IdentityError> {
     Name::new(value, MAX_METADATA_BYTES).map_err(|cause| IdentityError { label, cause })
 }
@@ -168,11 +186,6 @@ mod tests {
             identity.platform(),
             std::env::consts::OS,
             "platform must report the host this build actually runs on"
-        );
-        assert_eq!(
-            IosClientIdentity::targets_ios(),
-            cfg!(target_os = "ios"),
-            "targets_ios must agree with the compilation target"
         );
     }
 
