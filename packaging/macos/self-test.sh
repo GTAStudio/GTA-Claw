@@ -631,4 +631,50 @@ rm -f -- "$fixture_app/Contents/Info.plist"
 expect_failure missing-plist \
   "$MACOS_DIR/validate.sh" "$fixture_app" "$host_arch" adhoc
 
+exec_probe="$work/headless-execution"
+ensure_output_directory "$exec_probe"
+write_report_stub() {
+  local path="$1"
+  local report="$2"
+  local status="${3:-0}"
+  cat >"$path" <<STUB
+#!/bin/sh
+echo '$report'
+exit $status
+STUB
+  chmod +x "$path"
+}
+
+stub_target="aarch64-apple-darwin"
+write_report_stub "$exec_probe/cli" "gta-claw-cli $VERSION"
+write_report_stub "$exec_probe/daemon" "healthy runtime=macos-aarch64"
+write_report_stub "$exec_probe/cli-other-build" "gta-claw-cli 0.0.0-other-build"
+write_report_stub "$exec_probe/daemon-other-arch" "healthy runtime=macos-x86_64"
+write_report_stub "$exec_probe/cli-fails" "gta-claw-cli $VERSION" 1
+write_report_stub "$exec_probe/daemon-fails" "healthy runtime=macos-aarch64" 1
+cp "$exec_probe/cli" "$exec_probe/cli-not-executable"
+chmod -x "$exec_probe/cli-not-executable"
+
+expect_success headless-execution-accepts-this-build \
+  bash -c "source '$common'; assert_headless_binaries_execute \
+    '$exec_probe/cli' '$exec_probe/daemon' '$stub_target'"
+
+# Each of these is a binary that exists, is a valid Mach-O in the real build,
+# and passes every byte-reading check. Only running it tells them apart.
+expect_failure headless-execution-rejects-another-builds-version \
+  bash -c "source '$common'; assert_headless_binaries_execute \
+    '$exec_probe/cli-other-build' '$exec_probe/daemon' '$stub_target'"
+expect_failure headless-execution-rejects-another-target-arch \
+  bash -c "source '$common'; assert_headless_binaries_execute \
+    '$exec_probe/cli' '$exec_probe/daemon-other-arch' '$stub_target'"
+expect_failure headless-execution-rejects-failing-cli \
+  bash -c "source '$common'; assert_headless_binaries_execute \
+    '$exec_probe/cli-fails' '$exec_probe/daemon' '$stub_target'"
+expect_failure headless-execution-rejects-failing-daemon \
+  bash -c "source '$common'; assert_headless_binaries_execute \
+    '$exec_probe/cli' '$exec_probe/daemon-fails' '$stub_target'"
+expect_failure headless-execution-rejects-non-executable-cli \
+  bash -c "source '$common'; assert_headless_binaries_execute \
+    '$exec_probe/cli-not-executable' '$exec_probe/daemon' '$stub_target'"
+
 note "$tests macOS packaging self-tests passed"

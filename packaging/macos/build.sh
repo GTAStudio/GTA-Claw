@@ -104,6 +104,21 @@ build_target() {
     assert_macho_minimum_version "$binary"
   done
 
+  # The bytes archived below are the bytes that get signed and published, and
+  # until this point nothing had ever run them. Execution is only possible when
+  # the build target matches the host; a cross build says so rather than
+  # skipping silently. Both CI invocations of this script use `native`, which
+  # workflow-self-test.sh asserts, so the skip cannot occur there.
+  #
+  # gta-claw-desktop is deliberately absent: it ends in window.run(), which
+  # blocks forever, so there is no bounded way to execute it here. The packaged
+  # GUI binary is still never executed by anything in this repository.
+  if [[ "$target" == "$(host_target)" ]]; then
+    assert_headless_binaries_execute "$cli" "$daemon" "$target"
+  else
+    note "cross build for $target on $(host_target): headless execution not attempted"
+  fi
+
   "$MACOS_DIR/assemble-app.sh" "$desktop" "$arch" "$arch"
   "$MACOS_DIR/archive-headless.sh" "$cli" gta-claw-cli "$arch" "$arch"
   "$MACOS_DIR/archive-headless.sh" "$daemon" gta-claw-daemon "$arch" "$arch"
