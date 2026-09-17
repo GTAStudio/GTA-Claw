@@ -3977,17 +3977,89 @@ fn bounded_child_flood() {
     print!("{}", "x".repeat(1024 * 1024));
 }
 
-fn run_git(git: &Path, cwd: &Path, args: &[&str]) -> String {
-    let output = Command::new(git)
+const GIT_COMMIT_CONFIG: [&str; 2] = ["-c", "maintenance.auto=false"];
+const GIT_FIXTURE_STRESS_ITERATIONS: usize = 16;
+
+fn git_commit_args<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
+    assert_eq!(args.first(), Some(&"commit"));
+    let mut command_args = Vec::with_capacity(GIT_COMMIT_CONFIG.len() + args.len());
+    command_args.extend(GIT_COMMIT_CONFIG);
+    command_args.extend_from_slice(args);
+    command_args
+}
+
+fn git_trace_child_argv(trace: &Path) -> Vec<Vec<String>> {
+    fs::read_to_string(trace)
+        .expect("read Git Trace2 event stream")
+        .lines()
+        .filter_map(|line| {
+            let event: serde_json::Value =
+                serde_json::from_str(line).expect("decode Git Trace2 event");
+            (event.get("event").and_then(serde_json::Value::as_str) == Some("child_start")).then(
+                || {
+                    event
+                        .get("argv")
+                        .and_then(serde_json::Value::as_array)
+                        .expect("Git Trace2 child_start argv")
+                        .iter()
+                        .map(|arg| {
+                            arg.as_str()
+                                .expect("Git Trace2 child argv string")
+                                .to_owned()
+                        })
+                        .collect()
+                },
+            )
+        })
+        .collect()
+}
+
+fn is_auto_maintenance(argv: &[String]) -> bool {
+    argv.windows(2)
+        .any(|pair| pair[0] == "maintenance" && pair[1] == "run")
+        && argv.iter().any(|arg| arg == "--auto")
+        && argv.iter().any(|arg| arg == "--quiet")
+}
+
+fn is_upload_pack(argv: &[String]) -> bool {
+    argv.iter().any(|arg| {
+        let executable = arg
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(['\'', '"']);
+        Path::new(executable)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "git-upload-pack" | "git-upload-pack.exe"))
+    })
+}
+
+fn run_git_with_trace(
+    git: &Path,
+    cwd: &Path,
+    global_config: &Path,
+    trace: Option<&Path>,
+    args: &[&str],
+) -> String {
+    assert!(
+        !args
+            .iter()
+            .any(|arg| matches!(*arg, "--global" | "--system")),
+        "Git fixture commands must not mutate global or system configuration: {args:?}"
+    );
+    let mut command = Command::new(git);
+    command
         .args(args)
         .current_dir(cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env(
-            "GIT_CONFIG_GLOBAL",
-            if cfg!(windows) { "NUL" } else { "/dev/null" },
-        )
-        .output()
-        .expect("run Git fixture command");
+        .env("GIT_CONFIG_GLOBAL", global_config);
+    if let Some(trace) = trace {
+        command.env("GIT_TRACE2_EVENT", trace);
+    } else {
+        command.env_remove("GIT_TRACE2_EVENT");
+    }
+    let output = command.output().expect("run Git fixture command");
     assert!(
         output.status.success(),
         "Git fixture command failed: args={args:?} stdout={} stderr={}",
@@ -4000,32 +4072,78 @@ fn run_git(git: &Path, cwd: &Path, args: &[&str]) -> String {
         .to_owned()
 }
 
+fn run_git(git: &Path, cwd: &Path, global_config: &Path, args: &[&str]) -> String {
+    run_git_with_trace(git, cwd, global_config, None, args)
+}
+
+fn run_git_commit(git: &Path, cwd: &Path, global_config: &Path, args: &[&str]) -> String {
+    let command_args = git_commit_args(args);
+    let trace = cwd.join(".git").join("fixture-commit-trace.json");
+    let output = run_git_with_trace(git, cwd, global_config, Some(&trace), &command_args);
+    let child_argv = git_trace_child_argv(&trace);
+    assert!(
+        !child_argv.iter().any(|argv| is_auto_maintenance(argv)),
+        "maintenance.auto=false commit spawned automatic maintenance: {child_argv:?}"
+    );
+    output
+}
+
 #[test]
 fn trusted_git_manifest_covers_more_than_three_hundred_files() {
-    let Some(git) = env::var_os("GIT_BIN").map(PathBuf::from) else {
-        eprintln!("GIT_BIN is not set; hosted bootstrap requires and runs this test");
-        return;
-    };
-    assert!(git.is_absolute());
+    let git = PathBuf::from(
+        env::var_os("GIT_BIN")
+            .expect("GIT_BIN must name the absolute Git executable; this test must not be skipped"),
+    );
+    assert!(git.is_absolute(), "GIT_BIN must be absolute: {git:?}");
+    assert!(git.is_file(), "GIT_BIN is not a file: {}", git.display());
+    assert_eq!(
+        git_commit_args(&["commit", "--quiet", "-m", "fixture"]),
+        [
+            "-c",
+            "maintenance.auto=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture"
+        ]
+    );
     let fixture = TempTree::new("git-diff");
     let trusted = fixture.join("trusted");
     let candidate = fixture.join("candidate");
+    let global_config = fixture.join("global.gitconfig");
+    let global_config_bytes =
+        b"[user]\n\tname = Global Sentinel\n\temail = sentinel@example.invalid\n";
+    fs::write(&global_config, global_config_bytes).expect("write immutable global Git config");
     fs::create_dir_all(&trusted).expect("create trusted Git fixture");
-    run_git(&git, &trusted, &["init", "--quiet"]);
-    run_git(&git, &trusted, &["config", "user.name", "Policy Test"]);
+    run_git(&git, &trusted, &global_config, &["init", "--quiet"]);
     run_git(
         &git,
         &trusted,
-        &["config", "user.email", "policy@example.invalid"],
+        &global_config,
+        &["config", "--local", "user.name", "Policy Test"],
     );
-    fs::write(trusted.join("README.txt"), "base\n").expect("write base fixture");
-    run_git(&git, &trusted, &["add", "."]);
-    run_git(&git, &trusted, &["commit", "--quiet", "-m", "base"]);
-    let base = run_git(&git, &trusted, &["rev-parse", "HEAD"]);
-    let fixture_path = fixture.path.to_string_lossy().to_string();
     run_git(
         &git,
+        &trusted,
+        &global_config,
+        &["config", "--local", "user.email", "policy@example.invalid"],
+    );
+    fs::write(trusted.join("README.txt"), "base\n").expect("write base fixture");
+    run_git(&git, &trusted, &global_config, &["add", "."]);
+    run_git_commit(
+        &git,
+        &trusted,
+        &global_config,
+        &["commit", "--quiet", "-m", "base"],
+    );
+    let base = run_git(&git, &trusted, &global_config, &["rev-parse", "HEAD"]);
+    let fixture_path = fixture.path.to_string_lossy().to_string();
+    let clone_trace = fixture.join("clone-trace.json");
+    run_git_with_trace(
+        &git,
         &fixture.path,
+        &global_config,
+        Some(&clone_trace),
         &[
             "clone",
             "--quiet",
@@ -4034,11 +4152,29 @@ fn trusted_git_manifest_covers_more_than_three_hundred_files() {
             candidate.to_str().expect("candidate path UTF-8"),
         ],
     );
-    run_git(&git, &candidate, &["config", "user.name", "Policy Test"]);
+    let clone_child_argv = git_trace_child_argv(&clone_trace);
+    assert!(
+        clone_child_argv.len() == 1 && is_upload_pack(&clone_child_argv[0]),
+        "local clone invoked a child other than its sole upload-pack: {clone_child_argv:?}"
+    );
+    assert!(
+        fs::read_dir(candidate.join(".git/objects/pack"))
+            .expect("read cloned pack directory")
+            .next()
+            .is_none(),
+        "local no-hardlinks clone unexpectedly wrote a pack"
+    );
     run_git(
         &git,
         &candidate,
-        &["config", "user.email", "policy@example.invalid"],
+        &global_config,
+        &["config", "--local", "user.name", "Policy Test"],
+    );
+    run_git(
+        &git,
+        &candidate,
+        &global_config,
+        &["config", "--local", "user.email", "policy@example.invalid"],
     );
     fs::create_dir_all(candidate.join("docs")).expect("create changed docs");
     for index in 0..350 {
@@ -4053,20 +4189,28 @@ fn trusted_git_manifest_covers_more_than_three_hundred_files() {
     fs::create_dir_all(candidate.join("desktop")).expect("create relevant directory");
     fs::write(candidate.join("desktop/Cargo.toml"), "[workspace]\n")
         .expect("write late relevant path");
-    run_git(&git, &candidate, &["add", "."]);
-    run_git(&git, &candidate, &["commit", "--quiet", "-m", "head"]);
-    fs::write(candidate.join("README.txt"), "second head\n").expect("write second head fixture");
-    run_git(&git, &candidate, &["add", "README.txt"]);
-    run_git(
+    run_git(&git, &candidate, &global_config, &["add", "."]);
+    run_git_commit(
         &git,
         &candidate,
+        &global_config,
+        &["commit", "--quiet", "-m", "head"],
+    );
+    fs::write(candidate.join("README.txt"), "second head\n").expect("write second head fixture");
+    run_git(&git, &candidate, &global_config, &["add", "README.txt"]);
+    run_git_commit(
+        &git,
+        &candidate,
+        &global_config,
         &["commit", "--quiet", "-m", "second head"],
     );
-    let head = run_git(&git, &candidate, &["rev-parse", "HEAD"]);
+    let head = run_git(&git, &candidate, &global_config, &["rev-parse", "HEAD"]);
+    let mut current_head = head.clone();
     assert_eq!(
         run_git(
             &git,
             &candidate,
+            &global_config,
             &["rev-list", "--count", &format!("{base}..{head}")]
         ),
         "2"
@@ -4104,6 +4248,87 @@ fn trusted_git_manifest_covers_more_than_three_hundred_files() {
     for path in fake_packs {
         fs::remove_file(path).expect("remove fake Git pack entry");
     }
+
+    run_git(
+        &git,
+        &candidate,
+        &global_config,
+        &[
+            "-c",
+            "pack.writeReverseIndex=true",
+            "-c",
+            "repack.writeBitmaps=false",
+            "repack",
+            "-ad",
+            "--quiet",
+        ],
+    );
+    let canonical_pack_extensions: BTreeSet<String> = fs::read_dir(&pack_root)
+        .expect("read canonical Git pack directory")
+        .map(|entry| {
+            entry
+                .expect("read canonical Git pack entry")
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .expect("canonical Git pack extension")
+                .to_owned()
+        })
+        .collect();
+    for extension in ["pack", "idx", "rev"] {
+        assert!(
+            canonical_pack_extensions.contains(extension),
+            "Git repack did not create canonical .{extension}: {canonical_pack_extensions:?}"
+        );
+    }
+    compute_manifest(&git, &trusted, &candidate, &isolated_home, &base, &head)
+        .expect("canonical Git pack, index, and reverse index must pass");
+
+    let transient = pack_root.join("tmp_pack_OWNHdS");
+    fs::write(&transient, []).expect("plant Git pack temporary");
+    let transient_error =
+        compute_manifest(&git, &trusted, &candidate, &isolated_home, &base, &head)
+            .expect_err("planted tmp_pack entry unexpectedly passed");
+    assert!(
+        transient_error
+            .to_string()
+            .contains("Git pack directory contains an unexpected entry"),
+        "planted tmp_pack entry was rejected by the wrong rule: {transient_error}"
+    );
+    fs::remove_file(transient).expect("remove planted Git pack temporary");
+
+    for iteration in 0..GIT_FIXTURE_STRESS_ITERATIONS {
+        fs::write(
+            candidate.join("README.txt"),
+            format!("fixture stress iteration {iteration}\n"),
+        )
+        .expect("write fixture stress mutation");
+        run_git(&git, &candidate, &global_config, &["add", "README.txt"]);
+        run_git_commit(
+            &git,
+            &candidate,
+            &global_config,
+            &[
+                "commit",
+                "--quiet",
+                "-m",
+                &format!("fixture stress {iteration}"),
+            ],
+        );
+        let stress_head = run_git(&git, &candidate, &global_config, &["rev-parse", "HEAD"]);
+        let stress_manifest = compute_manifest(
+            &git,
+            &trusted,
+            &candidate,
+            &isolated_home,
+            &base,
+            &stress_head,
+        )
+        .unwrap_or_else(|error| panic!("fixture stress iteration {iteration} failed: {error}"));
+        assert_eq!(stress_manifest.paths.len(), 353);
+        current_head = stress_head;
+    }
+
     validate_pull_request_commit_count(1).expect("one commit is accepted");
     validate_pull_request_commit_count(MAX_PULL_REQUEST_COMMITS)
         .expect("exact pull request commit cap is accepted");
@@ -4111,37 +4336,52 @@ fn trusted_git_manifest_covers_more_than_three_hundred_files() {
     assert!(validate_pull_request_commit_count(MAX_PULL_REQUEST_COMMITS + 1).is_err());
 
     fs::write(trusted.join("TRUSTED.txt"), "advanced base\n").expect("write advanced base");
-    run_git(&git, &trusted, &["add", "TRUSTED.txt"]);
-    run_git(
+    run_git(&git, &trusted, &global_config, &["add", "TRUSTED.txt"]);
+    run_git_commit(
         &git,
         &trusted,
+        &global_config,
         &["commit", "--quiet", "-m", "advanced base"],
     );
-    let advanced_base = run_git(&git, &trusted, &["rev-parse", "HEAD"]);
+    let advanced_base = run_git(&git, &trusted, &global_config, &["rev-parse", "HEAD"]);
     let stale = compute_manifest(
         &git,
         &trusted,
         &candidate,
         &isolated_home,
         &advanced_base,
-        &head,
+        &current_head,
     )
     .expect_err("stale pull request unexpectedly passed");
-    assert!(stale.to_string().contains("base is not an ancestor"));
+    assert!(
+        stale.to_string().contains("base is not an ancestor"),
+        "stale-history fixture was rejected by the wrong rule: {stale}"
+    );
 
     let unrelated = fixture.join("unrelated");
     fs::create_dir_all(&unrelated).expect("create unrelated Git fixture");
-    run_git(&git, &unrelated, &["init", "--quiet"]);
-    run_git(&git, &unrelated, &["config", "user.name", "Policy Test"]);
+    run_git(&git, &unrelated, &global_config, &["init", "--quiet"]);
     run_git(
         &git,
         &unrelated,
-        &["config", "user.email", "policy@example.invalid"],
+        &global_config,
+        &["config", "--local", "user.name", "Policy Test"],
+    );
+    run_git(
+        &git,
+        &unrelated,
+        &global_config,
+        &["config", "--local", "user.email", "policy@example.invalid"],
     );
     fs::write(unrelated.join("UNRELATED.txt"), "unrelated\n").expect("write unrelated fixture");
-    run_git(&git, &unrelated, &["add", "."]);
-    run_git(&git, &unrelated, &["commit", "--quiet", "-m", "unrelated"]);
-    let unrelated_head = run_git(&git, &unrelated, &["rev-parse", "HEAD"]);
+    run_git(&git, &unrelated, &global_config, &["add", "."]);
+    run_git_commit(
+        &git,
+        &unrelated,
+        &global_config,
+        &["commit", "--quiet", "-m", "unrelated"],
+    );
+    let unrelated_head = run_git(&git, &unrelated, &global_config, &["rev-parse", "HEAD"]);
     assert!(
         compute_manifest(
             &git,
@@ -4153,6 +4393,11 @@ fn trusted_git_manifest_covers_more_than_three_hundred_files() {
         )
         .is_err(),
         "unrelated pull request history unexpectedly passed"
+    );
+    assert_eq!(
+        fs::read(&global_config).expect("read immutable global Git config"),
+        global_config_bytes,
+        "Git fixture commands mutated global configuration"
     );
 }
 
