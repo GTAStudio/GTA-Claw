@@ -204,6 +204,26 @@ where
     Arc::new(handler)
 }
 
+/// Lists the staging directory without the lock that serializes concurrent runs.
+///
+/// The lock object is the staging directory's own mutex: it outlives every
+/// download and install, so it is never part of what a run cleans up.
+fn staging_entries(stage: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(stage)
+        .expect("read staging directory")
+        .map(|entry| {
+            entry
+                .expect("staging entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name != "stage.lock")
+        .collect();
+    names.sort();
+    names
+}
+
 fn signing_key() -> SigningKey {
     SigningKey::from_bytes(&[19_u8; 32])
 }
@@ -606,10 +626,8 @@ async fn rejects_tampered_artifact_and_removes_untrusted_partial() {
         2
     );
     assert_eq!(
-        std::fs::read_dir(directory.path.join(".gta-claw.exe.gta-claw-stage"))
-            .expect("read protected staging directory")
-            .count(),
-        0
+        staging_entries(&directory.path.join(".gta-claw.exe.gta-claw-stage")),
+        Vec::<String>::new()
     );
 }
 
@@ -657,10 +675,8 @@ async fn verified_stage_is_reused_without_redownload_and_cleaned_after_install()
     );
     assert_eq!(server.requests.lock().expect("request log lock").len(), 1);
     assert_eq!(
-        std::fs::read_dir(directory.path.join(".gta-claw.exe.gta-claw-stage"))
-            .expect("read staging directory")
-            .count(),
-        0,
+        staging_entries(&directory.path.join(".gta-claw.exe.gta-claw-stage")),
+        Vec::<String>::new(),
         "successful install must remove verified, partial, binding, and journal files"
     );
 }
@@ -936,10 +952,8 @@ async fn installs_complete_macos_bundle_and_rejects_archive_traversal() {
     );
     assert!(!target_path.join("old.txt").exists());
     assert_eq!(
-        std::fs::read_dir(directory.path.join(".GTA Claw.app.gta-claw-stage"))
-            .expect("read bundle staging directory")
-            .count(),
-        0,
+        staging_entries(&directory.path.join(".GTA Claw.app.gta-claw-stage")),
+        Vec::<String>::new(),
         "successful bundle install must remove its verified archive"
     );
 

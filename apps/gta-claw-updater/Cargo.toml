@@ -40,5 +40,9 @@ windows-acl = "=0.3.0"
 ed25519-dalek = { version = "=3.0.0", features = ["digest"] }
 tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync"] }
 
+[[bin]]
+name = "gta-claw-updater-fixture"
+path = "tests/fixtures/updater_fixture.rs"
+
 [lints]
 workspace = true
