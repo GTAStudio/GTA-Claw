@@ -15,6 +15,14 @@ and records, per feature row, whether GTA-Claw actually implements it.
 | `manifest.json` | only `evidence_policy.status_totals` may change |
 | `ledgers/*.json` (3 files, 47 rows) | only `status`, `acceptance_evidence.status`, `acceptance_evidence.artifacts`, `implementation_pointers` and `known_differences` may change; every other field, **including `acceptance_evidence.required`**, is frozen by a digest hardcoded in `validate.ps1` |
 | `ledger-digests.sha256` | regenerated only by `validate.ps1 -WriteLedgerDigests` |
+| `validate-self-test.ps1` | frozen, digest hardcoded in `validate.ps1` |
+| `README.md` (this file) | frozen, digest hardcoded in `validate.ps1` |
+
+The last two are unusual and deliberate. An instrument that proves the rules
+reject a forgery, and a specification that says what the rules are, are both
+trust-root artifacts: each can be hollowed out without changing a single rule,
+and neither failure looks like a rule change in review. See
+[Why the specification is digest-pinned](#why-the-specification-is-digest-pinned).
 
 ## Validation
 
@@ -583,8 +591,17 @@ anything under `src/`, `compat/legacy/`, `packages/`, `node_modules/` or
 
    This is the only supported way to change a ledger digest. It rewrites
    `ledger-digests.sha256` and nothing else: inventory digests, the feature schema
-   digest, the enabled-test oracle corpus digest and `baseline.json` stay
-   hardcoded in `validate.ps1` and are unreachable from this command.
+   digest, the enabled-test oracle corpus digest, the reachability corpus digest,
+   the self-test digest, this file's digest and `baseline.json` stay hardcoded in
+   `validate.ps1` and are unreachable from this command.
+
+   If the same change also edits `README.md` — and a transition that changes what
+   the contract says usually should — bump `$ExpectedReadmeDigest` **before** this
+   step. Write mode is gated by the same checks as verify mode, so a drifted
+   specification refuses to regenerate ledger digests rather than quietly
+   re-blessing them. That ordering is the point, not an inconvenience: the
+   regeneration command must never be the thing that carries an unreviewed
+   documentation change past review.
 5. Re-run `validate.ps1` and `validate-self-test.ps1`.
 
 ## Continuous integration
@@ -634,11 +651,11 @@ Contract:
   which is a reviewed, committed artifact; regenerating it inside a job would
   re-bless whatever the job happens to be looking at.
 
-The adversarial self-test is a separate, slower step. It spawns 257 child
-validator processes — one baseline run against the real tree, one per each of the
-153 cases, and a re-blessing pre-run for the 103 cases that model an attacker who
-had already regenerated the ledger digests — and takes several minutes,
-so prefer a job with a `paths:` filter on `compat/upstream/**` over running it on
+The adversarial self-test is a separate, slower step. It spawns one child
+validator process per case, plus a baseline run against the real tree, plus a
+re-blessing pre-run for every case that models an attacker who had already
+regenerated the ledger digests — several hundred processes, taking minutes — so
+prefer a job with a `paths:` filter on `compat/upstream/**` over running it on
 every push:
 
 ```yaml
@@ -648,8 +665,15 @@ every push:
 ```
 
 It exits 0 when every case passes and 1 otherwise, printing `ok`/`FAIL` per case
-followed by an aggregate. It evaluates every case even after one fails, so a
-single regression cannot hide the cases behind it.
+followed by an aggregate carrying `positive_cases` and `negative_cases`. It
+evaluates every case even after one fails, so a single regression cannot hide the
+cases behind it.
+
+The exact totals are deliberately not restated here. The sentence this replaced
+gave three of them — 257 processes, 153 cases, 103 re-blessing pre-runs — and all
+three had drifted, because nothing derives a number written in prose. The run
+prints its own totals; a reader who needs them should read the run rather than
+this file.
 
 ### Where the self-test builds its throwaway trees
 
@@ -681,3 +705,49 @@ wrong reason" rather than pass. Had the harness only checked that the validator
 rejected something, every one of the negative cases would have passed vacuously
 against a fixture that no longer existed — a green anti-forgery suite testing
 nothing.
+
+## Why the specification is digest-pinned
+
+This file is frozen by `$ExpectedReadmeDigest` in `validate.ps1`, on the same
+terms as `validate-self-test.ps1`: LF-normalised SHA-256, compared before any
+evidence is judged, and unreachable from `-WriteLedgerDigests`. Editing this file
+therefore requires bumping that constant in the same commit.
+
+That cost is accepted deliberately, and it was not a precaution. This file was
+only presence-checked, and for roughly a day it asserted that the Cargo
+reachability rule was locally owned, unported, and the stricter of the two
+implementations. All three had become false: `crates/claw-conformance` had
+implemented the same rule, and on that axis this validator had become the more
+permissive side. A session read that paragraph, believed it — correctly, since a
+specification is meant to be believable without re-deriving it — and reasoned
+from it to a proposal that would have made this validator reject 225 legitimate
+tests across 34 files in 9 crates. `validate.ps1` carried the same claim in a
+code comment.
+
+Nothing dishonest happened at any point in that sequence, which is exactly what
+makes it worth pinning against. **The cheapest way to weaken a gate is not to
+edit the gate. It is to leave a true-sounding sentence about it in place after
+it stops being true, and let a competent reader act on it in good faith.** That
+produces no suspicious diff by anyone: the eventual weakening arrives as an
+ordinary maintenance commit by the rule's own owner, justified by the rule's own
+documentation.
+
+Over-strictness is the same problem wearing the opposite sign. A gate that
+rejects 225 legitimate tests does not get obeyed; it gets relaxed, under deadline
+pressure, by whoever is blocked, with less care than went into the original.
+
+Two consequences follow, and both are intended:
+
+- **A documentation edit is now a reviewed edit.** It appears in the same commit
+  as a constant bump in the trust root, so it cannot be reviewed as though it
+  were only prose.
+- **Claims in this file should be written so they can be checked.** Prefer naming
+  a symbol over quoting a line number, and dating a claim to the commit where it
+  was *measured* rather than the commit where someone believed it held. A line
+  number is a digest of a location: it is a fact about one revision of one file,
+  and it decays silently. A symbol is a fact about the program.
+
+The digest cannot detect a claim that was wrong when written. It guarantees only
+that the specification and the rules move together, which is the property whose
+absence caused the incident.
+
