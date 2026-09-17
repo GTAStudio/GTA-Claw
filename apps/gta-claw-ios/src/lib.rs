@@ -15,11 +15,15 @@
 //!   is pinned to exactly `["desktop"]`, the lockfile inventory is pinned to
 //!   exactly three paths, and the manifest inventory is pinned to the root
 //!   members plus the desktop and trusted manifests.
-//! * Every root member's `[lints]` must be exactly `workspace = true`, which
-//!   inherits `unsafe_code = "forbid"`. Slint's generated item-tree macros need
-//!   a local `allow(unsafe_code)`, which `forbid` cannot grant. The `desktop/`
-//!   workspace uses `deny` instead of `forbid` for precisely this reason and
-//!   says so in its own manifest comment.
+//! * The trusted policy validates each root member manifest separately. This
+//!   iOS member must use `[lints] workspace = true`, so it inherits the root
+//!   `unsafe_code = "forbid"`. Exceptions are explicit, path/package-bound
+//!   audited policy, currently including `claw-config`'s generated-code lint
+//!   table with `unsafe_code = "deny"`; they do not make the root lint table
+//!   authoritative for every member. Slint's generated item-tree macros need a
+//!   local `allow(unsafe_code)`, which this member's `forbid` cannot grant. The
+//!   `desktop/` workspace uses `deny` instead of `forbid` for precisely this
+//!   reason and says so in its own manifest comment.
 //!
 //! Lifting those three restrictions is a change to `.github/trusted/**`, which
 //! is byte-frozen and cannot authorise itself. Until that lands, the honest
