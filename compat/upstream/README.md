@@ -145,21 +145,23 @@ Because carriage return is ASCII whitespace to the tokenizer, a CRLF checkout on
 Windows and an LF checkout on Linux produce identical tokens and therefore
 identical verdicts.
 
-#### Ownership of the enabled-test rule
+#### Shared enabled-test rule and function mapping
 
-`declares_enabled_test` in `crates/claw-conformance/src/claims.rs` is the
-**normative** implementation. `Test-DeclaresEnabledRustTest` in `validate.ps1`
-is a follower port and has no independent authority: where the two ever disagree,
-the Rust harness is correct and this script is the bug.
+Rust and PowerShell are co-equal implementations of one enabled-test rule.
+Neither side may tighten or loosen it alone, and a disagreement is a drift defect
+to fix on the side that changed rather than an authority decision:
 
-The two trees are independently owned, so this is a real drift risk. The rule is
-binding in one direction only:
+| Stage | Rust (`crates/claw-conformance/src/claims.rs`) | PowerShell (`validate.ps1`) |
+| --- | --- | --- |
+| enabled-test decision | `declares_enabled_test` | `Test-DeclaresEnabledRustTest` |
+| tokenization | `rust_tokens` | `Get-RustTokens` |
+| item-tree walk | `declares_in_items` | `Test-RustDeclaresInItems` |
 
-- Any change to `declares_enabled_test` must be reported to the coordinating
-  session and re-ported here in the same cycle.
-- This port must never be "improved" unilaterally. Tightening or loosening it
-  here without a matching change in the harness creates exactly the split the
-  port exists to prevent: a row that passes one trust root and fails the other.
+The frozen oracle still uses the historical field names
+`normative_implementation` and `follower_implementation` and records the commit
+where the original port was taken. Those fields are provenance retained by the
+frozen schema and digest, not present-day ownership or permission for unilateral
+changes.
 
 #### The drift check is mechanical, not manual
 
@@ -177,8 +179,8 @@ silently changes behaviour therefore fails a build on both sides instead of
 quietly accepting or rejecting a claim the other side disagrees with.
 
 The `expected` values were **not written by hand**: they were produced by running
-the normative Rust implementation, so the corpus cannot encode an expectation the
-normative side does not actually hold.
+the Rust implementation when the corpus was created, then frozen. Both current
+implementations are measured against those same recorded decisions.
 
 The corpus is frozen like the inventories. Its digest, its case count and its
 accept/reject split are pinned as constants in `validate.ps1`, and
@@ -342,13 +344,27 @@ Three limits, stated plainly rather than left to be discovered:
 - It proves a file is compiled and a test is enabled. It does not prove the test
   passes; that is `cargo test`'s job.
 
-This rule is **shared, not locally owned**. `crates/claw-conformance` implements
-the same rule — "a target root, or reachable from a target root" — after a
-proposal to require the cited file to *be* a target root was put to the
-compatibility owner and then withdrawn: target-root-only left, at the time it was
-proposed, 225 tests across 34 files in 9 crates with no legal citation at all,
-and the only workaround was widening the visibility of private items in
-production code, which would have let the ledger dictate the API surface.
+Rust and PowerShell implement the same rule — "a target root, or reachable from
+a target root." The current merged function mapping is:
+
+| Stage | Rust (`crates/claw-conformance/src/claims.rs`) | PowerShell (`validate.ps1`) |
+| --- | --- | --- |
+| orchestration | `CargoTestTargets::load` | `Assert-EvidenceFileIsCompiled` |
+| workspace/package admission | `CargoWorkspaceSpec::includes_package` | `Test-CratePackageIsBuilt` |
+| test-enabled target roots | `CargoManifestTargets::uses_standard_test_harness` inside `CargoTestTargets::load` | `Get-CargoManifestTargetSections`, `Test-CargoSectionRunsTests`, `Get-CrateTargetRootFiles` |
+| module-reference discovery | `rust_module_references`, `collect_rust_module_references` | `Get-RustModuleReferences`, `Get-RustModReferencesInRange` |
+| transitive source walk | `reachable_rust_sources` | `Get-CrateCompiledFileSet` |
+| final compiled-source membership | `CargoTestTargets::contains_compiled_source` | `$reachable.ContainsKey($RelativePath)` inside `Assert-EvidenceFileIsCompiled` |
+
+The Rust side uses `cargo metadata` plus a manifest overlay while PowerShell
+models the same verdict hermetically, so this is a decision-stage mapping rather
+than a claim that their internal mechanics are line-for-line ports. The shared
+rule followed a proposal to require the cited file to *be* a target root that was
+put to the compatibility owner and then withdrawn: target-root-only left, at the
+time it was proposed, 225 tests across 34 files in 9 crates with no legal
+citation at all, and the only workaround was widening the visibility of private
+items in production code, which would have let the ledger dictate the API
+surface.
 Re-measured when this rule was settled — 292 tracked `.rs` files at that point,
 counting `#[test]` occurrences in files this rule accepts that are not themselves
 target roots — the cost was **822 tests across 99 files in 17 packages**. The figure is a lower
@@ -441,9 +457,8 @@ never be reported as one. The corpus and the sweep are complementary and neither
 is sufficient on its own: the sweep covers what the tree exercises, the corpus
 covers what it does not, and any rule outside both is pinned by nothing.
 
-**Neither implementation is normative here.** The `arbiter` field records that
-every expectation was produced by running `cargo` and `rustc` against the
-fixture, not by asking either resolver what it thinks. Accepting cases place
+The `arbiter` field records that `cargo` and `rustc`, not either resolver, decide
+every expectation by running against the fixture. Accepting cases place
 `compile_error!` decoys at each formerly wrong path, so a successful `cargo
 build` is itself proof that cargo compiles none of them; rejecting cases that
 model a non-building crate are ones `cargo` actually fails on. One expectation
