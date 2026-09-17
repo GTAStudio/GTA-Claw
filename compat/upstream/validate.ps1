@@ -63,7 +63,7 @@ $ExpectedReachabilityCorpusAccepting = 15
 # Frozen exactly like the schema and corpus digests: -WriteLedgerDigests cannot
 # reach this constant, so re-blessing a hollowed-out self-test takes a reviewed
 # edit to this line.
-$ExpectedSelfTestDigest = "0da69d4ad9266c7a5cb4516dbf7fd95a4f0c7f0f82f6844bea44116a06956d96"
+$ExpectedSelfTestDigest = "0dd031ed479f71c4e26f32c430bf94ca72dc97cd7c5fb0ca18ed95d29e7a6e49"
 $LedgerDigestFileName = "ledger-digests.sha256"
 $LedgerDigestHeader = @(
     "# GTA-Claw frozen upstream compatibility ledger digests.",
@@ -1757,6 +1757,50 @@ function Assert-ReachabilityCorpusPath {
     }
 }
 
+# Canonical reachability cases, append-only. A case name that has ever been accepted
+# into the corpus may never leave it. ADDING cases does not require editing this list;
+# only removal or rename does, which is the entire point. The count, split and digest
+# pins all move legitimately whenever a case is added, so a deletion or a substitution
+# can ride along inside an otherwise ordinary corpus expansion -- the self-test case
+# "reachability-corpus-case-renamed" records that only the digest catches a rename,
+# and that digest is bumped by every honest addition. This list is what makes that
+# specific move visible: a rollback must delete a name from an explicit never-remove
+# list, which no reviewer can mistake for an addition.
+$CanonicalReachabilityCaseNames = @(
+    "ambiguity-directory-side",
+    "ambiguity-file-side",
+    "compiled-file-outside-any-package",
+    "cross-package-also-own-package-accept",
+    "cross-package-only-reject",
+    "inline-path-mod-rs-accept",
+    "inline-path-mod-rs-decoy",
+    "inline-path-non-mod-rs-accept",
+    "inline-path-non-mod-rs-module-dir-decoy",
+    "inline-path-plain-child-accept",
+    "nested-inline-path-accept",
+    "nested-inline-path-file-dir-decoy",
+    "peer1-explicit-bin-test-false-reject",
+    "peer2-top-level-path-sibling",
+    "peer2-top-level-path-sibling-decoy",
+    "peer3-path-mod-rs-child",
+    "peer3-path-mod-rs-child-decoy",
+    "peer4-inline-path-propagates",
+    "peer4-inline-path-propagates-decoy",
+    "peer5-raw-string-path",
+    "peer6-ambiguity-directory-side",
+    "peer6-ambiguity-file-side",
+    "peer7-excluded-workspace-root",
+    "peer7-standalone-own-workspace-table-accept",
+    "peer7-unbuildable-orphan-package-reject",
+    "peer8-default-bench-reject",
+    "peer8-default-example-reject",
+    "peer8-enabled-integration-test-accept",
+    "peer8-harness-false-target-reject",
+    "peer8-src-bin-target-accept",
+    "unambiguous-file-accept",
+    "unambiguous-mod-rs-accept"
+)
+
 function Assert-ReachabilityCorpus {
     param([object]$Corpus)
     # Structural and digest pin only. This function deliberately does NOT
@@ -1840,6 +1884,19 @@ function Assert-ReachabilityCorpus {
         if (-not $citeIsDefined) {
             Fail "reachability-corpus case '$name' cites '$cite', which the case does not define"
         }
+    }
+    # Canonical cases are append-only. Checked against the names actually parsed, so a
+    # case that was deleted, renamed or swapped for a different one is named explicitly
+    # rather than surfacing as a count or digest mismatch that an addition also produces.
+    $missingCanonical = @()
+    foreach ($canonicalName in $CanonicalReachabilityCaseNames) {
+        if (-not $names.ContainsKey($canonicalName)) {
+            $missingCanonical += $canonicalName
+        }
+    }
+    if ($missingCanonical.Count -gt 0) {
+        [Array]::Sort($missingCanonical, [StringComparer]::Ordinal)
+        Fail ("reachability-corpus must not drop canonical cases; missing=[{0}]" -f ($missingCanonical -join ", "))
     }
     if ($accepting -ne $ExpectedReachabilityCorpusAccepting) {
         Fail ("reachability-corpus must record exactly {0} accepting cases; found {1}" -f $ExpectedReachabilityCorpusAccepting, $accepting)
