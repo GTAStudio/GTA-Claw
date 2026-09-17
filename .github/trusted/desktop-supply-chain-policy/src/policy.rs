@@ -1634,7 +1634,7 @@ pub fn validate_build_artifact_pin_table(
         }
         if !valid_checksum(digest) {
             return Err(PolicyError::new(format!(
-                "reviewed build-artifact digest is not a SHA-256: {package} {target}"
+                "reviewed build-artifact digest is not a lowercase SHA-256: {package} {target}"
             )));
         }
         if !url.starts_with("https://") || url.contains("..") || !url.contains(target) {
@@ -2186,8 +2186,18 @@ fn lock_packages(lock: &TomlValue) -> PolicyResult<&Vec<TomlValue>> {
         .ok_or_else(|| PolicyError::new("Cargo.lock package array is missing"))
 }
 
+/// Accepts a full SHA-256 in the one spelling the rest of the repository uses.
+///
+/// Lowercase is not cosmetic here: the decision ledger rejects anything else as "must be a
+/// lowercase full SHA-256" and the release workflow matches `^[0-9a-f]{64}$`, so accepting
+/// uppercase would let a byte-frozen table carry a digest every other gate refuses. Comparisons
+/// are byte equality, so a mixed-case digest never matches a computed one — it fails closed, but
+/// it fails somewhere further away than here, naming the artifact rather than the spelling.
 fn valid_checksum(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Validates evolving root lock sources, local packages, and no-GUI policy.
